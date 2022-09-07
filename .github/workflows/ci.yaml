@@ -41,7 +41,7 @@ jobs:
         name: Kubernetes KinD Cluster w/local registry
 
       # Publish a syncer image to the local registry
-      - uses: imjasonh/setup-ko@v0.4
+      - uses: imjasonh/setup-ko@v0.6
       - run: KO_DOCKER_REPO=${KIND_REGISTRY} ko publish ./cmd/syncer --insecure-registry -t $(git rev-parse --short "$GITHUB_SHA") > /tmp/syncer-image
 
       # Publish a the kcp test image to the local registry
