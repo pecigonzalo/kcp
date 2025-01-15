@@ -17,21 +17,16 @@ limitations under the License.
 package replication
 
 import (
-	"context"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/kcp-dev/logicalcluster/v2"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
-	clientgotesting "k8s.io/client-go/testing"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 func TestEnsureUnstructuredSpec(t *testing.T) {
@@ -55,12 +50,14 @@ func TestEnsureUnstructuredSpec(t *testing.T) {
 				"spec": map[string]interface{}{},
 			}},
 			expectSpecChanged: true,
-			validateCacheObjectSpec: func(ts *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+			validateCacheObjectSpec: func(t *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+				t.Helper()
+
 				if _, hasSpec := cacheObject.Object["spec"]; !hasSpec {
-					ts.Fatal("the cachedObject doesn't have the spec field")
+					t.Fatal("the cachedObject doesn't have the spec field")
 				}
 				if _, hasSpec := localObject.Object["spec"]; !hasSpec {
-					ts.Fatal("the localObject was modified and doesn't have the spec field anymore")
+					t.Fatal("the localObject was modified and doesn't have the spec field anymore")
 				}
 			},
 		},
@@ -71,12 +68,14 @@ func TestEnsureUnstructuredSpec(t *testing.T) {
 			}},
 			localObject:       &unstructured.Unstructured{Object: map[string]interface{}{}},
 			expectSpecChanged: true,
-			validateCacheObjectSpec: func(ts *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+			validateCacheObjectSpec: func(t *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+				t.Helper()
+
 				if _, hasSpec := cacheObject.Object["spec"]; hasSpec {
-					ts.Fatal("the cacheObject has the spec field")
+					t.Fatal("the cacheObject has the spec field")
 				}
 				if _, hasSpec := localObject.Object["spec"]; hasSpec {
-					ts.Fatal("the localObject has the spec field")
+					t.Fatal("the localObject has the spec field")
 				}
 			},
 		},
@@ -89,12 +88,14 @@ func TestEnsureUnstructuredSpec(t *testing.T) {
 				"spec": map[string]interface{}{"fieldA": "a", "fieldB": "b"},
 			}},
 			expectSpecChanged: true,
-			validateCacheObjectSpec: func(ts *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+			validateCacheObjectSpec: func(t *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+				t.Helper()
+
 				expectedObject := &unstructured.Unstructured{Object: map[string]interface{}{
 					"spec": map[string]interface{}{"fieldA": "a", "fieldB": "b"},
 				}}
 				if !reflect.DeepEqual(cacheObject.Object, expectedObject.Object) {
-					ts.Errorf("received spec differs from the expected one :\n%s", cmp.Diff(cacheObject.Object, expectedObject.Object))
+					t.Errorf("received spec differs from the expected one :\n%s", cmp.Diff(cacheObject.Object, expectedObject.Object))
 				}
 			},
 		},
@@ -107,12 +108,14 @@ func TestEnsureUnstructuredSpec(t *testing.T) {
 				"spec": map[string]interface{}{"fieldA": "a"},
 			}},
 			expectSpecChanged: true,
-			validateCacheObjectSpec: func(ts *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+			validateCacheObjectSpec: func(t *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+				t.Helper()
+
 				expectedObject := &unstructured.Unstructured{Object: map[string]interface{}{
 					"spec": map[string]interface{}{"fieldA": "a"},
 				}}
 				if !reflect.DeepEqual(cacheObject.Object, expectedObject.Object) {
-					ts.Errorf("received spec differs from the expected one :\n%s", cmp.Diff(cacheObject.Object, expectedObject.Object))
+					t.Errorf("received spec differs from the expected one :\n%s", cmp.Diff(cacheObject.Object, expectedObject.Object))
 				}
 			},
 		},
@@ -157,12 +160,14 @@ func TestEnsureUnstructuredStatus(t *testing.T) {
 				"status": map[string]interface{}{},
 			}},
 			expectStatusChanged: true,
-			validateCacheObjectSpec: func(ts *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+			validateCacheObjectSpec: func(t *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+				t.Helper()
+
 				if _, hasStatus := cacheObject.Object["status"]; !hasStatus {
-					ts.Fatal("the cachedObject doesn't have the status field")
+					t.Fatal("the cachedObject doesn't have the status field")
 				}
 				if _, hasStatus := localObject.Object["status"]; !hasStatus {
-					ts.Fatal("the localObject was modified and doesn't have the status field anymore")
+					t.Fatal("the localObject was modified and doesn't have the status field anymore")
 				}
 			},
 		},
@@ -173,12 +178,14 @@ func TestEnsureUnstructuredStatus(t *testing.T) {
 			}},
 			localObject:         &unstructured.Unstructured{Object: map[string]interface{}{}},
 			expectStatusChanged: true,
-			validateCacheObjectSpec: func(ts *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+			validateCacheObjectSpec: func(t *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+				t.Helper()
+
 				if _, hasStatus := cacheObject.Object["status"]; hasStatus {
-					ts.Fatal("the cacheObject has the status field")
+					t.Fatal("the cacheObject has the status field")
 				}
 				if _, hasStatus := localObject.Object["status"]; hasStatus {
-					ts.Fatal("the localObject has the status field")
+					t.Fatal("the localObject has the status field")
 				}
 			},
 		},
@@ -191,12 +198,14 @@ func TestEnsureUnstructuredStatus(t *testing.T) {
 				"status": map[string]interface{}{"fieldA": "a", "fieldB": "b"},
 			}},
 			expectStatusChanged: true,
-			validateCacheObjectSpec: func(ts *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+			validateCacheObjectSpec: func(t *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+				t.Helper()
+
 				expectedObject := &unstructured.Unstructured{Object: map[string]interface{}{
 					"status": map[string]interface{}{"fieldA": "a", "fieldB": "b"},
 				}}
 				if !reflect.DeepEqual(cacheObject.Object, expectedObject.Object) {
-					ts.Errorf("received status differs from the expected one :\n%s", cmp.Diff(cacheObject.Object, expectedObject.Object))
+					t.Errorf("received status differs from the expected one :\n%s", cmp.Diff(cacheObject.Object, expectedObject.Object))
 				}
 			},
 		},
@@ -209,12 +218,14 @@ func TestEnsureUnstructuredStatus(t *testing.T) {
 				"status": map[string]interface{}{"fieldA": "a"},
 			}},
 			expectStatusChanged: true,
-			validateCacheObjectSpec: func(ts *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+			validateCacheObjectSpec: func(t *testing.T, cacheObject, localObject *unstructured.Unstructured) {
+				t.Helper()
+
 				expectedObject := &unstructured.Unstructured{Object: map[string]interface{}{
 					"status": map[string]interface{}{"fieldA": "a"},
 				}}
 				if !reflect.DeepEqual(cacheObject.Object, expectedObject.Object) {
-					ts.Errorf("received status differs from the expected one :\n%s", cmp.Diff(cacheObject.Object, expectedObject.Object))
+					t.Errorf("received status differs from the expected one :\n%s", cmp.Diff(cacheObject.Object, expectedObject.Object))
 				}
 			},
 		},
@@ -258,15 +269,17 @@ func TestEnsureUnstructuredMeta(t *testing.T) {
 			name:            "no-op: equal with rv",
 			cacheObjectMeta: metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b"}},
 			localObjectMeta: metav1.ObjectMeta{ResourceVersion: "2", Annotations: map[string]string{"a": "b"}},
-			validateCacheObjectMeta: func(ts *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+			validateCacheObjectMeta: func(t *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+				t.Helper()
+
 				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b"}}
 				if !reflect.DeepEqual(cacheObjectMeta, expectedCacheObjectMeta) {
-					ts.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
+					t.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
 				}
 
 				expectedLocalObjectMeta := metav1.ObjectMeta{ResourceVersion: "2", Annotations: map[string]string{"a": "b"}}
 				if !reflect.DeepEqual(localObjectMeta, expectedLocalObjectMeta) {
-					ts.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
+					t.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
 				}
 			},
 		},
@@ -275,15 +288,17 @@ func TestEnsureUnstructuredMeta(t *testing.T) {
 			cacheObjectMeta:         metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b"}},
 			localObjectMeta:         metav1.ObjectMeta{ResourceVersion: "2", Annotations: map[string]string{"a": "b", "foo": "bar"}},
 			expectObjectMetaChanged: true,
-			validateCacheObjectMeta: func(ts *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+			validateCacheObjectMeta: func(t *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+				t.Helper()
+
 				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b", "foo": "bar"}}
 				if !reflect.DeepEqual(cacheObjectMeta, expectedCacheObjectMeta) {
-					ts.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
+					t.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
 				}
 
 				expectedLocalObjectMeta := metav1.ObjectMeta{ResourceVersion: "2", Annotations: map[string]string{"a": "b", "foo": "bar"}}
 				if !reflect.DeepEqual(localObjectMeta, expectedLocalObjectMeta) {
-					ts.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
+					t.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
 				}
 			},
 		},
@@ -292,66 +307,74 @@ func TestEnsureUnstructuredMeta(t *testing.T) {
 			cacheObjectMeta:         metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b", "foo": "bar"}},
 			localObjectMeta:         metav1.ObjectMeta{ResourceVersion: "2", Annotations: map[string]string{"a": "b"}},
 			expectObjectMetaChanged: true,
-			validateCacheObjectMeta: func(ts *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+			validateCacheObjectMeta: func(t *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+				t.Helper()
+
 				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b"}}
 				if !reflect.DeepEqual(cacheObjectMeta, expectedCacheObjectMeta) {
-					ts.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
+					t.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
 				}
 
 				expectedLocalObjectMeta := metav1.ObjectMeta{ResourceVersion: "2", Annotations: map[string]string{"a": "b"}}
 				if !reflect.DeepEqual(localObjectMeta, expectedLocalObjectMeta) {
-					ts.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
+					t.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
 				}
 			},
 		},
 		{
 			name:                    "annotations on local diff and cached has a shard name",
-			cacheObjectMeta:         metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b", "kcp.dev/shard": "amber"}},
+			cacheObjectMeta:         metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b", "kcp.io/shard": "amber"}},
 			localObjectMeta:         metav1.ObjectMeta{ResourceVersion: "2", Annotations: map[string]string{"a": "b", "foo": "bar"}},
 			expectObjectMetaChanged: true,
-			validateCacheObjectMeta: func(ts *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
-				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b", "kcp.dev/shard": "amber", "foo": "bar"}}
+			validateCacheObjectMeta: func(t *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+				t.Helper()
+
+				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"a": "b", "kcp.io/shard": "amber", "foo": "bar"}}
 				if !reflect.DeepEqual(cacheObjectMeta, expectedCacheObjectMeta) {
-					ts.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
+					t.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
 				}
 
 				expectedLocalObjectMeta := metav1.ObjectMeta{ResourceVersion: "2", Annotations: map[string]string{"a": "b", "foo": "bar"}}
 				if !reflect.DeepEqual(localObjectMeta, expectedLocalObjectMeta) {
-					ts.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
+					t.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
 				}
 			},
 		},
 		{
 			name:                    "no annotations on local, shard name is preserved on cached",
-			cacheObjectMeta:         metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"kcp.dev/shard": "amber"}},
+			cacheObjectMeta:         metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"kcp.io/shard": "amber"}},
 			localObjectMeta:         metav1.ObjectMeta{},
 			expectObjectMetaChanged: true,
-			validateCacheObjectMeta: func(ts *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
-				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"kcp.dev/shard": "amber"}}
+			validateCacheObjectMeta: func(t *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+				t.Helper()
+
+				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"kcp.io/shard": "amber"}}
 				if !reflect.DeepEqual(cacheObjectMeta, expectedCacheObjectMeta) {
-					ts.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
+					t.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
 				}
 
 				expectedLocalObjectMeta := metav1.ObjectMeta{}
 				if !reflect.DeepEqual(localObjectMeta, expectedLocalObjectMeta) {
-					ts.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
+					t.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
 				}
 			},
 		},
 		{
 			name:                    "an arbitrary field on meta",
-			cacheObjectMeta:         metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"kcp.dev/shard": "amber"}},
+			cacheObjectMeta:         metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"kcp.io/shard": "amber"}},
 			localObjectMeta:         metav1.ObjectMeta{Finalizers: []string{"f1"}},
 			expectObjectMetaChanged: true,
-			validateCacheObjectMeta: func(ts *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
-				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"kcp.dev/shard": "amber"}, Finalizers: []string{"f1"}}
+			validateCacheObjectMeta: func(t *testing.T, cacheObjectMeta, localObjectMeta metav1.ObjectMeta) {
+				t.Helper()
+
+				expectedCacheObjectMeta := metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"kcp.io/shard": "amber"}, Finalizers: []string{"f1"}}
 				if !reflect.DeepEqual(cacheObjectMeta, expectedCacheObjectMeta) {
-					ts.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
+					t.Errorf("received metadata differs from the expected one :\n%s", cmp.Diff(cacheObjectMeta, expectedCacheObjectMeta))
 				}
 
 				expectedLocalObjectMeta := metav1.ObjectMeta{Finalizers: []string{"f1"}}
 				if !reflect.DeepEqual(localObjectMeta, expectedLocalObjectMeta) {
-					ts.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
+					t.Errorf("local object's metadata mustn't be changed, diff :\n%s", cmp.Diff(localObjectMeta, expectedLocalObjectMeta))
 				}
 			},
 		},
@@ -359,8 +382,8 @@ func TestEnsureUnstructuredMeta(t *testing.T) {
 
 	for _, scenario := range scenarios {
 		t.Run(scenario.name, func(tt *testing.T) {
-			cacheApiExport := &apisv1alpha1.APIExport{ObjectMeta: scenario.cacheObjectMeta}
-			unstructuredCacheApiExport, err := toUnstructured(cacheApiExport)
+			cacheAPIExport := &apisv1alpha1.APIExport{ObjectMeta: scenario.cacheObjectMeta}
+			unstructuredCacheApiExport, err := toUnstructured(cacheAPIExport)
 			if err != nil {
 				tt.Fatal(err)
 			}
@@ -390,142 +413,5 @@ func TestEnsureUnstructuredMeta(t *testing.T) {
 				scenario.validateCacheObjectMeta(tt, cacheApiExportFromUnstructured.ObjectMeta, localApiExportFromUnstructured.ObjectMeta)
 			}
 		})
-	}
-}
-
-func TestHandleUnstructuredObjectDeletion(t *testing.T) {
-	scenarios := []struct {
-		name                        string
-		cacheObject                 *apisv1alpha1.APIExport
-		validateCacheObjectDeletion func(ts *testing.T, actions []clientgotesting.Action)
-	}{
-		{
-			name: "no-op",
-		},
-		{
-			name:        "DeletionTimestamp filed not set on cacheObject",
-			cacheObject: newAPIExport("foo"),
-			validateCacheObjectDeletion: func(ts *testing.T, actions []clientgotesting.Action) {
-				wasCacheApiExportValidated := false
-				for _, action := range actions {
-					if action.Matches("delete", "apiexports") {
-						deleteAction := action.(clientgotesting.DeleteAction)
-						if deleteAction.GetName() != "foo" {
-							ts.Fatalf("unexpected APIExport was removed = %v, expected = %v", deleteAction.GetName(), "foo")
-						}
-						wasCacheApiExportValidated = true
-						break
-					}
-				}
-				if !wasCacheApiExportValidated {
-					ts.Errorf("an ApiExport on the cache sever wasn't deleted")
-				}
-			},
-		},
-		{
-			name: "no-op when DeletionTimestamp filed set",
-			cacheObject: func() *apisv1alpha1.APIExport {
-				t := metav1.NewTime(time.Now())
-				apiExport := newAPIExport("foo")
-				apiExport.DeletionTimestamp = &t
-				return apiExport
-			}(),
-			validateCacheObjectDeletion: func(ts *testing.T, actions []clientgotesting.Action) {
-				if len(actions) > 0 {
-					ts.Fatalf("didn't expect any API calls, got %v", actions)
-				}
-			},
-		},
-		{
-			name: "no-op when DeletionTimestamp filed and Finalizers are set",
-			cacheObject: func() *apisv1alpha1.APIExport {
-				t := metav1.NewTime(time.Now())
-				apiExport := newAPIExport("foo")
-				apiExport.DeletionTimestamp = &t
-				apiExport.Finalizers = []string{"aFinalizer"}
-				return apiExport
-			}(),
-			validateCacheObjectDeletion: func(ts *testing.T, actions []clientgotesting.Action) {
-				if len(actions) > 0 {
-					ts.Fatalf("didn't expect any API calls, got %v", actions)
-				}
-			},
-		},
-	}
-
-	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(tt *testing.T) {
-			var unstructuredCacheObject *unstructured.Unstructured
-			var err error
-			if scenario.cacheObject != nil {
-				unstructuredCacheObject, err = toUnstructured(scenario.cacheObject)
-				if err != nil {
-					tt.Fatal(err)
-				}
-			}
-			gvr := apisv1alpha1.SchemeGroupVersion.WithResource("apiexports")
-			target := &controller{}
-			fakeDynamicClient := newFakeKcpClusterClient(dynamicfake.NewSimpleDynamicClient(scheme, func() []runtime.Object {
-				if unstructuredCacheObject == nil {
-					return []runtime.Object{}
-				}
-				return []runtime.Object{unstructuredCacheObject}
-			}()...))
-			target.dynamicCacheClient = fakeDynamicClient
-
-			err = target.handleObjectDeletion(context.TODO(), logicalcluster.New("root"), &gvr, unstructuredCacheObject)
-			if err != nil {
-				tt.Fatal(err)
-			}
-			if scenario.validateCacheObjectDeletion != nil {
-				scenario.validateCacheObjectDeletion(tt, fakeDynamicClient.fakeDs.Actions())
-			}
-		})
-	}
-}
-
-// TestToUnstructured test if changing an unstructured obj won't change the original object
-func TestToUnstructured(t *testing.T) {
-	apiExport := newAPIExport("a1")
-	apiExport.Spec.MaximalPermissionPolicy = &apisv1alpha1.MaximalPermissionPolicy{Local: &apisv1alpha1.LocalAPIExportPolicy{}}
-	unstructuredApiExport, err := toUnstructured(apiExport)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// manipulate map (a reference type)
-	if err := unstructured.SetNestedField(unstructuredApiExport.Object, "valForNewAnnotation", "metadata", "annotations", "newAnnotation"); err != nil {
-		t.Fatal(err)
-	}
-	if newAnnotationVal := unstructuredApiExport.GetAnnotations()["newAnnotation"]; newAnnotationVal != "valForNewAnnotation" {
-		t.Fatalf("unexpected value %v for newAnnotation", newAnnotationVal)
-	}
-
-	if _, hasNewAnnotation := apiExport.Annotations["newAnnotation"]; hasNewAnnotation {
-		t.Fatal("didn't expect changing unstructuredApiExport annotation will also change the original apiExport object")
-	}
-
-	// manipulate string (a simple type)
-	if err := unstructured.SetNestedField(unstructuredApiExport.Object, "newName", "metadata", "name"); err != nil {
-		t.Fatal(err)
-	}
-	if unstructuredApiExport.GetName() != "newName" {
-		t.Fatalf("unexpected name %v", unstructuredApiExport.GetName())
-	}
-	if apiExport.Name != "a1" {
-		t.Fatal("didn't expect changing unstructuredApiExport name will also change the original apiExport object")
-	}
-
-	// manipulate pinter (a reference type)
-	unstructured.RemoveNestedField(unstructuredApiExport.Object, "spec", "maximalPermissionPolicy")
-	_, maximalPolicyFound, err := unstructured.NestedFieldNoCopy(unstructuredApiExport.Object, "spec", "maximalPermissionPolicy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if maximalPolicyFound {
-		t.Fatal("didn't expect to find spec.maximalPermissionPolicy")
-	}
-	if apiExport.Spec.MaximalPermissionPolicy == nil {
-		t.Fatal("apiExport.Spec.MaximalPermissionPolicy was removed")
 	}
 }

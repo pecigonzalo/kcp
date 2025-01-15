@@ -1,0 +1,18 @@
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: metrics-viewer
+  annotations:
+    bootstrap.kcp.io/battery: metrics-viewer
+subjects:
+- kind: ServiceAccount
+  name: metrics
+  namespace: default
+  apiGroup: ""
+- kind: User
+  name: metrics-viewer
+  apiGroup: ""
+roleRef:
+  kind: ClusterRole
+  name: metrics-viewer
+  apiGroup: ""

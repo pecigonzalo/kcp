@@ -31,11 +31,11 @@ import (
 	"k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/util"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/crdpuller"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
-// InternalAPI describes an API to be imported from some schemes and generated OpenAPI V2 definitions
+// InternalAPI describes an API to be imported from some schemes and generated OpenAPI V2 definitions.
 type InternalAPI struct {
 	Names         apiextensionsv1.CustomResourceDefinitionNames
 	GroupVersion  schema.GroupVersion
@@ -44,7 +44,7 @@ type InternalAPI struct {
 	HasStatus     bool
 }
 
-func CreateAPIResourceSchemas(schemes []*runtime.Scheme, openAPIDefinitionsGetters []common.GetOpenAPIDefinitions, defs ...InternalAPI) ([]*apisv1alpha1.APIResourceSchema, error) {
+func CreateAPIResourceSchemas(schemes []*runtime.Scheme, openAPIDefinitionsGetters []common.GetOpenAPIDefinitions, defs ...InternalAPI) (map[apisv1alpha1.GroupResource]*apisv1alpha1.APIResourceSchema, error) {
 	config := genericapiserver.DefaultOpenAPIConfig(func(ref common.ReferenceCallback) map[string]common.OpenAPIDefinition {
 		result := make(map[string]common.OpenAPIDefinition)
 
@@ -57,7 +57,7 @@ func CreateAPIResourceSchemas(schemes []*runtime.Scheme, openAPIDefinitionsGette
 		return result
 	}, endpointsopenapi.NewDefinitionNamer(schemes...))
 
-	var canonicalTypeNames []string
+	canonicalTypeNames := make([]string, 0, len(defs))
 	for _, def := range defs {
 		canonicalTypeNames = append(canonicalTypeNames, util.GetCanonicalTypeName(def.Instance))
 	}
@@ -76,7 +76,7 @@ func CreateAPIResourceSchemas(schemes []*runtime.Scheme, openAPIDefinitionsGette
 		return nil, err
 	}
 
-	var apis []*apisv1alpha1.APIResourceSchema
+	apis := map[apisv1alpha1.GroupResource]*apisv1alpha1.APIResourceSchema{}
 	for _, def := range defs {
 		gvk := def.GroupVersion.WithKind(def.Names.Kind)
 		var schemaProps apiextensionsv1.JSONSchemaProps
@@ -88,32 +88,47 @@ func CreateAPIResourceSchemas(schemes []*runtime.Scheme, openAPIDefinitionsGette
 		if group == "" {
 			group = "core"
 		}
+
+		version := apisv1alpha1.APIResourceVersion{
+			Name:    def.GroupVersion.Version,
+			Served:  true,
+			Storage: true,
+			Schema:  runtime.RawExtension{},
+		}
+
+		if def.HasStatus {
+			version.Subresources.Status = &apiextensionsv1.CustomResourceSubresourceStatus{}
+		}
+
+		if err := version.SetSchema(&schemaProps); err != nil {
+			return nil, err
+		}
+
+		if ars, exists := apis[apisv1alpha1.GroupResource{
+			Group:    group,
+			Resource: def.Names.Plural,
+		}]; exists {
+			ars.Spec.Versions = append(ars.Spec.Versions, version)
+			continue
+		}
+
 		spec := &apisv1alpha1.APIResourceSchema{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: fmt.Sprintf("internal.%s.%s", def.Names.Plural, group),
 			},
 			Spec: apisv1alpha1.APIResourceSchemaSpec{
-				Group: def.GroupVersion.Group,
-				Names: def.Names,
-				Scope: def.ResourceScope,
-				Versions: []apisv1alpha1.APIResourceVersion{
-					{
-						Name:    def.GroupVersion.Version,
-						Served:  true,
-						Storage: true,
-						Schema:  runtime.RawExtension{},
-					},
-				},
+				Group:    def.GroupVersion.Group,
+				Names:    def.Names,
+				Scope:    def.ResourceScope,
+				Versions: []apisv1alpha1.APIResourceVersion{version},
 			},
 		}
-		if def.HasStatus {
-			spec.Spec.Versions[0].Subresources.Status = &apiextensionsv1.CustomResourceSubresourceStatus{}
-		}
-		if err := spec.Spec.Versions[0].SetSchema(&schemaProps); err != nil {
-			return nil, err
-		}
 
-		apis = append(apis, spec)
+		apis[apisv1alpha1.GroupResource{
+			Group:    gvk.Group,
+			Resource: def.Names.Plural,
+		}] = spec
 	}
+
 	return apis, nil
 }

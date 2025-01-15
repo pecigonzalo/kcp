@@ -51,8 +51,8 @@ func (vw *FixedGroupVersionsVirtualWorkspace) Register(vwName string, rootAPISer
 				StorageBuilders: make(map[string]func(apiGroupAPIServerConfig genericapiserver.CompletedConfig) (restStorage.Storage, error)),
 			},
 		}
-		for resourceName, builder := range restStorageBuilders {
-			cfg.ExtraConfig.StorageBuilders[resourceName] = builder
+		for resourceName, restStorageBuilder := range restStorageBuilders {
+			cfg.ExtraConfig.StorageBuilders[resourceName] = restStorageBuilder
 		}
 
 		scheme := runtime.NewScheme()
@@ -87,12 +87,12 @@ func (vw *FixedGroupVersionsVirtualWorkspace) Register(vwName string, rootAPISer
 		}
 
 		if groupVersionAPISet.OpenAPIDefinitions != nil {
-			spec, err := builder.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(server.GenericAPIServer.Handler.GoRestfulContainer.RegisteredWebServices()), config.GenericConfig.OpenAPIConfig)
+			openAPISpec, err := builder.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(server.GenericAPIServer.Handler.GoRestfulContainer.RegisteredWebServices()), config.GenericConfig.OpenAPIConfig)
 			if err != nil {
 				return nil, err
 			}
-			spec.Definitions = handler.PruneDefaults(spec.Definitions)
-			openAPISpecs = append(openAPISpecs, spec)
+			openAPISpec.Definitions = handler.PruneDefaults(openAPISpec.Definitions)
+			openAPISpecs = append(openAPISpecs, openAPISpec)
 		}
 
 		if vwGroupManager == nil && server.GenericAPIServer.DiscoveryGroupManager != nil {
@@ -100,7 +100,6 @@ func (vw *FixedGroupVersionsVirtualWorkspace) Register(vwName string, rootAPISer
 			// a given virtual workspace, then grab its DiscoveryGroupManager
 			// to reuse it in the next GroupVersionAPIServers for the virtual workspace.
 			vwGroupManager = server.GenericAPIServer.DiscoveryGroupManager
-
 		}
 		if firstAPIServer == nil {
 			// If this GroupVersionAPIServer is the first one for
@@ -121,13 +120,8 @@ func (vw *FixedGroupVersionsVirtualWorkspace) Register(vwName string, rootAPISer
 				return nil, err
 			}
 		}
-		openAPIService, err := handler.NewOpenAPIService(mergedSpec)
-		if err != nil {
-			return nil, err
-		}
-		if err := openAPIService.RegisterOpenAPIVersionedService("/openapi/v2", firstAPIServer.Handler.NonGoRestfulMux); err != nil {
-			return nil, err
-		}
+		openAPIService := handler.NewOpenAPIService(mergedSpec)
+		openAPIService.RegisterOpenAPIVersionedService("/openapi/v2", firstAPIServer.Handler.NonGoRestfulMux)
 	}
 
 	return delegateAPIServer, nil

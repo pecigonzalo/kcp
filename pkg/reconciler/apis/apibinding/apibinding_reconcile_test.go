@@ -21,7 +21,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
@@ -32,19 +32,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	conditionsv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/apis/conditions/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/util/conditions"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	conditionsv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/apis/conditions/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/util/conditions"
 )
 
 // requireConditionMatches looks for a condition matching c in g. Only fields that are set in c are compared (Type is
 // required, though). If c.Message is set, the test performed is contains rather than an exact match.
 func requireConditionMatches(t *testing.T, g conditions.Getter, c *conditionsv1alpha1.Condition) {
-	actual := conditions.Get(g, c.Type)
+	t.Helper()
 
+	actual := conditions.Get(g, c.Type)
 	require.NotNil(t, actual, "missing condition %q", c.Type)
 
 	if c.Status != "" {
@@ -68,25 +68,23 @@ var (
 	unbound = newBindingBuilder().
 		WithClusterName("org:ws").
 		WithName("my-binding").
-		WithWorkspaceReference("org:some-workspace", "some-export")
+		WithExportReference(logicalcluster.NewPath("org:some-workspace"), "some-export")
 
 	binding = unbound.DeepCopy().WithPhase(apisv1alpha1.APIBindingPhaseBinding)
 
 	rebinding = binding.DeepCopy().
-			WithBoundAPIExport("org:some-workspace", "some-export").
 			WithBoundResources(
 			new(boundAPIResourceBuilder).
-				WithGroupResource("kcp.dev", "widgets").
-				WithSchema("today.widgets.kcp.dev", "todaywidgetsuid").
+				WithGroupResource("kcp.io", "widgets").
+				WithSchema("today.widgets.kcp.io", "todaywidgetsuid").
 				WithStorageVersions("v0", "v1").
 				BoundAPIResource,
 		)
 
-	invalidSchema = binding.DeepCopy().WithWorkspaceReference("org:some-workspace", "invalid-schema")
+	invalidSchema = binding.DeepCopy().WithExportReference(logicalcluster.NewPath("org:some-workspace"), "invalid-schema")
 
 	bound = unbound.DeepCopy().
 		WithPhase(apisv1alpha1.APIBindingPhaseBound).
-		WithBoundAPIExport("org:some-workspace", "some-export").
 		WithBoundResources(
 			new(boundAPIResourceBuilder).
 				WithGroupResource("mygroup", "someresources").
@@ -101,25 +99,24 @@ var (
 	conflicting = unbound.DeepCopy().
 			WithName("conflicting").
 			WithPhase(apisv1alpha1.APIBindingPhaseBound).
-			WithWorkspaceReference("org:some-workspace", "conflict").
-			WithBoundAPIExport("org:some-workspace", "conflict").
+			WithExportReference(logicalcluster.NewPath("org:some-workspace"), "conflict").
 			WithBoundResources(
 			new(boundAPIResourceBuilder).
-				WithGroupResource("other.io", "widgets").
-				WithSchema("another.widgets.other.io", "anotherwidgetsuid").
+				WithGroupResource("kcp.io", "widgets").
+				WithSchema("another.widgets.kcp.io", "anotherwidgetsuid").
 				BoundAPIResource,
 		)
 
 	todayWidgetsAPIResourceSchema = &apisv1alpha1.APIResourceSchema{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{
-				logicalcluster.AnnotationKey: "some-workspace",
+				logicalcluster.AnnotationKey: "org-some-workspace",
 			},
-			Name: "today.widgets.kcp.dev",
+			Name: "today.widgets.kcp.io",
 			UID:  "todaywidgetsuid",
 		},
 		Spec: apisv1alpha1.APIResourceSchemaSpec{
-			Group: "kcp.dev",
+			Group: "kcp.io",
 			Names: apiextensionsv1.CustomResourceDefinitionNames{
 				Plural:   "widgets",
 				Singular: "widget",
@@ -142,11 +139,11 @@ var (
 
 	someOtherWidgetsAPIResourceSchema = &apisv1alpha1.APIResourceSchema{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "another.widgets.other.io",
+			Name: "another.widgets.kcp.io",
 			UID:  "anotherwidgetsuid",
 		},
 		Spec: apisv1alpha1.APIResourceSchemaSpec{
-			Group: "other.io",
+			Group: "kcp.io",
 			Names: apiextensionsv1.CustomResourceDefinitionNames{
 				Plural:   "widgets",
 				Singular: "widget",
@@ -173,9 +170,10 @@ func TestReconcileNew(t *testing.T) {
 
 	c := &controller{}
 
-	err := c.reconcile(context.Background(), apiBinding)
+	requeue, err := c.reconcile(context.Background(), apiBinding)
 	require.NoError(t, err)
 	require.Equal(t, apisv1alpha1.APIBindingPhaseBinding, apiBinding.Status.Phase)
+	require.False(t, requeue)
 	requireConditionMatches(t, apiBinding, conditions.FalseCondition(conditionsv1alpha1.ReadyCondition, "", "", ""))
 }
 
@@ -193,12 +191,14 @@ func TestReconcileBinding(t *testing.T) {
 		updateCRDError                          error
 		deletedCRDs                             []string
 		wantError                               bool
+		wantRequeue                             bool
 		wantInvalidReference                    bool
 		wantAPIExportNotFound                   bool
 		wantAPIExportInternalError              bool
 		wantWaitingForEstablished               bool
 		wantAPIExportValid                      bool
 		wantReady                               bool
+		wantNoReady                             bool
 		wantBoundAPIExport                      bool
 		wantInitialBindingComplete              bool
 		wantInitialBindingCompleteInternalError bool
@@ -238,7 +238,8 @@ func TestReconcileBinding(t *testing.T) {
 		},
 		"APIExport doesn't have identity hash yet": {
 			apiBinding: binding.DeepCopy().
-				WithWorkspaceReference("org:some-workspace", "no-identity-hash").Build(),
+				WithExportReference(logicalcluster.NewPath("org:some-workspace"), "no-identity-hash").
+				Build(),
 			wantAPIExportValid: false,
 		},
 		"APIResourceSchema invalid": {
@@ -253,7 +254,6 @@ func TestReconcileBinding(t *testing.T) {
 		},
 		"create CRD fails - invalid": {
 			apiBinding:                              binding.Build(),
-			getCRDError:                             apierrors.NewNotFound(schema.GroupResource{}, ""),
 			wantCreateCRD:                           true,
 			createCRDError:                          apierrors.NewInvalid(apiextensionsv1.Kind("CustomResourceDefinition"), "todaywidgetsuid", field.ErrorList{field.Forbidden(field.NewPath("foo"), "details")}),
 			wantInitialBindingCompleteSchemaInvalid: true,
@@ -261,7 +261,6 @@ func TestReconcileBinding(t *testing.T) {
 		},
 		"create CRD fails - other error": {
 			apiBinding:                              binding.Build(),
-			getCRDError:                             apierrors.NewNotFound(schema.GroupResource{}, ""),
 			wantCreateCRD:                           true,
 			createCRDError:                          errors.New("foo"),
 			wantInitialBindingCompleteInternalError: true,
@@ -269,7 +268,6 @@ func TestReconcileBinding(t *testing.T) {
 		},
 		"create CRD - no other bindings": {
 			apiBinding:                binding.Build(),
-			getCRDError:               apierrors.NewNotFound(schema.GroupResource{}, ""),
 			wantCreateCRD:             true,
 			wantWaitingForEstablished: true,
 			wantAPIExportValid:        true,
@@ -281,7 +279,6 @@ func TestReconcileBinding(t *testing.T) {
 			existingAPIBindings: []*apisv1alpha1.APIBinding{
 				bound.Build(),
 			},
-			getCRDError:               apierrors.NewNotFound(schema.GroupResource{}, ""),
 			wantCreateCRD:             true,
 			wantWaitingForEstablished: true,
 			wantAPIExportValid:        true,
@@ -293,8 +290,10 @@ func TestReconcileBinding(t *testing.T) {
 			existingAPIBindings: []*apisv1alpha1.APIBinding{
 				conflicting.Build(),
 			},
-			getCRDError:        apierrors.NewNotFound(schema.GroupResource{}, ""),
 			wantNamingConflict: true,
+			wantError:          true,
+			wantRequeue:        true,
+			wantNoReady:        true,
 		},
 		"bind existing CRD - other bindings - conflicts": {
 			apiBinding: binding.Build(),
@@ -303,6 +302,9 @@ func TestReconcileBinding(t *testing.T) {
 				conflicting.Build(),
 			},
 			wantNamingConflict: true,
+			wantError:          true,
+			wantRequeue:        true,
+			wantNoReady:        true,
 		},
 		"CRD already exists but isn't established yet": {
 			apiBinding:                binding.Build(),
@@ -327,10 +329,10 @@ func TestReconcileBinding(t *testing.T) {
 			wantBoundAPIExport: true,
 			wantBoundResources: []apisv1alpha1.BoundAPIResource{
 				{
-					Group:    "kcp.dev",
+					Group:    "kcp.io",
 					Resource: "widgets",
 					Schema: apisv1alpha1.BoundAPIResourceSchema{
-						Name:         "today.widgets.kcp.dev",
+						Name:         "today.widgets.kcp.io",
 						UID:          "todaywidgetsuid",
 						IdentityHash: "hash1",
 					},
@@ -351,10 +353,10 @@ func TestReconcileBinding(t *testing.T) {
 			wantBoundAPIExport: true,
 			wantBoundResources: []apisv1alpha1.BoundAPIResource{
 				{
-					Group:    "kcp.dev",
+					Group:    "kcp.io",
 					Resource: "widgets",
 					Schema: apisv1alpha1.BoundAPIResourceSchema{
-						Name:         "today.widgets.kcp.dev",
+						Name:         "today.widgets.kcp.io",
 						UID:          "todaywidgetsuid",
 						IdentityHash: "hash1",
 					},
@@ -374,33 +376,33 @@ func TestReconcileBinding(t *testing.T) {
 				"some-export": {
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							logicalcluster.AnnotationKey: "some-export",
+							logicalcluster.AnnotationKey: "org-some-workspace",
 						},
-						Name: "some-workspace",
+						Name: "some-export",
 					},
 					Spec: apisv1alpha1.APIExportSpec{
-						LatestResourceSchemas: []string{"today.widgets.kcp.dev"},
+						LatestResourceSchemas: []string{"today.widgets.kcp.io"},
 					},
 					Status: apisv1alpha1.APIExportStatus{IdentityHash: "hash1"},
 				},
 				"conflict": {
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							logicalcluster.AnnotationKey: "conflict",
+							logicalcluster.AnnotationKey: "org-some-workspace",
 						},
-						Name: "some-workspace",
+						Name: "conflict",
 					},
 					Spec: apisv1alpha1.APIExportSpec{
-						LatestResourceSchemas: []string{"another.widgets.other.io"},
+						LatestResourceSchemas: []string{"another.widgets.kcp.io"},
 					},
 					Status: apisv1alpha1.APIExportStatus{IdentityHash: "hash2"},
 				},
 				"invalid-schema": {
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							logicalcluster.AnnotationKey: "invalid-schema",
+							logicalcluster.AnnotationKey: "org-some-workspace",
 						},
-						Name: "some-workspace",
+						Name: "invalid-schema",
 					},
 					Spec: apisv1alpha1.APIExportSpec{
 						LatestResourceSchemas: []string{"invalid.schema.io"},
@@ -410,12 +412,12 @@ func TestReconcileBinding(t *testing.T) {
 				"no-identity-hash": {
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							logicalcluster.AnnotationKey: "some-export",
+							logicalcluster.AnnotationKey: "org-some-workspace",
 						},
-						Name: "some-workspace",
+						Name: "some-export",
 					},
 					Spec: apisv1alpha1.APIExportSpec{
-						LatestResourceSchemas: []string{"today.widgets.kcp.dev"},
+						LatestResourceSchemas: []string{"today.widgets.kcp.io"},
 					},
 				},
 			}
@@ -424,9 +426,9 @@ func TestReconcileBinding(t *testing.T) {
 				"invalid.schema.io": {
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							logicalcluster.AnnotationKey: "invalid.schema.io",
+							logicalcluster.AnnotationKey: "org-some-workspace",
 						},
-						Name: "some-workspace",
+						Name: "invalid.schema.io",
 					},
 					Spec: apisv1alpha1.APIResourceSchemaSpec{
 						Versions: []apisv1alpha1.APIResourceVersion{
@@ -438,16 +440,16 @@ func TestReconcileBinding(t *testing.T) {
 						},
 					},
 				},
-				"today.widgets.kcp.dev":    todayWidgetsAPIResourceSchema,
-				"another.widgets.other.io": someOtherWidgetsAPIResourceSchema,
+				"today.widgets.kcp.io":   todayWidgetsAPIResourceSchema,
+				"another.widgets.kcp.io": someOtherWidgetsAPIResourceSchema,
 			}
 
 			c := &controller{
 				listAPIBindings: func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIBinding, error) {
 					return tc.existingAPIBindings, nil
 				},
-				getAPIExport: func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIExport, error) {
-					require.Equal(t, "org:some-workspace", clusterName.String())
+				getAPIExportByPath: func(path logicalcluster.Path, name string) (*apisv1alpha1.APIExport, error) {
+					require.Equal(t, "org:some-workspace", path.String())
 					return apiExports[name], tc.getAPIExportError
 				},
 				getAPIResourceSchema: func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIResourceSchema, error) {
@@ -455,31 +457,19 @@ func TestReconcileBinding(t *testing.T) {
 						return nil, tc.getAPIResourceSchemaError
 					}
 
-					require.Equal(t, "org:some-workspace", clusterName.String())
+					require.Equal(t, "org-some-workspace", clusterName.String())
 
-					schema, ok := apiResourceSchemas[name]
+					s, ok := apiResourceSchemas[name]
 					if !ok {
 						return nil, apierrors.NewNotFound(apisv1alpha1.Resource("apiresourceschemas"), name)
 					}
 
-					return schema, nil
+					return s, nil
 				},
 				getCRD: func(clusterName logicalcluster.Name, name string) (*apiextensionsv1.CustomResourceDefinition, error) {
-					require.Equal(t, ShadowWorkspaceName, clusterName)
+					require.Equal(t, SystemBoundCRDsClusterName, clusterName)
 
-					// for conflicts
-					if name == "anotherwidgetsuid" {
-						return &apiextensionsv1.CustomResourceDefinition{
-							Spec: apiextensionsv1.CustomResourceDefinitionSpec{Group: "kcp.dev"},
-							Status: apiextensionsv1.CustomResourceDefinitionStatus{
-								AcceptedNames: apiextensionsv1.CustomResourceDefinitionNames{
-									Plural: "widgets",
-								},
-							},
-						}, nil
-					}
-
-					if !tc.crdExists {
+					if tc.getCRDError != nil {
 						return nil, tc.getCRDError
 					}
 
@@ -487,6 +477,21 @@ func TestReconcileBinding(t *testing.T) {
 						Status: apiextensionsv1.CustomResourceDefinitionStatus{
 							StoredVersions: tc.crdStorageVersions,
 						},
+					}
+
+					if name == "anotherwidgetsuid" {
+						crd.Spec.Group = "kcp.io"
+						crd.Spec.Names = apiextensionsv1.CustomResourceDefinitionNames{
+							Plural: "widgets",
+						}
+						crd.Status.AcceptedNames = apiextensionsv1.CustomResourceDefinitionNames{
+							Plural: "widgets",
+						}
+						return crd, nil
+					}
+
+					if !tc.crdExists {
+						return nil, apierrors.NewNotFound(schema.GroupResource{}, "")
 					}
 
 					if tc.crdEstablished {
@@ -498,19 +503,17 @@ func TestReconcileBinding(t *testing.T) {
 
 					return crd, nil
 				},
-				createCRD: func(ctx context.Context, clusterName logicalcluster.Name, crd *apiextensionsv1.CustomResourceDefinition) (*apiextensionsv1.CustomResourceDefinition, error) {
+				listCRDs: func(clusterName logicalcluster.Name) ([]*apiextensionsv1.CustomResourceDefinition, error) {
+					return nil, nil
+				},
+				createCRD: func(ctx context.Context, clusterName logicalcluster.Path, crd *apiextensionsv1.CustomResourceDefinition) (*apiextensionsv1.CustomResourceDefinition, error) {
 					createCRDCalled = true
 					return crd, tc.createCRDError
 				},
 				deletedCRDTracker: &lockedStringSet{},
-				crdIndexer:        cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}),
 			}
 
-			if err := c.crdIndexer.AddIndexers(cache.Indexers{indexByWorkspace: indexByWorkspaceFunc}); err != nil {
-				t.Fatal(err)
-			}
-
-			err := c.reconcile(context.Background(), tc.apiBinding)
+			requeue, err := c.reconcile(context.Background(), tc.apiBinding)
 
 			if tc.wantError {
 				require.Error(t, err)
@@ -518,6 +521,7 @@ func TestReconcileBinding(t *testing.T) {
 				require.NoError(t, err)
 			}
 
+			require.Equal(t, tc.wantRequeue, requeue, "mismatched requeue, want: %v, got: %v", tc.wantRequeue, requeue)
 			require.Equal(t, tc.wantCreateCRD, createCRDCalled, "mismatch on CRD creation expectation")
 
 			if tc.wantInvalidReference {
@@ -560,17 +564,12 @@ func TestReconcileBinding(t *testing.T) {
 				requireConditionMatches(t, tc.apiBinding, conditions.TrueCondition(apisv1alpha1.APIExportValid))
 			}
 
-			if tc.wantReady {
+			if tc.wantNoReady {
+				require.False(t, conditions.Has(tc.apiBinding, conditionsv1alpha1.ReadyCondition), "unexpected Ready condition")
+			} else if tc.wantReady {
 				requireConditionMatches(t, tc.apiBinding, conditions.TrueCondition(conditionsv1alpha1.ReadyCondition))
 			} else {
 				requireConditionMatches(t, tc.apiBinding, conditions.FalseCondition(conditionsv1alpha1.ReadyCondition, "", "", ""))
-			}
-
-			if tc.wantBoundAPIExport {
-				require.NotNil(t, tc.apiBinding.Status.BoundAPIExport)
-				require.Equal(t, tc.apiBinding.Spec.Reference, *tc.apiBinding.Status.BoundAPIExport)
-			} else {
-				require.Nil(t, tc.apiBinding.Status.BoundAPIExport)
 			}
 
 			if tc.wantInitialBindingComplete {
@@ -607,7 +606,7 @@ func TestReconcileBinding(t *testing.T) {
 					Status:   corev1.ConditionFalse,
 					Severity: conditionsv1alpha1.ConditionSeverityError,
 					Reason:   apisv1alpha1.NamingConflictsReason,
-					Message:  "naming conflict with a bound API conflicting, spec.names.plural=widgets is forbidden",
+					Message:  "naming conflict with APIBinding \"conflicting\" bound to APIExport org:some-workspace:conflict: spec.names.plural=widgets is forbidden",
 				})
 			}
 
@@ -626,120 +625,6 @@ func TestReconcileBinding(t *testing.T) {
 					Status:   corev1.ConditionFalse,
 					Severity: conditionsv1alpha1.ConditionSeverityError,
 					Reason:   apisv1alpha1.APIResourceSchemaInvalidReason,
-				})
-			}
-		})
-	}
-}
-
-func TestReconcileBound(t *testing.T) {
-	tests := map[string]struct {
-		apiBinding            *apisv1alpha1.APIBinding
-		apiExport             *apisv1alpha1.APIExport
-		getAPIExportError     error
-		apiResourceSchemas    map[string]*apisv1alpha1.APIResourceSchema
-		wantRebinding         bool
-		wantPhase             string
-		wantError             bool
-		wantAPIExportNotFound bool
-	}{
-		"rebinding when referenced export changes": {
-			apiBinding: bound.DeepCopy().
-				WithWorkspaceReference("root:org:new-workspace", "new-export").
-				Build(),
-			wantRebinding: true,
-			wantPhase:     "Bound",
-		},
-		"rebinding when export changes what it's exporting": {
-			apiBinding: bound.Build(),
-			apiExport: &apisv1alpha1.APIExport{
-				Spec: apisv1alpha1.APIExportSpec{
-					LatestResourceSchemas: []string{"someresources", "moreresources"},
-				},
-			},
-			apiResourceSchemas: map[string]*apisv1alpha1.APIResourceSchema{
-				"someresources": {
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "someresources",
-						UID:  "uid1",
-					},
-				},
-				"moreresources": {
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "moreresources",
-						UID:  "uid3",
-					},
-				},
-			},
-			wantRebinding: true,
-			wantPhase:     "Bound",
-		},
-		"rebinding when bound APIResourceSchema UID changes": {
-			apiBinding: bound.Build(),
-			apiExport: &apisv1alpha1.APIExport{
-				Spec: apisv1alpha1.APIExportSpec{
-					LatestResourceSchemas: []string{"someresources", "otherresources"},
-				},
-			},
-			apiResourceSchemas: map[string]*apisv1alpha1.APIResourceSchema{
-				"someresources": {
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "someresources",
-						UID:  "uid1",
-					},
-				},
-				"otherresources": {
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "otherresources",
-						UID:  "newuid",
-					},
-				},
-			},
-			wantRebinding: true,
-			wantPhase:     "Bound",
-		},
-		"APIExportValid warning condition set when error getting previously bound APIExport": {
-			apiBinding:            bound.Build(),
-			getAPIExportError:     apierrors.NewNotFound(schema.GroupResource{}, "foo"),
-			wantAPIExportNotFound: true,
-			wantPhase:             "Bound",
-		},
-	}
-
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			c := &controller{
-				getAPIExport: func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIExport, error) {
-					require.Equal(t, "org:some-workspace", clusterName.String())
-					require.Equal(t, "some-export", name)
-					return tc.apiExport, tc.getAPIExportError
-				},
-				getAPIResourceSchema: func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIResourceSchema, error) {
-					require.Equal(t, "org:some-workspace", clusterName.String())
-					return tc.apiResourceSchemas[name], nil
-				},
-				listAPIBindings: func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIBinding, error) {
-					// TODO: Add tests for reconcile permisonclaims, this is to prevent a nil panic in reconciling permission claims.
-					return []*apisv1alpha1.APIBinding{}, nil
-				},
-			}
-
-			rebind, err := c.reconcileBound(context.Background(), tc.apiBinding)
-			if tc.wantError {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-
-			require.Equal(t, tc.wantRebinding, rebind, "rebinding expected to be %v", tc.wantRebinding)
-			require.Equal(t, apisv1alpha1.APIBindingPhaseType(tc.wantPhase), tc.apiBinding.Status.Phase, "phase expected to be %q, got %q", tc.wantPhase, tc.apiBinding.Status.Phase)
-
-			if tc.wantAPIExportNotFound {
-				requireConditionMatches(t, tc.apiBinding, &conditionsv1alpha1.Condition{
-					Type:     apisv1alpha1.APIExportValid,
-					Status:   corev1.ConditionFalse,
-					Severity: conditionsv1alpha1.ConditionSeverityWarning,
-					Reason:   apisv1alpha1.APIExportNotFoundReason,
 				})
 			}
 		})
@@ -778,7 +663,7 @@ func TestCRDFromAPIResourceSchema(t *testing.T) {
 							Served:             true,
 							Storage:            false,
 							Deprecated:         true,
-							DeprecationWarning: pointer.StringPtr("deprecated!"),
+							DeprecationWarning: ptr.To("deprecated!"),
 							Schema: runtime.RawExtension{
 								Raw: []byte(`
 {
@@ -792,7 +677,7 @@ func TestCRDFromAPIResourceSchema(t *testing.T) {
 								Scale: &apiextensionsv1.CustomResourceSubresourceScale{
 									SpecReplicasPath:   ".spec.replicas",
 									StatusReplicasPath: ".status.replicas",
-									LabelSelectorPath:  pointer.StringPtr(".status.selector"),
+									LabelSelectorPath:  ptr.To(".status.selector"),
 								},
 							},
 							AdditionalPrinterColumns: []apiextensionsv1.CustomResourceColumnDefinition{
@@ -824,7 +709,7 @@ func TestCRDFromAPIResourceSchema(t *testing.T) {
 								Scale: &apiextensionsv1.CustomResourceSubresourceScale{
 									SpecReplicasPath:   ".spec.replicas",
 									StatusReplicasPath: ".status.replicas",
-									LabelSelectorPath:  pointer.StringPtr(".status.selector"),
+									LabelSelectorPath:  ptr.To(".status.selector"),
 								},
 							},
 							AdditionalPrinterColumns: []apiextensionsv1.CustomResourceColumnDefinition{
@@ -839,13 +724,16 @@ func TestCRDFromAPIResourceSchema(t *testing.T) {
 							},
 						},
 					},
+					Conversion: &apisv1alpha1.CustomResourceConversion{
+						Strategy: "None",
+					},
 				},
 			},
 			want: &apiextensionsv1.CustomResourceDefinition{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "my-uuid",
 					Annotations: map[string]string{
-						logicalcluster.AnnotationKey:            ShadowWorkspaceName.String(),
+						logicalcluster.AnnotationKey:            SystemBoundCRDsClusterName.String(),
 						apisv1alpha1.AnnotationBoundCRDKey:      "",
 						apisv1alpha1.AnnotationSchemaClusterKey: "my-cluster",
 						apisv1alpha1.AnnotationSchemaNameKey:    "my-name",
@@ -868,7 +756,7 @@ func TestCRDFromAPIResourceSchema(t *testing.T) {
 							Served:             true,
 							Storage:            false,
 							Deprecated:         true,
-							DeprecationWarning: pointer.StringPtr("deprecated!"),
+							DeprecationWarning: ptr.To("deprecated!"),
 							Schema: &apiextensionsv1.CustomResourceValidation{
 								OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
 									Description: "foo",
@@ -880,7 +768,7 @@ func TestCRDFromAPIResourceSchema(t *testing.T) {
 								Scale: &apiextensionsv1.CustomResourceSubresourceScale{
 									SpecReplicasPath:   ".spec.replicas",
 									StatusReplicasPath: ".status.replicas",
-									LabelSelectorPath:  pointer.StringPtr(".status.selector"),
+									LabelSelectorPath:  ptr.To(".status.selector"),
 								},
 							},
 							AdditionalPrinterColumns: []apiextensionsv1.CustomResourceColumnDefinition{
@@ -910,7 +798,7 @@ func TestCRDFromAPIResourceSchema(t *testing.T) {
 								Scale: &apiextensionsv1.CustomResourceSubresourceScale{
 									SpecReplicasPath:   ".spec.replicas",
 									StatusReplicasPath: ".status.replicas",
-									LabelSelectorPath:  pointer.StringPtr(".status.selector"),
+									LabelSelectorPath:  ptr.To(".status.selector"),
 								},
 							},
 							AdditionalPrinterColumns: []apiextensionsv1.CustomResourceColumnDefinition{
@@ -925,11 +813,104 @@ func TestCRDFromAPIResourceSchema(t *testing.T) {
 							},
 						},
 					},
-					Conversion:            nil,
+					Conversion: &apiextensionsv1.CustomResourceConversion{
+						Strategy: "None",
+					},
 					PreserveUnknownFields: false,
 				},
 			},
 			wantErr: false,
+		},
+		"error when multiple versions specified but no conversion strategy type": {
+			schema: &apisv1alpha1.APIResourceSchema{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						logicalcluster.AnnotationKey: "my-cluster",
+					},
+					Name: "my-name",
+					UID:  types.UID("my-uuid"),
+				},
+				Spec: apisv1alpha1.APIResourceSchemaSpec{
+					Group: "my-group",
+					Names: apiextensionsv1.CustomResourceDefinitionNames{
+						Plural:     "widgets",
+						Singular:   "widget",
+						ShortNames: []string{"w"},
+						Kind:       "Widget",
+						ListKind:   "WidgetList",
+						Categories: []string{"things"},
+					},
+					Scope: apiextensionsv1.NamespaceScoped,
+					Versions: []apisv1alpha1.APIResourceVersion{
+						{
+							Name:               "v1",
+							Served:             true,
+							Storage:            false,
+							Deprecated:         true,
+							DeprecationWarning: ptr.To("deprecated!"),
+							Schema: runtime.RawExtension{
+								Raw: []byte(`
+{
+	"description": "foo",
+	"type": "object"
+}
+								`),
+							},
+							Subresources: apiextensionsv1.CustomResourceSubresources{
+								Status: &apiextensionsv1.CustomResourceSubresourceStatus{},
+								Scale: &apiextensionsv1.CustomResourceSubresourceScale{
+									SpecReplicasPath:   ".spec.replicas",
+									StatusReplicasPath: ".status.replicas",
+									LabelSelectorPath:  ptr.To(".status.selector"),
+								},
+							},
+							AdditionalPrinterColumns: []apiextensionsv1.CustomResourceColumnDefinition{
+								{
+									Name:        "My Column",
+									Type:        "string",
+									Format:      "string",
+									Description: "This is my column",
+									Priority:    1,
+									JSONPath:    ".spec.myColumn",
+								},
+							},
+						},
+						{
+							Name:       "v2",
+							Served:     true,
+							Storage:    true,
+							Deprecated: false,
+							Schema: runtime.RawExtension{
+								Raw: []byte(`
+{
+	"description": "foo",
+	"type": "object"
+}
+								`),
+							},
+							Subresources: apiextensionsv1.CustomResourceSubresources{
+								Status: &apiextensionsv1.CustomResourceSubresourceStatus{},
+								Scale: &apiextensionsv1.CustomResourceSubresourceScale{
+									SpecReplicasPath:   ".spec.replicas",
+									StatusReplicasPath: ".status.replicas",
+									LabelSelectorPath:  ptr.To(".status.selector"),
+								},
+							},
+							AdditionalPrinterColumns: []apiextensionsv1.CustomResourceColumnDefinition{
+								{
+									Name:        "My Column",
+									Type:        "string",
+									Format:      "string",
+									Description: "This is my column",
+									Priority:    1,
+									JSONPath:    ".spec.myColumn",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
 		},
 		"error when schema is invalid": {
 			schema: &apisv1alpha1.APIResourceSchema{
@@ -983,11 +964,11 @@ func (b *bindingBuilder) Build() *apisv1alpha1.APIBinding {
 	return b.APIBinding.DeepCopy()
 }
 
-func (b *bindingBuilder) WithClusterName(clusterName string) *bindingBuilder {
+func (b *bindingBuilder) WithClusterName(clusterName logicalcluster.Name) *bindingBuilder {
 	if b.Annotations == nil {
 		b.Annotations = make(map[string]string)
 	}
-	b.Annotations[logicalcluster.AnnotationKey] = clusterName
+	b.Annotations[logicalcluster.AnnotationKey] = string(clusterName)
 	return b
 }
 
@@ -997,30 +978,20 @@ func (b *bindingBuilder) WithName(name string) *bindingBuilder {
 }
 
 func (b *bindingBuilder) WithoutWorkspaceReference() *bindingBuilder {
-	b.Spec.Reference.Workspace = nil
+	b.Spec.Reference.Export = nil
 	return b
 }
 
-func (b *bindingBuilder) WithWorkspaceReference(path, exportName string) *bindingBuilder {
-	b.Spec.Reference.Workspace = &apisv1alpha1.WorkspaceExportReference{
-		Path:       path,
-		ExportName: exportName,
+func (b *bindingBuilder) WithExportReference(path logicalcluster.Path, exportName string) *bindingBuilder {
+	b.Spec.Reference.Export = &apisv1alpha1.ExportBindingReference{
+		Path: path.String(),
+		Name: exportName,
 	}
 	return b
 }
 
 func (b *bindingBuilder) WithPhase(phase apisv1alpha1.APIBindingPhaseType) *bindingBuilder {
 	b.Status.Phase = phase
-	return b
-}
-
-func (b *bindingBuilder) WithBoundAPIExport(path, exportName string) *bindingBuilder {
-	b.Status.BoundAPIExport = &apisv1alpha1.ExportReference{
-		Workspace: &apisv1alpha1.WorkspaceExportReference{
-			Path:       path,
-			ExportName: exportName,
-		},
-	}
 	return b
 }
 

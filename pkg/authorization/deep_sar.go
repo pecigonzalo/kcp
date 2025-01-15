@@ -91,13 +91,13 @@ func WithDeepSubjectAccessReview(handler http.Handler) http.Handler {
 			return
 		}
 
-		// only for system:masters
+		// only for privileged user
 		user, ok := genericapirequest.UserFrom(r.Context())
 		if !ok {
 			responsewriters.InternalError(w, r, fmt.Errorf("cannot get user"))
 			return
 		}
-		if !sets.NewString(user.GetGroups()...).Has(kuser.SystemPrivilegedGroup) {
+		if !sets.New[string](user.GetGroups()...).Has(kuser.SystemPrivilegedGroup) {
 			handler.ServeHTTP(w, r)
 			return
 		}

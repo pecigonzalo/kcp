@@ -29,13 +29,13 @@ import (
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/tools/cache"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
 	"github.com/kcp-dev/kcp/pkg/permissionclaim"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 const (
-	PluginName = "apis.kcp.dev/PermissionClaims"
+	PluginName = "apis.kcp.io/PermissionClaims"
 )
 
 func Register(plugins *admission.Plugins) {
@@ -112,7 +112,6 @@ func (m *mutatingPermissionClaims) Admit(ctx context.Context, a admission.Attrib
 	u.SetLabels(labels)
 
 	return nil
-
 }
 
 func (m *mutatingPermissionClaims) Validate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
@@ -163,11 +162,13 @@ func (m *mutatingPermissionClaims) Validate(ctx context.Context, a admission.Att
 }
 
 // SetKcpInformers implements the WantsExternalKcpInformerFactory interface.
-func (m *mutatingPermissionClaims) SetKcpInformers(f kcpinformers.SharedInformerFactory) {
-	m.apiBindingsHasSynced = f.Apis().V1alpha1().APIBindings().Informer().HasSynced
+func (m *mutatingPermissionClaims) SetKcpInformers(local, global kcpinformers.SharedInformerFactory) {
+	m.apiBindingsHasSynced = local.Apis().V1alpha1().APIBindings().Informer().HasSynced
 
 	m.permissionClaimLabeler = permissionclaim.NewLabeler(
-		f.Apis().V1alpha1().APIBindings(),
+		local.Apis().V1alpha1().APIBindings(),
+		local.Apis().V1alpha1().APIExports(),
+		global.Apis().V1alpha1().APIExports(),
 	)
 }
 

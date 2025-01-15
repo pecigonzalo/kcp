@@ -24,13 +24,13 @@ import (
 	apiextensionsv1client "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/kcp-dev/kcp/pkg/apis/tenancy"
+	"github.com/kcp-dev/kcp/sdk/apis/tenancy"
 )
 
 func TestCreateFromFS(t *testing.T) {
 	tests := []struct {
 		name    string
-		ctx     context.Context
+		ctx     context.Context //nolint:containedctx
 		client  apiextensionsv1client.CustomResourceDefinitionInterface
 		fs      embed.FS
 		grs     []metav1.GroupResource

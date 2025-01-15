@@ -18,19 +18,19 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
 	_ "net/http/pprof"
 	"net/url"
 	"path"
 	"sort"
 	"strings"
 
-	"github.com/emicklei/go-restful"
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/emicklei/go-restful/v3"
 	jwt2 "gopkg.in/square/go-jose.v2/jwt"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	"k8s.io/apiextensions-apiserver/pkg/kcp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -42,15 +42,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/sets"
-	kaudit "k8s.io/apiserver/pkg/audit"
 	apiserverdiscovery "k8s.io/apiserver/pkg/endpoints/discovery"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/request"
+	clientgotransport "k8s.io/client-go/transport"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/genericcontrolplane/aggregator"
+	"k8s.io/kubernetes/pkg/controlplane/apiserver/miniaggregator"
 
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	tenancyv1beta1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1beta1"
+	authorizationbootstrap "github.com/kcp-dev/kcp/pkg/authorization/bootstrap"
 )
 
 var (
@@ -94,47 +93,46 @@ func UserAgentFrom(ctx context.Context) string {
 	return ""
 }
 
-// WithAuditAnnotation initializes audit annotations in the context. Without
-// initialization kaudit.AddAuditAnnotation isn't preserved.
-func WithAuditAnnotation(handler http.Handler) http.HandlerFunc {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		handler.ServeHTTP(w, req.WithContext(
-			kaudit.WithAuditAnnotations(req.Context()),
-		))
-	})
-}
-
-// WithWorkspaceProjection maps the personal virtual workspace "workspaces" resource into the cluster
-// workspace URL space. This means you can do `kubectl get workspaces` from an org workspace.
-func WithWorkspaceProjection(apiHandler http.Handler) http.HandlerFunc {
-	toRedirectPath := path.Join("/apis", tenancyv1beta1.SchemeGroupVersion.Group, tenancyv1beta1.SchemeGroupVersion.Version, "workspaces/")
-	getHomeWorkspaceRequestPath := path.Join(toRedirectPath, "~")
-
+// WithVirtualWorkspacesProxy proxies internal requests to virtual workspaces (i.e., requests that did
+// not go through the front proxy) to the external virtual workspaces server. Proxying is required to avoid
+// certificate verification errors because these requests typically come from the kcp loopback client, and it is
+// impossible to use that client against any server other than kcp.
+func WithVirtualWorkspacesProxy(apiHandler http.Handler, shardVirtualWorkspaceURL *url.URL, transport http.RoundTripper, proxy *httputil.ReverseProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		logger := klog.FromContext(req.Context())
-		cluster := request.ClusterFrom(req.Context())
-		if cluster.Name.Empty() {
+
+		if !strings.HasPrefix(req.URL.Path, "/services/") {
 			apiHandler.ServeHTTP(w, req)
 			return
 		}
 
-		if cluster.Name == tenancyv1alpha1.RootCluster && req.URL.Path == getHomeWorkspaceRequestPath {
-			// Do not rewrite URL to point to the `workspaces` virtual workspace if we are in the special case
-			// of a `kubectl get workspace ~` request which returns the Home workspace definition of the
-			// current user.
-			// This special request is managed later in the handler chain by the home workspace handler.
-			apiHandler.ServeHTTP(w, req)
+		if shardVirtualWorkspaceURL == nil || transport == nil {
+			// This handler func is only installed when these are both set. If this happens, it means we've regressed
+			// in the installation of this handler func, and a panic is appropriate.
+			panic("both shardVirtualWorkspaceURL and transport are required")
+		}
+
+		user, ok := request.UserFrom(req.Context())
+		if !ok {
+			responsewriters.ErrorNegotiated(
+				apierrors.NewInternalError(fmt.Errorf("no user in context")),
+				errorCodecs, schema.GroupVersion{}, w, req,
+			)
 			return
 		}
 
-		if strings.HasPrefix(req.URL.Path, toRedirectPath) {
-			newPath := path.Join("/services/workspaces", cluster.Name.String(), req.URL.Path)
-			logger = logger.WithValues("from", path.Join(cluster.Name.Path(), req.URL.Path), "to", newPath)
-			logger.V(4).Info("rewriting path")
-			req.URL.Path = newPath
-		}
+		proxy.Transport = clientgotransport.NewImpersonatingRoundTripper(
+			clientgotransport.ImpersonationConfig{
+				UserName: user.GetName(),
+				UID:      user.GetUID(),
+				Groups:   user.GetGroups(),
+				Extra:    user.GetExtra(),
+			},
+			transport,
+		)
 
-		apiHandler.ServeHTTP(w, req)
+		logger.V(4).Info("proxying virtual workspace", "target", req.URL.String())
+		proxy.ServeHTTP(w, req)
 	}
 }
 
@@ -153,7 +151,7 @@ func WithWildcardListWatchGuard(apiHandler http.Handler) http.HandlerFunc {
 				return
 			}
 
-			if requestInfo.IsResourceRequest && !sets.NewString("list", "watch").Has(requestInfo.Verb) {
+			if requestInfo.IsResourceRequest && !sets.New[string]("list", "watch").Has(requestInfo.Verb) {
 				statusErr := apierrors.NewMethodNotSupported(schema.GroupResource{Group: requestInfo.APIGroup, Resource: requestInfo.Resource}, requestInfo.Verb)
 				statusErr.ErrStatus.Message += " in the `*` logical cluster"
 
@@ -174,11 +172,10 @@ func WithWildcardListWatchGuard(apiHandler http.Handler) http.HandlerFunc {
 // from an InCluster service account requests (InCluster clients don't support prefixes).
 func WithInClusterServiceAccountRequestRewrite(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		// some headers we set to set logical clusters, those are not the requests from InCluster clients
-		clusterHeader := req.Header.Get(logicalcluster.ClusterHeader)
+		// some header we set for sharding, those are not the requests from InCluster clients
 		shardedHeader := req.Header.Get("X-Kubernetes-Sharded-Request")
 
-		if clusterHeader != "" || shardedHeader != "" {
+		if shardedHeader != "" {
 			handler.ServeHTTP(w, req)
 			return
 		}
@@ -259,6 +256,89 @@ func WithRequestIdentity(handler http.Handler) http.Handler {
 	})
 }
 
+type privilege int
+
+const (
+	unprivileged privilege = iota
+	priviledged
+	superPrivileged
+)
+
+var (
+	// specialGroups specify groups with special meaning kcp. Lower privilege (= lower number)
+	// cannot impersonate higher privilege levels.
+	specialGroups = map[string]privilege{
+		authorizationbootstrap.SystemMastersGroup:  superPrivileged,
+		authorizationbootstrap.SystemKcpAdminGroup: priviledged,
+	}
+)
+
+// WithImpersonationGatekeeper checks the request for impersonations and validates them,
+// if they are valid. If they are not, will return a 403.
+// We check for impersonation in the request headers, early to avoid it being propagated to
+// the backend services.
+func WithImpersonationGatekeeper(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Impersonation check is only done when impersonation is requested.
+		// And impersonations is only allowed for the users, who have metadata in the ctx.
+		// Else just pass the request.
+		impersonationUser := req.Header.Get(authenticationv1.ImpersonateUserHeader)
+		impersonationGroups := req.Header[authenticationv1.ImpersonateGroupHeader]
+		impersonationExtras := []string{}
+		for _, header := range req.Header {
+			for _, h := range header {
+				if strings.HasPrefix(h, authenticationv1.ImpersonateUserExtraHeaderPrefix) {
+					impersonationExtras = append(impersonationExtras, h)
+				}
+			}
+		}
+		if len(impersonationUser) == 0 && len(impersonationGroups) == 0 && len(impersonationExtras) == 0 { // No user and group to impersonate - just pass the request.
+			handler.ServeHTTP(w, req)
+			return
+		}
+
+		requester, exists := request.UserFrom(req.Context())
+		if !exists {
+			responsewriters.ErrorNegotiated(
+				apierrors.NewForbidden(schema.GroupResource{}, "", fmt.Errorf("impersonation is invalid for the requestor")),
+				errorCodecs, schema.GroupVersion{}, w, req)
+			return
+		}
+		// TODO: Add scopes and warrants to the impersonation check.
+		if validImpersonation(requester.GetGroups(), impersonationGroups) {
+			handler.ServeHTTP(w, req)
+			return
+		}
+
+		responsewriters.ErrorNegotiated(
+			apierrors.NewForbidden(schema.GroupResource{}, "", fmt.Errorf("impersonation is not allowed for the requestor")),
+			errorCodecs, schema.GroupVersion{}, w, req)
+	})
+}
+
+// maxUserPrivilege returns the highest privilege level found among the user's groups.
+func maxUserPrivilege(userGroups []string) privilege {
+	max := unprivileged
+	for _, g := range userGroups {
+		if p, found := specialGroups[g]; found && p > max {
+			max = p
+		}
+	}
+	return max
+}
+
+// validImpersonation checks if a user can impersonate all requested groups.
+func validImpersonation(userGroups, requestedGroups []string) bool {
+	userMax := maxUserPrivilege(userGroups)
+
+	for _, g := range requestedGroups {
+		if userMax < specialGroups[g] {
+			return false
+		}
+	}
+	return true
+}
+
 func processResourceIdentity(req *http.Request, requestInfo *request.RequestInfo) (*http.Request, error) {
 	if !requestInfo.IsResourceRequest {
 		return req, nil
@@ -289,7 +369,7 @@ func processResourceIdentity(req *http.Request, requestInfo *request.RequestInfo
 	return req, nil
 }
 
-func mergeCRDsIntoCoreGroup(crdLister kcp.ClusterAwareCRDLister, crdHandler, coreHandler func(res http.ResponseWriter, req *http.Request)) restful.FilterFunction {
+func mergeCRDsIntoCoreGroup(crdLister kcp.ClusterAwareCRDClusterLister, crdHandler, coreHandler func(res http.ResponseWriter, req *http.Request)) restful.FilterFunction {
 	return func(req *restful.Request, res *restful.Response, chain *restful.FilterChain) {
 		ctx := req.Request.Context()
 		requestInfo, ok := request.RequestInfoFrom(ctx)
@@ -343,7 +423,21 @@ func mergeCRDsIntoCoreGroup(crdLister kcp.ClusterAwareCRDLister, crdHandler, cor
 			// server handle it.
 			crdName := requestInfo.Resource + ".core"
 
-			if _, err := crdLister.Get(req.Request.Context(), crdName); err == nil {
+			clusterName, wildcard, err := request.ClusterNameOrWildcardFrom(req.Request.Context())
+			if err != nil {
+				responsewriters.ErrorNegotiated(
+					apierrors.NewInternalError(fmt.Errorf("no cluster found in the context")),
+					// TODO is this the right Codecs?
+					errorCodecs, schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}, res.ResponseWriter, req.Request,
+				)
+				return
+			}
+			if wildcard {
+				// this is the only case where wildcard works for a list because this is our special CRD lister that handles it.
+				clusterName = "*"
+			}
+
+			if _, err := crdLister.Cluster(clusterName).Get(req.Request.Context(), crdName); err == nil {
 				crdHandler(res.ResponseWriter, req.Request)
 				return
 			}
@@ -356,9 +450,22 @@ func mergeCRDsIntoCoreGroup(crdLister kcp.ClusterAwareCRDLister, crdHandler, cor
 	}
 }
 
-func serveCoreV1Discovery(ctx context.Context, crdLister kcp.ClusterAwareCRDLister, coreHandler func(w http.ResponseWriter, req *http.Request), res http.ResponseWriter, req *http.Request) {
+func serveCoreV1Discovery(ctx context.Context, crdLister kcp.ClusterAwareCRDClusterLister, coreHandler func(w http.ResponseWriter, req *http.Request), res http.ResponseWriter, req *http.Request) {
+	clusterName, wildcard, err := request.ClusterNameOrWildcardFrom(ctx)
+	if err != nil {
+		responsewriters.ErrorNegotiated(
+			apierrors.NewInternalError(fmt.Errorf("no cluster found in the context")),
+			errorCodecs, schema.GroupVersion{}, res, req,
+		)
+		return
+	}
+	if wildcard {
+		// this is the only case where wildcard works for a list because this is our special CRD lister that handles it.
+		clusterName = "*"
+	}
+
 	// Get all the CRDs to see if any of them are in v1
-	crds, err := crdLister.List(ctx, labels.Everything())
+	crds, err := crdLister.Cluster(clusterName).List(ctx, labels.Everything())
 	if err != nil {
 		// Listing from a lister can really only ever fail if invoking meta.Accessor() on an item in the list fails.
 		// Which means it essentially will never fail. But just in case...
@@ -388,7 +495,7 @@ func serveCoreV1Discovery(ctx context.Context, crdLister kcp.ClusterAwareCRDList
 	// is "special" - it doesn't have an apiVersion field that the decoder needs to determine the
 	// type.
 	into := &metav1.APIResourceList{}
-	obj, _, err := aggregator.DiscoveryCodecs.UniversalDeserializer().Decode(writer.data, nil, into)
+	obj, _, err := miniaggregator.DiscoveryCodecs.UniversalDeserializer().Decode(writer.data, nil, into)
 	if err != nil {
 		err = apierrors.NewInternalError(fmt.Errorf("unable to serve /api/v1 discovery: error decoding /api/v1 response from generic control plane: %w", err))
 		_ = responsewriters.ErrorNegotiated(err, errorCodecs, schema.GroupVersion{}, res, req)
@@ -410,7 +517,7 @@ func serveCoreV1Discovery(ctx context.Context, crdLister kcp.ClusterAwareCRDList
 	})
 
 	// Serve up our combined discovery
-	versionHandler := apiserverdiscovery.NewAPIVersionHandler(aggregator.DiscoveryCodecs, schema.GroupVersion{Group: "", Version: "v1"}, apiserverdiscovery.APIResourceListerFunc(func() []metav1.APIResource {
+	versionHandler := apiserverdiscovery.NewAPIVersionHandler(miniaggregator.DiscoveryCodecs, schema.GroupVersion{Group: "", Version: "v1"}, apiserverdiscovery.APIResourceListerFunc(func() []metav1.APIResource {
 		return v1ResourceList.APIResources
 	}))
 	versionHandler.ServeHTTP(res, req)
@@ -455,14 +562,4 @@ func (r *inMemoryResponseWriter) String() string {
 		s += fmt.Sprintf(", Header: %s", r.header)
 	}
 	return s
-}
-
-// unimplementedServiceResolver is a webhook.ServiceResolver that always returns an error, because
-// we have not implemented support for this yet. As a result, CRD webhook conversions are not
-// supported.
-type unimplementedServiceResolver struct{}
-
-// ResolveEndpoint always returns an error that this is not yet supported.
-func (r *unimplementedServiceResolver) ResolveEndpoint(namespace string, name string, port int32) (*url.URL, error) {
-	return nil, errors.New("CRD webhook conversions are not yet supported in kcp")
 }

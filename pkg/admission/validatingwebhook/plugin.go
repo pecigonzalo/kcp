@@ -17,79 +17,72 @@ limitations under the License.
 package validatingwebhook
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"sync"
 
-	admissionv1 "k8s.io/api/admission/v1"
-	admissionv1beta1 "k8s.io/api/admission/v1beta1"
+	kcpkubernetesinformers "github.com/kcp-dev/client-go/informers"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/configuration"
-	"k8s.io/apiserver/pkg/admission/plugin/webhook/config"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/validating"
-	webhookutil "k8s.io/apiserver/pkg/util/webhook"
-	kubernetesinformers "k8s.io/client-go/informers"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 
-	"github.com/kcp-dev/kcp/pkg/admission/webhook"
+	kcpinitializers "github.com/kcp-dev/kcp/pkg/admission/initializers"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 const (
-	PluginName = "apis.kcp.dev/ValidatingWebhook"
+	PluginName = "apis.kcp.io/ValidatingWebhook"
 )
 
 type Plugin struct {
-	// Using validating plugin, for the dispatcher to use.
-	// This plugins admit function will never be called.
-	validating.Plugin
-	webhook.WebhookDispatcher
+	*admission.Handler
+	config []byte
+
+	// Injected/set via initializers
+	kubeClusterClient               kcpkubernetesclientset.ClusterInterface
+	localKubeSharedInformerFactory  kcpkubernetesinformers.SharedInformerFactory
+	globalKubeSharedInformerFactory kcpkubernetesinformers.SharedInformerFactory
+
+	getAPIBindings func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIBinding, error)
+
+	managerLock   sync.Mutex
+	managersCache map[logicalcluster.Name]generic.Source
 }
 
-func NewValidatingAdmissionWebhook(configfile io.Reader) (*Plugin, error) {
-	p := &Plugin{Plugin: validating.Plugin{Webhook: &generic.Webhook{}}}
-	p.WebhookDispatcher.Handler = admission.NewHandler(admission.Connect, admission.Create, admission.Delete, admission.Update)
+var (
+	_ = admission.ValidationInterface(&Plugin{})
+	_ = admission.InitializationValidator(&Plugin{})
+	_ = kcpinitializers.WantsKubeClusterClient(&Plugin{})
+	_ = kcpinitializers.WantsKubeInformers(&Plugin{})
+	_ = kcpinitializers.WantsKcpInformers(&Plugin{})
+)
 
-	dispatcherFactory := validating.NewValidatingDispatcher(&p.Plugin)
-
-	// Making our own dispatcher so that we can control the webhook accessors.
-	kubeconfigFile, err := config.LoadConfig(configfile)
-	if err != nil {
-		return nil, err
+func NewValidatingAdmissionWebhook(configFile io.Reader) (*Plugin, error) {
+	p := &Plugin{
+		managerLock:   sync.Mutex{},
+		managersCache: make(map[logicalcluster.Name]generic.Source),
+		Handler:       admission.NewHandler(admission.Connect, admission.Create, admission.Delete, admission.Update),
 	}
-	cm, err := webhookutil.NewClientManager(
-		[]schema.GroupVersion{
-			admissionv1beta1.SchemeGroupVersion,
-			admissionv1.SchemeGroupVersion,
-		},
-		admissionv1beta1.AddToScheme,
-		admissionv1.AddToScheme,
-	)
-	if err != nil {
-		return nil, err
-	}
-	authInfoResolver, err := webhookutil.NewDefaultAuthenticationInfoResolver(kubeconfigFile)
-	if err != nil {
-		return nil, err
-	}
-	// Set defaults which may be overridden later.
-	cm.SetAuthenticationInfoResolver(authInfoResolver)
-	cm.SetServiceResolver(webhookutil.NewDefaultServiceResolver())
-
-	p.WebhookDispatcher.SetDispatcher(dispatcherFactory(&cm))
-	// Need to do this, to make sure that the underlying objects for the call to ShouldCallHook have the right values
-	p.Plugin.Webhook, err = generic.NewWebhook(p.Handler, configfile, configuration.NewValidatingWebhookConfigurationManager, dispatcherFactory)
-	if err != nil {
-		return nil, err
-	}
-
-	// Override the ready func
-
-	p.SetReadyFunc(func() bool {
-		if p.WebhookDispatcher.HasSynced() && p.Plugin.WaitForReady() {
-			return true
+	if configFile != nil {
+		config, err := io.ReadAll(configFile)
+		if err != nil {
+			return nil, err
 		}
-		return false
-	})
+		p.config = config
+	}
+
 	return p, nil
 }
 
@@ -99,12 +92,136 @@ func Register(plugins *admission.Plugins) {
 	})
 }
 
-func (a *Plugin) Validate(ctx context.Context, attr admission.Attributes, o admission.ObjectInterfaces) error {
-	return a.WebhookDispatcher.Dispatch(ctx, attr, o)
+func (p *Plugin) Validate(ctx context.Context, attr admission.Attributes, o admission.ObjectInterfaces) error {
+	cluster, err := genericapirequest.ValidClusterFrom(ctx)
+	if err != nil {
+		return err
+	}
+	clusterName := cluster.Name
+
+	var config io.Reader
+	if len(p.config) > 0 {
+		config = bytes.NewReader(p.config)
+	}
+
+	hookSource, err := p.getHookSource(clusterName, attr.GetResource().GroupResource())
+	if err != nil {
+		return err
+	}
+
+	plugin, err := validating.NewValidatingAdmissionWebhook(config)
+	if err != nil {
+		return fmt.Errorf("error creating validating admission webhook: %w", err)
+	}
+
+	plugin.SetExternalKubeClientSet(p.kubeClusterClient.Cluster(clusterName.Path()))
+	plugin.SetNamespaceInformer(p.localKubeSharedInformerFactory.Core().V1().Namespaces().Cluster(clusterName))
+	plugin.SetHookSource(hookSource)
+	plugin.SetReadyFuncFromKCP(p.localKubeSharedInformerFactory.Core().V1().Namespaces().Cluster(clusterName))
+
+	if err := plugin.ValidateInitialization(); err != nil {
+		return fmt.Errorf("error validating ValidatingAdmissionWebhook initialization: %w", err)
+	}
+
+	// Add cluster annotation on create
+	if attr.GetOperation() == admission.Create {
+		u, ok := attr.GetObject().(metav1.Object)
+		if !ok {
+			return fmt.Errorf("unexpected type %T", attr.GetObject())
+		}
+		if undo := SetClusterAnnotation(u, clusterName); undo != nil {
+			defer undo()
+		}
+	}
+
+	return plugin.Validate(ctx, attr, o)
 }
 
-// SetExternalKubeInformerFactory implements the WantsExternalKubeInformerFactory interface.
-func (p *Plugin) SetExternalKubeInformerFactory(f kubernetesinformers.SharedInformerFactory) {
-	p.WebhookDispatcher.SetHookSource(configuration.NewValidatingWebhookConfigurationManager(f))
-	p.Plugin.SetExternalKubeInformerFactory(f)
+func (p *Plugin) getHookSource(clusterName logicalcluster.Name, groupResource schema.GroupResource) (generic.Source, error) {
+	clusterNameForGroupResource, err := p.getSourceClusterForGroupResource(clusterName, groupResource)
+	if err != nil {
+		return nil, err
+	}
+
+	p.managerLock.Lock()
+	defer p.managerLock.Unlock()
+	if _, ok := p.managersCache[clusterNameForGroupResource]; !ok {
+		p.managersCache[clusterNameForGroupResource] = configuration.NewValidatingWebhookConfigurationManagerForInformer(
+			p.globalKubeSharedInformerFactory.Admissionregistration().V1().ValidatingWebhookConfigurations().Cluster(clusterNameForGroupResource),
+		)
+	}
+
+	return p.managersCache[clusterNameForGroupResource], nil
+}
+
+func (p *Plugin) getSourceClusterForGroupResource(clusterName logicalcluster.Name, groupResource schema.GroupResource) (logicalcluster.Name, error) {
+	objs, err := p.getAPIBindings(clusterName)
+	if err != nil {
+		return "", err
+	}
+
+	for _, apiBinding := range objs {
+		for _, br := range apiBinding.Status.BoundResources {
+			if br.Group == groupResource.Group && br.Resource == groupResource.Resource {
+				// GroupResource comes from an APIBinding/APIExport
+				return logicalcluster.Name(apiBinding.Status.APIExportClusterName), nil
+			}
+		}
+	}
+
+	// GroupResource is local to this cluster
+	return clusterName, nil
+}
+
+func (p *Plugin) ValidateInitialization() error {
+	if p.kubeClusterClient == nil {
+		return errors.New("missing kubeClusterClient")
+	}
+	if p.localKubeSharedInformerFactory == nil {
+		return errors.New("missing localKubeSharedInformerFactory")
+	}
+	if p.globalKubeSharedInformerFactory == nil {
+		return errors.New("missing globalKubeSharedInformerFactory")
+	}
+	return nil
+}
+
+func (p *Plugin) SetKubeClusterClient(client kcpkubernetesclientset.ClusterInterface) {
+	p.kubeClusterClient = client
+}
+
+func (p *Plugin) SetKubeInformers(local, global kcpkubernetesinformers.SharedInformerFactory) {
+	p.localKubeSharedInformerFactory = local
+	p.globalKubeSharedInformerFactory = global
+}
+
+func (p *Plugin) SetKcpInformers(local, global kcpinformers.SharedInformerFactory) {
+	p.getAPIBindings = func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIBinding, error) {
+		return local.Apis().V1alpha1().APIBindings().Lister().Cluster(clusterName).List(labels.Everything())
+	}
+}
+
+// SetClusterAnnotation sets the cluster annotation on the given object to the given clusterName,
+// returning an undo function that can be used to revert the change.
+func SetClusterAnnotation(obj metav1.Object, clusterName logicalcluster.Name) func() {
+	undoFn := func() {
+		anns := obj.GetAnnotations()
+		delete(anns, logicalcluster.AnnotationKey)
+		obj.SetAnnotations(anns)
+	}
+
+	anns := obj.GetAnnotations()
+	if anns == nil {
+		obj.SetAnnotations(map[string]string{logicalcluster.AnnotationKey: clusterName.String()})
+		return undoFn
+	}
+
+	old, ok := anns[logicalcluster.AnnotationKey]
+	if ok && old == clusterName.String() {
+		return nil
+	}
+
+	anns[logicalcluster.AnnotationKey] = clusterName.String()
+	obj.SetAnnotations(anns)
+	return undoFn
 }
