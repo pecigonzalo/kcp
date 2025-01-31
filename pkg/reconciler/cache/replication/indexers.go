@@ -19,18 +19,18 @@ package replication
 import (
 	"fmt"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
 
 const (
-	// ByShardAndLogicalClusterAndNamespaceAndName is the name for the index that indexes by an object's shard and logical cluster, namespace and name
+	// ByShardAndLogicalClusterAndNamespaceAndName is the name for the index that indexes by an object's shard and logical cluster, namespace and name.
 	ByShardAndLogicalClusterAndNamespaceAndName = "kcp-byShardAndLogicalClusterAndNamespaceAndName"
 )
 
-// IndexByShardAndLogicalClusterAndNamespace is an index function that indexes by an object's shard and logical cluster, namespace and name
+// IndexByShardAndLogicalClusterAndNamespace is an index function that indexes by an object's shard and logical cluster, namespace and name.
 func IndexByShardAndLogicalClusterAndNamespace(obj interface{}) ([]string, error) {
 	a, err := meta.Accessor(obj)
 	if err != nil {
@@ -40,21 +40,21 @@ func IndexByShardAndLogicalClusterAndNamespace(obj interface{}) ([]string, error
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
-	// TODO: rename to genericapirequest.ShardNameAnnotationKey
-	shardName := annotations[genericapirequest.AnnotationKey]
 
-	return []string{ShardAndLogicalClusterAndNamespaceKey(shardName, logicalcluster.From(a).String(), a.GetNamespace(), a.GetName())}, nil
+	shardName := annotations[genericapirequest.ShardAnnotationKey]
+
+	return []string{ShardAndLogicalClusterAndNamespaceKey(shardName, logicalcluster.From(a), a.GetNamespace(), a.GetName())}, nil
 }
 
 // ShardAndLogicalClusterAndNamespaceKey creates an index key from the given parameters.
 // As of today this function is used by IndexByShardAndLogicalClusterAndNamespace indexer.
-func ShardAndLogicalClusterAndNamespaceKey(shard, cluster, namespace, name string) string {
+func ShardAndLogicalClusterAndNamespaceKey(shard string, cluster logicalcluster.Name, namespace, name string) string {
 	var key string
 	if len(shard) > 0 {
 		key += shard + "|"
 	}
-	if len(cluster) > 0 {
-		key += cluster + "|"
+	if !cluster.Empty() {
+		key += cluster.String() + "|"
 	}
 	if len(namespace) > 0 {
 		key += namespace + "/"

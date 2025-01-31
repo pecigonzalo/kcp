@@ -22,27 +22,15 @@ import (
 	"testing"
 
 	"github.com/spf13/pflag"
-	"github.com/stretchr/testify/require"
+
+	"k8s.io/apimachinery/pkg/util/sets"
+	cliflag "k8s.io/component-base/cli/flag"
 )
-
-func TestNamedFlagSetOrder(t *testing.T) {
-	fss := NewOptions(".kcp").Flags()
-	var names []string
-	for name, fs := range fss.FlagSets {
-		if !fs.HasFlags() {
-			continue
-		}
-		fmt.Printf("%q,\n", name)
-		names = append(names, name)
-	}
-
-	require.Subset(t, names, namedFlagSetOrder, "namedFlagSetOrder has extra entries")
-	require.Subset(t, namedFlagSetOrder, names, "namedFlagSetOrder in incomplete")
-}
 
 func TestAllowedFlagList(t *testing.T) {
 	o := NewOptions(".kcp")
-	fss := o.rawFlags()
+	var fss cliflag.NamedFlagSets
+	o.GenericControlPlane.AddFlags(&fss)
 
 	missing := map[string][]*pflag.Flag{}
 
@@ -69,7 +57,8 @@ func TestAllowedFlagList(t *testing.T) {
 
 func TestAllowedFlagListCleanup(t *testing.T) {
 	o := NewOptions(".kcp")
-	fss := o.rawFlags()
+	var fss cliflag.NamedFlagSets
+	o.GenericControlPlane.AddFlags(&fss)
 
 	allFlags := map[string]*pflag.Flag{}
 	for _, fs := range fss.FlagSets {
@@ -78,12 +67,12 @@ func TestAllowedFlagListCleanup(t *testing.T) {
 		})
 	}
 
-	for _, flag := range allowedFlags.List() {
+	for _, flag := range sets.List[string](allowedFlags) {
 		if _, ok := allFlags[flag]; !ok {
 			t.Errorf("flag --%s is allowed but not in any flag set", flag)
 		}
 	}
-	for _, flag := range disallowedFlags.List() {
+	for _, flag := range sets.List[string](disallowedFlags) {
 		if _, ok := allFlags[flag]; !ok {
 			t.Errorf("flag --%s is allowed but not in any flag set", flag)
 		}

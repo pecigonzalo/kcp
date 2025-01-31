@@ -26,35 +26,34 @@ import (
 	"strings"
 	"sync"
 
-	kcpclienthelper "github.com/kcp-dev/apimachinery/pkg/client"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	errorsutil "k8s.io/apimachinery/pkg/util/errors"
-	kubernetesclient "k8s.io/client-go/kubernetes"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
 	configshard "github.com/kcp-dev/kcp/config/shard"
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
 	"github.com/kcp-dev/kcp/pkg/logging"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/identitycache"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/core"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
 )
 
 var (
-	// KcpRootGroupExportNames lists the APIExports in the root workspace for standard kcp groups
+	// KcpRootGroupExportNames lists the APIExports in the root workspace for standard kcp groups.
 	KcpRootGroupExportNames = map[string]string{
-		"tenancy.kcp.dev":     "tenancy.kcp.dev",
-		"scheduling.kcp.dev":  "scheduling.kcp.dev",
-		"workload.kcp.dev":    "workload.kcp.dev",
-		"apiresource.kcp.dev": "apiresource.kcp.dev",
+		"tenancy.kcp.io":  "tenancy.kcp.io",
+		"topology.kcp.io": "topology.kcp.io",
 	}
 
-	// KcpRootGroupResourceExportNames lists the APIExports in the root workspace for standard kcp group resources
+	// KcpRootGroupResourceExportNames lists the APIExports in the root workspace for standard kcp group resources.
 	KcpRootGroupResourceExportNames = map[schema.GroupResource]string{
-		{Group: "tenancy.kcp.dev", Resource: "clusterworkspaceshards"}: "shards.tenancy.kcp.dev",
+		{Group: "core.kcp.io", Resource: "shards"}: "shards.core.kcp.io",
 	}
 )
 
@@ -89,7 +88,7 @@ func (ids *identities) grIdentity(gr schema.GroupResource) (string, bool) {
 func NewConfigWithWildcardIdentities(config *rest.Config,
 	groupExportNames map[string]string,
 	groupResourceExportNames map[schema.GroupResource]string,
-	localShardKubeClusterClient kubernetesclient.ClusterInterface) (identityConfig *rest.Config, resolve func(ctx context.Context) error) {
+	localShardKubeClusterClient kcpkubernetesclientset.ClusterInterface) (identityConfig *rest.Config, resolve func(ctx context.Context) error) {
 	identityRoundTripper, identityResolver := NewWildcardIdentitiesWrappingRoundTripper(groupExportNames, groupResourceExportNames, config, localShardKubeClusterClient)
 	identityConfig = rest.CopyConfig(config)
 	identityConfig.Wrap(identityRoundTripper)
@@ -97,7 +96,7 @@ func NewConfigWithWildcardIdentities(config *rest.Config,
 }
 
 // NewWildcardIdentitiesWrappingRoundTripper creates an HTTP RoundTripper
-// that injected resource identities for individual group or group resources.
+// that injects resource identities for individual groups or group resources.
 // Each group or resource is coming from one APIExport whose names are passed in as a map.
 // The RoundTripper is exposed as a function that allows wrapping the RoundTripper
 //
@@ -108,7 +107,7 @@ func NewConfigWithWildcardIdentities(config *rest.Config,
 func NewWildcardIdentitiesWrappingRoundTripper(groupExportNames map[string]string,
 	groupResourceExportNames map[schema.GroupResource]string,
 	config *rest.Config,
-	localShardKubeClusterClient kubernetesclient.ClusterInterface) (func(rt http.RoundTripper) http.RoundTripper, func(ctx context.Context) error) {
+	localShardKubeClusterClient kcpkubernetesclientset.ClusterInterface) (func(rt http.RoundTripper) http.RoundTripper, func(ctx context.Context) error) {
 	ids := &identities{
 		groupIdentities:         map[string]string{},
 		groupResourceIdentities: map[schema.GroupResource]string{},
@@ -135,7 +134,7 @@ func wildcardIdentitiesResolver(ids *identities,
 			logger := logging.WithObject(logger, &apisv1alpha1.APIExport{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        name,
-					Annotations: map[string]string{logging.APIVersionKey: tenancyv1alpha1.RootCluster.String()},
+					Annotations: map[string]string{logicalcluster.AnnotationKey: core.RootCluster.String()},
 				},
 			}).WithValues("group", group)
 			ids.lock.RLock()
@@ -161,13 +160,13 @@ func wildcardIdentitiesResolver(ids *identities,
 			ids.groupIdentities[group] = apiExportIdentity
 			ids.lock.Unlock()
 
-			logger.V(2).Info("APIExport has identity")
+			logger.V(4).Info("APIExport has identity")
 		}
 		for gr, name := range groupResourceExportNames {
 			logger := logging.WithObject(logger, &apisv1alpha1.APIExport{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        name,
-					Annotations: map[string]string{logging.APIVersionKey: tenancyv1alpha1.RootCluster.String()},
+					Annotations: map[string]string{logicalcluster.AnnotationKey: core.RootCluster.String()},
 				},
 			}).WithValues("gr", gr.String())
 			ids.lock.RLock()
@@ -193,22 +192,21 @@ func wildcardIdentitiesResolver(ids *identities,
 			ids.groupResourceIdentities[gr] = apiExportIdentity
 			ids.lock.Unlock()
 
-			logger.V(2).Info("APIExport has identity")
+			logger.V(4).Info("APIExport has identity")
 		}
-		return errorsutil.NewAggregate(errs)
+		return utilerrors.NewAggregate(errs)
 	}
 }
 
-func apiExportIdentityProvider(config *rest.Config, localShardKubeClusterClient kubernetesclient.ClusterInterface) func(ctx context.Context, apiExportName string) (string, error) {
+func apiExportIdentityProvider(config *rest.Config, localShardKubeClusterClient kcpkubernetesclientset.ClusterInterface) func(ctx context.Context, apiExportName string) (string, error) {
 	return func(ctx context.Context, apiExportName string) (string, error) {
-		rootShardConfig := kcpclienthelper.SetCluster(rest.CopyConfig(config), tenancyv1alpha1.RootCluster)
-		rootShardKcpClient, err := kcpclient.NewForConfig(rootShardConfig)
+		rootShardKcpClient, err := kcpclientset.NewForConfig(config)
 		if err != nil {
 			return "", err
 		}
 
 		if localShardKubeClusterClient != nil {
-			apiExportIdentitiesConfigMap, err := localShardKubeClusterClient.Cluster(configshard.SystemShardCluster).CoreV1().ConfigMaps("default").Get(ctx, identitycache.ConfigMapName, metav1.GetOptions{})
+			apiExportIdentitiesConfigMap, err := localShardKubeClusterClient.Cluster(configshard.SystemShardCluster.Path()).CoreV1().ConfigMaps("default").Get(ctx, identitycache.ConfigMapName, metav1.GetOptions{})
 			if err == nil {
 				apiExportIdentity, found := apiExportIdentitiesConfigMap.Data[apiExportName]
 				if found {
@@ -220,7 +218,7 @@ func apiExportIdentityProvider(config *rest.Config, localShardKubeClusterClient 
 			// - the cm wasn't found
 			// - an entry in the cm wasn't found
 		}
-		apiExport, err := rootShardKcpClient.ApisV1alpha1().APIExports().Get(ctx, apiExportName, metav1.GetOptions{})
+		apiExport, err := rootShardKcpClient.Cluster(core.RootCluster.Path()).ApisV1alpha1().APIExports().Get(ctx, apiExportName, metav1.GetOptions{})
 		if err != nil {
 			return "", err
 		}
@@ -228,45 +226,55 @@ func apiExportIdentityProvider(config *rest.Config, localShardKubeClusterClient 
 	}
 }
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
+type roundTripperFunc struct {
+	delegate http.RoundTripper
+	fn       func(*http.Request) (*http.Response, error)
+}
 
-var _ http.RoundTripper = roundTripperFunc(nil)
+var _ http.RoundTripper = roundTripperFunc{}
 
 func (rt roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
-	return rt(r)
+	return rt.fn(r)
+}
+
+func (rt roundTripperFunc) WrappedRoundTripper() http.RoundTripper {
+	return rt.delegate
 }
 
 // injectKcpIdentities injects the KCP identities into the request URLs.
 func injectKcpIdentities(ids *identities) func(rt http.RoundTripper) http.RoundTripper {
 	return func(rt http.RoundTripper) http.RoundTripper {
-		return roundTripperFunc(func(origReq *http.Request) (*http.Response, error) {
-			urlPath, err := decorateWildcardPathsWithResourceIdentities(origReq.URL.Path, ids)
-			if err != nil {
-				return nil, err
-			}
-			if urlPath == origReq.URL.Path {
-				return rt.RoundTrip(origReq)
-			}
+		return roundTripperFunc{
+			delegate: rt,
+			fn: func(origReq *http.Request) (*http.Response, error) {
+				urlPath, err := decorateWildcardPathsWithResourceIdentities(origReq.URL.Path, ids)
+				if err != nil {
+					return nil, err
+				}
+				if urlPath == origReq.URL.Path {
+					return rt.RoundTrip(origReq)
+				}
 
-			req := *origReq // shallow copy
-			req.URL = &url.URL{}
-			*req.URL = *origReq.URL
-			req.URL.Path = urlPath
+				req := *origReq // shallow copy
+				req.URL = &url.URL{}
+				*req.URL = *origReq.URL
+				req.URL.Path = urlPath
 
-			return rt.RoundTrip(&req)
-		})
+				return rt.RoundTrip(&req)
+			},
+		}
 	}
 }
 
 // decorateWildcardPathsWithResourceIdentities adds per-API-group identity to wildcard URL paths, e.g.
 //
-//	/clusters/*/apis/tenancy.kcp.dev/v1alpha1/clusterworkspaces/root
+//	/clusters/*/apis/tenancy.kcp.io/v1alpha1/workspaces/root
 //
 // becomes
 //
-//	/clusters/*/apis/tenancy.kcp.dev/v1alpha1/clusterworkspaces:<identity>/root
+//	/clusters/*/apis/tenancy.kcp.io/v1alpha1/workspaces:<identity>/root
 func decorateWildcardPathsWithResourceIdentities(urlPath string, ids *identities) (string, error) {
-	// Check for: /clusters/*/apis/tenancy.kcp.dev/v1alpha1/clusterworkspaces/root
+	// Check for: /clusters/*/apis/tenancy.kcp.io/v1alpha1/workspaces/root
 	if !strings.HasPrefix(urlPath, "/clusters/*/apis/") {
 		return urlPath, nil
 	}
@@ -276,12 +284,31 @@ func decorateWildcardPathsWithResourceIdentities(urlPath string, ids *identities
 		return urlPath, nil
 	}
 
-	gr := schema.GroupResource{Group: comps[3], Resource: comps[5]}
-	if id, found := ids.grIdentity(gr); found {
+	// It's possible the outgoing request already has an identity specified. Make sure we exclude that when
+	// determining the resource in question.
+	parts := strings.SplitN(comps[5], ":", 2)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("invalid resource %q", comps[5])
+	}
+
+	resource := parts[0]
+
+	gr := schema.GroupResource{Group: comps[3], Resource: resource}
+	if id, found := ids.grIdentity(gr); found && gr != corev1alpha1.Resource("logicalclusters") {
 		if len(id) == 0 {
 			return "", fmt.Errorf("identity for %s is unknown", gr)
 		}
-		comps[5] += ":" + id
+
+		passedInIdentity := ""
+		if len(parts) > 1 {
+			passedInIdentity = parts[1]
+		}
+
+		if passedInIdentity != "" && passedInIdentity != id {
+			return "", fmt.Errorf("invalid identity %q for resource %q", passedInIdentity, resource)
+		}
+
+		comps[5] = resource + ":" + id
 
 		return "/" + path.Join(comps...), nil
 	}

@@ -19,11 +19,11 @@ package indexers
 import (
 	"fmt"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 // ClusterAndGroupResourceValue returns the index value for use with
@@ -40,7 +40,7 @@ func IndexAPIBindingByClusterAndAcceptedClaimedGroupResources(obj interface{}) (
 		return []string{}, fmt.Errorf("obj %T is not an APIBinding", obj)
 	}
 
-	var ret []string
+	ret := make([]string, 0, len(apiBinding.Spec.PermissionClaims))
 	for _, c := range apiBinding.Spec.PermissionClaims {
 		if c.State != apisv1alpha1.ClaimAccepted {
 			continue
@@ -48,6 +48,22 @@ func IndexAPIBindingByClusterAndAcceptedClaimedGroupResources(obj interface{}) (
 
 		groupResource := schema.GroupResource{Group: c.Group, Resource: c.Resource}
 		ret = append(ret, ClusterAndGroupResourceValue(logicalcluster.From(apiBinding), groupResource))
+	}
+
+	return ret, nil
+}
+
+const APIBindingByBoundResourceUID = "byBoundResourceUID"
+
+func IndexAPIBindingByBoundResourceUID(obj interface{}) ([]string, error) {
+	apiBinding, ok := obj.(*apisv1alpha1.APIBinding)
+	if !ok {
+		return []string{}, fmt.Errorf("obj %T is not an APIBinding", obj)
+	}
+
+	ret := make([]string, 0, len(apiBinding.Status.BoundResources))
+	for _, r := range apiBinding.Status.BoundResources {
+		ret = append(ret, r.Schema.UID)
 	}
 
 	return ret, nil
@@ -63,7 +79,7 @@ func IndexAPIBindingByBoundResources(obj interface{}) ([]string, error) {
 
 	clusterName := logicalcluster.From(apiBinding)
 
-	var ret []string
+	ret := make([]string, 0, len(apiBinding.Status.BoundResources))
 	for _, r := range apiBinding.Status.BoundResources {
 		ret = append(ret, APIBindingBoundResourceValue(clusterName, r.Group, r.Resource))
 	}
@@ -73,4 +89,21 @@ func IndexAPIBindingByBoundResources(obj interface{}) ([]string, error) {
 
 func APIBindingBoundResourceValue(clusterName logicalcluster.Name, group, resource string) string {
 	return fmt.Sprintf("%s|%s.%s", clusterName, resource, group)
+}
+
+const APIBindingsByAPIExport = "APIBindingByAPIExport"
+
+// IndexAPIBindingByAPIExport indexes the APIBindings by their APIExport's Reference Path and Name.
+func IndexAPIBindingByAPIExport(obj interface{}) ([]string, error) {
+	apiBinding, ok := obj.(*apisv1alpha1.APIBinding)
+	if !ok {
+		return []string{}, fmt.Errorf("obj %T is not an APIBinding", obj)
+	}
+
+	path := logicalcluster.NewPath(apiBinding.Spec.Reference.Export.Path)
+	if path.Empty() {
+		path = logicalcluster.From(apiBinding).Path()
+	}
+
+	return []string{path.Join(apiBinding.Spec.Reference.Export.Name).String()}, nil
 }

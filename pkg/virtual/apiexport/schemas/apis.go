@@ -21,10 +21,10 @@ import (
 	"fmt"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	configcrds "github.com/kcp-dev/kcp/config/crds"
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 var ApisKcpDevSchemas = map[string]*apisv1alpha1.APIResourceSchema{}
@@ -33,7 +33,7 @@ func init() {
 	for _, resource := range []string{"apibindings", "apiresourceschemas", "apiexports"} {
 		// get APIBindings resource schema
 		crd := apiextensionsv1.CustomResourceDefinition{}
-		if err := configcrds.Unmarshal(fmt.Sprintf("apis.kcp.dev_%s.yaml", resource), &crd); err != nil {
+		if err := configcrds.Unmarshal(fmt.Sprintf("apis.kcp.io_%s.yaml", resource), &crd); err != nil {
 			panic(fmt.Sprintf("failed to unmarshal apibindings resource: %v", err))
 		}
 		schema, err := apisv1alpha1.CRDToAPIResourceSchema(&crd, "crd")
@@ -42,7 +42,7 @@ func init() {
 		}
 		bs, err := json.Marshal(&apiextensionsv1.JSONSchemaProps{
 			Type:                   "object",
-			XPreserveUnknownFields: pointer.BoolPtr(true),
+			XPreserveUnknownFields: ptr.To(true),
 		})
 		if err != nil {
 			panic(fmt.Sprintf("failed to marshal JSONSchemaProps: %v", err))

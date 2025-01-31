@@ -26,8 +26,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/wait"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 
+	"github.com/kcp-dev/kcp/cmd/sharded-test-server/third_party/library-go/crypto"
 	shard "github.com/kcp-dev/kcp/cmd/test-server/kcp"
 )
 
@@ -46,9 +48,10 @@ import (
 //
 //	$ go test -v --use-default-kcp-server
 func main() {
-	flag.String("log-file-path", ".kcp/kcp.log", "Path to the log file")
+	logDirPath := flag.String("log-dir-path", "", "Directory for log files. If empty, .kcp is used.")
+	quiet := flag.Bool("quiet", false, "Suppress output of the subprocesses")
 
-	// split flags into --shard-* and everything elese (generic). The former are
+	// split flags into --shard-* and everything else (generic). The former are
 	// passed to the respective components. Everything after "--" is considered a shard flag.
 	var shardFlags, genericFlags []string
 	for i, arg := range os.Args[1:] {
@@ -64,7 +67,7 @@ func main() {
 	}
 	flag.CommandLine.Parse(genericFlags) //nolint:errcheck
 
-	if err := start(shardFlags); err != nil {
+	if err := start(shardFlags, *logDirPath, *quiet); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			os.Exit(exitErr.ExitCode())
@@ -74,17 +77,73 @@ func main() {
 	}
 }
 
-func start(shardFlags []string) error {
-	ctx, cancelFn := context.WithCancel(genericapiserver.SetupSignalContext())
-	defer cancelFn()
+func start(shardFlags []string, logDirPath string, quiet bool) error {
+	// We use a shutdown context to know that it's time to gather metrics, before stopping the shard
+	shutdownCtx, shutdownCancel := context.WithCancel(genericapiserver.SetupSignalContext())
+	defer shutdownCancel()
 
-	logFilePath := flag.Lookup("log-file-path").Value.String()
-	errCh, err := shard.Start(ctx, "kcp", ".kcp", logFilePath,
-		append(shardFlags, "--audit-log-path", filepath.Join(filepath.Dir(logFilePath), "audit.log")),
+	// This context controls the life of the shard
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// create client CA and kcp-admin client cert to connect through front-proxy
+	_, err := crypto.MakeSelfSignedCA(
+		filepath.Join(".kcp", "/client-ca.crt"),
+		filepath.Join(".kcp", "/client-ca.key"),
+		filepath.Join(".kcp", "/client-ca-serial.txt"),
+		"kcp-client-ca",
+		365,
 	)
+	if err != nil {
+		return fmt.Errorf("failed to create client-ca: %w", err)
+	}
+
+	logFilePath := filepath.Join(".kcp", "kcp.log")
+	if logDirPath != "" {
+		logFilePath = filepath.Join(logDirPath, "kcp.log")
+	}
+
+	s := shard.NewShard(
+		"kcp",
+		".kcp",
+		logFilePath,
+		append(shardFlags,
+			"--audit-log-path", filepath.Join(filepath.Dir(logFilePath), "audit.log"),
+			"--client-ca-file", filepath.Join(".kcp", "client-ca.crt"),
+		),
+	)
+	if err := s.Start(ctx, quiet); err != nil {
+		return err
+	}
+
+	errCh, err := s.WaitForReady(ctx)
 	if err != nil {
 		return err
 	}
 
-	return <-errCh
+	err = shard.ScrapeMetrics(ctx, s, ".")
+	if err != nil {
+		return err
+	}
+
+	readyToTestFile, err := os.Create(filepath.Join(".kcp", "ready-to-test"))
+	if err != nil {
+		return fmt.Errorf("error creating ready-to-test file: %w", err)
+	}
+	defer readyToTestFile.Close()
+
+	// Wait for either a premature termination error from the shard, or for the test server process to shut down
+	select {
+	case err := <-errCh:
+		return err
+	case <-shutdownCtx.Done():
+	}
+
+	// We've received the notice to shut down, so try to gather metrics. Use a new context with a fixed timeout.
+	metricsCtx, metricsCancel := context.WithTimeout(ctx, wait.ForeverTestTimeout)
+	defer metricsCancel()
+
+	s.GatherMetrics(metricsCtx)
+
+	return nil
 }

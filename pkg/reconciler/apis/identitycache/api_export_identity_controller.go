@@ -21,22 +21,26 @@ import (
 	"fmt"
 	"time"
 
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
+	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
+	kcpcorev1informers "github.com/kcp-dev/client-go/informers/core/v1"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	coreinformers "k8s.io/client-go/informers/core/v1"
-	kubernetesclient "k8s.io/client-go/kubernetes"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
 	configshard "github.com/kcp-dev/kcp/config/shard"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	apisinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/apis/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/logging"
+	"github.com/kcp-dev/kcp/pkg/reconciler/events"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/core"
+	apisv1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/apis/v1alpha1"
 )
 
 const (
@@ -54,52 +58,66 @@ const (
 // The config map is meant to be used by clients/informers to inject the identities
 // for the given GRs when making requests to the server.
 func NewApiExportIdentityProviderController(
-	kubeClusterClient kubernetesclient.ClusterInterface,
-	remoteShardApiExportInformer apisinformers.APIExportInformer,
-	configMapInformer coreinformers.ConfigMapInformer,
+	kubeClusterClient kcpkubernetesclientset.ClusterInterface,
+	globalAPIExportInformer apisv1alpha1informers.APIExportClusterInformer,
+	configMapInformer kcpcorev1informers.ConfigMapClusterInformer,
 ) (*controller, error) {
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), ControllerName)
-
 	c := &controller{
-		queue:                        queue,
-		kubeClient:                   kubeClusterClient.Cluster(configshard.SystemShardCluster),
-		configMapLister:              configMapInformer.Lister(),
-		remoteShardApiExportsIndexer: remoteShardApiExportInformer.Informer().GetIndexer(),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name: ControllerName,
+			},
+		),
+		createConfigMap: func(ctx context.Context, cluster logicalcluster.Path, namespace string, configMap *corev1.ConfigMap) (*corev1.ConfigMap, error) {
+			return kubeClusterClient.Cluster(cluster).CoreV1().ConfigMaps(namespace).Create(ctx, configMap, metav1.CreateOptions{})
+		},
+		getConfigMap: func(clusterName logicalcluster.Name, namespace, name string) (*corev1.ConfigMap, error) {
+			return configMapInformer.Lister().Cluster(clusterName).ConfigMaps(namespace).Get(name)
+		},
+		updateConfigMap: func(ctx context.Context, cluster logicalcluster.Path, namespace string, configMap *corev1.ConfigMap) (*corev1.ConfigMap, error) {
+			return kubeClusterClient.Cluster(cluster).CoreV1().ConfigMaps(namespace).Update(ctx, configMap, metav1.UpdateOptions{})
+		},
+		listGlobalAPIExports: func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIExport, error) {
+			return globalAPIExportInformer.Lister().Cluster(clusterName).List(labels.Everything())
+		},
 	}
 
-	remoteShardApiExportInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+	_, _ = globalAPIExportInformer.Informer().AddEventHandler(events.WithoutSyncs(cache.FilteringResourceEventHandler{
 		FilterFunc: func(obj interface{}) bool {
 			key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
 			if err != nil {
-				runtime.HandleError(err)
+				utilruntime.HandleError(err)
 				return false
 			}
-			clusterName, _, _, err := kcpcache.SplitMetaClusterNamespaceKey(key)
+			cluster, _, _, err := kcpcache.SplitMetaClusterNamespaceKey(key)
 			if err != nil {
-				runtime.HandleError(err)
+				utilruntime.HandleError(err)
 				return false
 			}
-			return clusterName == tenancyv1alpha1.RootCluster
+			clusterName := logicalcluster.Name(cluster.String()) // TODO: remove when SplitMetaClusterNamespaceKey returns tenancy.Name
+			return clusterName == core.RootCluster
 		},
 		Handler: cache.ResourceEventHandlerFuncs{
 			AddFunc:    func(obj interface{}) { c.queue.Add(workKey) },
 			UpdateFunc: func(old, new interface{}) { c.queue.Add(workKey) },
 			DeleteFunc: func(obj interface{}) { c.queue.Add(workKey) },
 		},
-	})
+	}))
 
-	configMapInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+	_, _ = configMapInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
 		FilterFunc: func(obj interface{}) bool {
 			key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
 			if err != nil {
-				runtime.HandleError(err)
+				utilruntime.HandleError(err)
 				return false
 			}
-			clusterName, _, _, err := kcpcache.SplitMetaClusterNamespaceKey(key)
+			cluster, _, _, err := kcpcache.SplitMetaClusterNamespaceKey(key)
 			if err != nil {
-				runtime.HandleError(err)
+				utilruntime.HandleError(err)
 				return false
 			}
+			clusterName := logicalcluster.Name(cluster.String()) // TODO: remove when SplitMetaClusterNamespaceKey returns tenancy.Name
 			if clusterName != configshard.SystemShardCluster {
 				return false
 			}
@@ -120,7 +138,7 @@ func NewApiExportIdentityProviderController(
 
 // Start starts the controller, which stops when ctx.Done() is closed.
 func (c *controller) Start(ctx context.Context, _ int) {
-	defer runtime.HandleCrash()
+	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
 	logger := logging.WithReconciler(klog.FromContext(ctx), ControllerName)
@@ -151,15 +169,16 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 		return true
 	}
 
-	runtime.HandleError(fmt.Errorf("%v failed with: %w", key, err))
+	utilruntime.HandleError(fmt.Errorf("%v failed with: %w", key, err))
 	c.queue.AddRateLimited(key)
 
 	return true
 }
 
 type controller struct {
-	queue                        workqueue.RateLimitingInterface
-	kubeClient                   kubernetesclient.Interface
-	configMapLister              corelisters.ConfigMapLister
-	remoteShardApiExportsIndexer cache.Indexer
+	queue                workqueue.TypedRateLimitingInterface[string]
+	createConfigMap      func(ctx context.Context, cluster logicalcluster.Path, namespace string, configMap *corev1.ConfigMap) (*corev1.ConfigMap, error)
+	getConfigMap         func(clusterName logicalcluster.Name, namespace, name string) (*corev1.ConfigMap, error)
+	updateConfigMap      func(ctx context.Context, cluster logicalcluster.Path, namespace string, configMap *corev1.ConfigMap) (*corev1.ConfigMap, error)
+	listGlobalAPIExports func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIExport, error)
 }

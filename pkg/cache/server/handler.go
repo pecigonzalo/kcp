@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,19 +48,27 @@ func init() {
 
 // WithShardScope reads a shard name from the URL path and puts it into the context.
 // It also trims "/shards/" prefix from the URL.
-// If the path doesn't contain the shard name then a default "system:cache:server" name is assigned.
+// If the path doesn't contain the shard name then a 404 error is returned.
 //
 // For example:
 //
-// /shards/*/clusters/*/apis/apis.kcp.dev/v1alpha1/apiexports
+// /shards/*/clusters/*/apis/apis.kcp.io/v1alpha1/apiexports
 //
-// /shards/amber/clusters/*/apis/apis.kcp.dev/v1alpha1/apiexports
+// /shards/amber/clusters/*/apis/apis.kcp.io/v1alpha1/apiexports
 //
-// /shards/sapphire/clusters/system:sapphire/apis/apis.kcp.dev/v1alpha1/apiexports
+// /shards/sapphire/clusters/system:sapphire/apis/apis.kcp.io/v1alpha1/apiexports
 //
-// /shards/amber/clusters/system:amber/apis/apis.kcp.dev/v1alpha1/apiexports
+// /shards/amber/clusters/system:amber/apis/apis.kcp.io/v1alpha1/apiexports
+//
+// Note:
+// not all paths require to have a valid shard name,
+// as of today the following paths pass through: "/livez", "/readyz", "/healthz".
 func WithShardScope(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if path := req.URL.Path; path == "/livez" || path == "/readyz" || path == "/healthz" {
+			handler.ServeHTTP(w, req)
+			return
+		}
 		var shardName string
 		if path := req.URL.Path; strings.HasPrefix(path, "/shards/") {
 			path = strings.TrimPrefix(path, "/shards/")
@@ -113,8 +122,8 @@ func WithShardScope(handler http.Handler) http.Handler {
 
 // WithServiceScope an HTTP filter that trims "/services/cache" prefix from the URL.
 //
-// for example: /services/cache/shards/amber/clusters/*/apis/apis.kcp.dev/v1alpha1/apiexports
-// is truncated to /shards/amber/clusters/*/apis/apis.kcp.dev/v1alpha1/apiexports
+// for example: /services/cache/shards/amber/clusters/*/apis/apis.kcp.io/v1alpha1/apiexports
+// is truncated to /shards/amber/clusters/*/apis/apis.kcp.io/v1alpha1/apiexports.
 func WithServiceScope(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if path := req.URL.Path; strings.HasPrefix(path, "/services/cache") {
@@ -130,6 +139,14 @@ func WithServiceScope(handler http.Handler) http.Handler {
 			}
 			req.URL = newURL
 		}
+		handler.ServeHTTP(w, req)
+	})
+}
+
+// WithSyntheticDelay injects a synthetic delay to calls, to exacerbate timing issues and expose inconsistent client behavior.
+func WithSyntheticDelay(handler http.Handler, delay time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		time.Sleep(delay)
 		handler.ServeHTTP(w, req)
 	})
 }
