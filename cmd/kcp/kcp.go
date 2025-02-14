@@ -23,23 +23,24 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"k8s.io/apimachinery/pkg/util/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/rest"
 	"k8s.io/component-base/cli"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
-	"k8s.io/component-base/config"
 	"k8s.io/component-base/logs"
+	logsapiv1 "k8s.io/component-base/logs/api/v1"
+	_ "k8s.io/component-base/logs/json/register"
 	"k8s.io/component-base/term"
 	"k8s.io/component-base/version"
 	"k8s.io/klog/v2"
 
-	"github.com/kcp-dev/kcp/pkg/cmd/help"
+	"github.com/kcp-dev/kcp/cmd/kcp/options"
 	"github.com/kcp-dev/kcp/pkg/embeddedetcd"
 	kcpfeatures "github.com/kcp-dev/kcp/pkg/features"
 	"github.com/kcp-dev/kcp/pkg/server"
-	"github.com/kcp-dev/kcp/pkg/server/options"
+	"github.com/kcp-dev/kcp/sdk/cmd/help"
 )
 
 func main() {
@@ -50,10 +51,10 @@ func main() {
 			KCP is the easiest way to manage Kubernetes applications against one or
 			more clusters, by giving you a personal control plane that schedules your
 			workloads onto one or many clusters, and making it simple to pick up and
-			move. Advanced use cases including spreading your apps across clusters for
-			resiliency, scheduling batch workloads onto clusters with free capacity,
-			and enabling collaboration for individual teams without having access to
-			the underlying clusters.
+			move. It supports advanced use cases such as spreading your apps across
+			clusters for resiliency, scheduling batch workloads onto clusters with
+			free capacity, and enabling collaboration for individual teams without
+			having access to the underlying clusters.
 
 			To get started, launch a new cluster with 'kcp start', which will
 			initialize your personal control plane and write an admin kubeconfig file
@@ -67,6 +68,7 @@ func main() {
 
 	// manually extract root directory from flags first as it influence all other flags
 	rootDir := ".kcp"
+	additionalMappingsFile := ""
 	for i, f := range os.Args {
 		if f == "--root-directory" {
 			if i < len(os.Args)-1 {
@@ -74,11 +76,18 @@ func main() {
 			} // else let normal flag processing fail
 		} else if strings.HasPrefix(f, "--root-directory=") {
 			rootDir = strings.TrimPrefix(f, "--root-directory=")
+		} else if f == "--miniproxy-mapping-file" {
+			if i < len(os.Args)-1 {
+				additionalMappingsFile = os.Args[i+1]
+			} // else let normal flag processing fail
+		} else if strings.HasPrefix(f, "--miniproxy-mapping-file") {
+			additionalMappingsFile = strings.TrimPrefix(f, "--miniproxy-mapping-file=")
 		}
 	}
 
-	serverOptions := options.NewOptions(rootDir)
-	serverOptions.GenericControlPlane.Logs.Config.Verbosity = config.VerbosityLevel(2)
+	kcpOptions := options.NewOptions(rootDir)
+	kcpOptions.Server.GenericControlPlane.Logs.Verbosity = logsapiv1.VerbosityLevel(2)
+	kcpOptions.Server.Extra.AdditionalMappingsFile = additionalMappingsFile
 
 	startCmd := &cobra.Command{
 		Use:   "start",
@@ -100,32 +109,33 @@ func main() {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// run as early as possible to avoid races later when some components (e.g. grpc) start early using klog
-			if err := serverOptions.GenericControlPlane.Logs.ValidateAndApply(kcpfeatures.DefaultFeatureGate); err != nil {
+			if err := logsapiv1.ValidateAndApply(kcpOptions.Server.GenericControlPlane.Logs, kcpfeatures.DefaultFeatureGate); err != nil {
 				return err
 			}
 
-			completed, err := serverOptions.Complete()
+			completedKcpOptions, err := kcpOptions.Complete()
 			if err != nil {
 				return err
 			}
 
-			if errs := completed.Validate(); len(errs) > 0 {
-				return errors.NewAggregate(errs)
+			if errs := completedKcpOptions.Validate(); len(errs) > 0 {
+				return utilerrors.NewAggregate(errs)
 			}
 
-			klog.Infof("Batteries included: %s", strings.Join(completed.Extra.BatteriesIncluded, ","))
-
-			config, err := server.NewConfig(completed)
-			if err != nil {
-				return err
-			}
-
-			completedConfig, err := config.Complete()
-			if err != nil {
-				return err
-			}
+			logger := klog.FromContext(cmd.Context())
+			logger.Info("running with selected batteries", "batteries", strings.Join(completedKcpOptions.Server.Extra.BatteriesIncluded, ","))
 
 			ctx := genericapiserver.SetupSignalContext()
+
+			serverConfig, err := server.NewConfig(ctx, completedKcpOptions.Server)
+			if err != nil {
+				return err
+			}
+
+			completedConfig, err := serverConfig.Complete()
+			if err != nil {
+				return err
+			}
 
 			// the etcd server must be up before NewServer because storage decorators access it right away
 			if completedConfig.EmbeddedEtcd.Config != nil {
@@ -143,10 +153,11 @@ func main() {
 	}
 
 	// add start named flag sets to start flags
-	namedStartFlagSets := serverOptions.Flags()
-	globalflag.AddGlobalFlags(namedStartFlagSets.FlagSet("global"), cmd.Name(), logs.SkipLoggingConfigurationFlags())
+	fss := cliflag.NamedFlagSets{}
+	kcpOptions.AddFlags(&fss)
+	globalflag.AddGlobalFlags(fss.FlagSet("global"), cmd.Name(), logs.SkipLoggingConfigurationFlags())
 	startFlags := startCmd.Flags()
-	for _, f := range namedStartFlagSets.FlagSets {
+	for _, f := range fss.FlagSets {
 		startFlags.AddFlagSet(f)
 	}
 
@@ -165,15 +176,15 @@ func main() {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Fprintf(cmd.OutOrStderr(), usageFmt, startCmd.UseLine())
-			cliflag.PrintSections(cmd.OutOrStderr(), namedStartFlagSets, cols)
+			fmt.Fprintf(cmd.OutOrStdout(), usageFmt, startCmd.UseLine())
+			cliflag.PrintSections(cmd.OutOrStdout(), fss, cols)
 			return nil
 		},
 	}
 	startCmd.AddCommand(startOptionsCmd)
 	cmd.AddCommand(startCmd)
 
-	setPartialUsageAndHelpFunc(startCmd, namedStartFlagSets, cols, []string{
+	setPartialUsageAndHelpFunc(startCmd, fss, cols, []string{
 		"etcd-servers",
 		"batteries-included",
 		"run-virtual-workspaces",

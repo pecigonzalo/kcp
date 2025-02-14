@@ -19,13 +19,17 @@ package forwardingregistry_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	"github.com/kcp-dev/logicalcluster/v3"
 	"github.com/stretchr/testify/require"
 
+	kcpfakedynamic "github.com/kcp-dev/client-go/third_party/k8s.io/client-go/dynamic/fake"
+	kcptesting "github.com/kcp-dev/client-go/third_party/k8s.io/client-go/testing"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver"
@@ -34,6 +38,7 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/registry/customresource/tableconvertor"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/validation/path"
 	"k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -44,25 +49,16 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/fake"
-	kubernetestesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/util/retry"
 
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/forwardingregistry"
 )
 
-type mockedClusterClient struct {
-	client *fake.FakeDynamicClient
-}
-
-func (mcg *mockedClusterClient) Cluster(cluster logicalcluster.Name) dynamic.Interface {
-	return mcg.client
-}
-
 var noxusGVR = schema.GroupVersionResource{Group: "mygroup.example.com", Resource: "noxus", Version: "v1beta1"}
 
-func newStorage(t *testing.T, clusterClient dynamic.ClusterInterface, apiExportIdentityHash string, patchConflictRetryBackoff *wait.Backoff) (mainStorage, statusStorage rest.Storage) {
+func newStorage(t *testing.T, clusterClient kcpdynamic.ClusterInterface, apiExportIdentityHash string, patchConflictRetryBackoff *wait.Backoff) (mainStorage, statusStorage rest.Storage) {
+	t.Helper()
+
 	gvr := noxusGVR
 	groupVersion := gvr.GroupVersion()
 
@@ -108,19 +104,21 @@ func newStorage(t *testing.T, clusterClient dynamic.ClusterInterface, apiExportI
 			typer,
 			true,
 			kind,
+			path.ValidatePathSegmentName,
 			nil,
 			nil,
 			nil,
 			&apiextensions.CustomResourceSubresourceStatus{},
-			nil),
+			nil,
+			[]apiextensionsv1.SelectableField{},
+		),
 		nil,
 		table,
 		nil,
-		clusterClient,
+		func(ctx context.Context) (kcpdynamic.ClusterInterface, error) { return clusterClient, nil },
 		patchConflictRetryBackoff,
-		func(_ schema.GroupResource, store *forwardingregistry.StoreFuncs) *forwardingregistry.StoreFuncs {
-			return store
-		})
+		forwardingregistry.StorageWrapperFunc(func(_ schema.GroupResource, store *forwardingregistry.StoreFuncs) {
+		}))
 }
 
 func createResource(namespace, name string) *unstructured.Unstructured {
@@ -132,6 +130,7 @@ func createResource(namespace, name string) *unstructured.Unstructured {
 				"namespace":         namespace,
 				"name":              name,
 				"creationTimestamp": time.Now().Add(-time.Hour*12 - 30*time.Minute).UTC().Format(time.RFC3339),
+				"annotations":       map[string]interface{}{logicalcluster.AnnotationKey: "test"},
 			},
 			"spec": map[string]interface{}{
 				"replicas":         int64(7),
@@ -147,29 +146,29 @@ func createResource(namespace, name string) *unstructured.Unstructured {
 }
 
 func TestGet(t *testing.T) {
-	fakeClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
-	storage, _ := newStorage(t, &mockedClusterClient{fakeClient}, "", nil)
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClient(runtime.NewScheme())
+	storage, _ := newStorage(t, fakeClient, "", nil)
 	ctx := request.WithNamespace(context.Background(), "default")
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.New("foo")})
+	ctx = request.WithCluster(ctx, request.Cluster{Name: "test"})
 
 	getter := storage.(rest.Getter)
 	_, err := getter.Get(ctx, "foo", &metav1.GetOptions{})
 	require.EqualError(t, err, "noxus.mygroup.example.com \"foo\" not found")
 
 	resource := createResource("default", "foo")
-	_ = fakeClient.Tracker().Add(resource)
+	_ = fakeClient.Tracker().Cluster(logicalcluster.NewPath("test")).Add(resource)
 
 	result, err := getter.Get(ctx, "foo", &metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Truef(t, apiequality.Semantic.DeepEqual(resource, result), "expected:\n%V\nactual:\n%V", resource, result)
+	require.Truef(t, apiequality.Semantic.DeepEqual(resource, result), "expected:\n%v\nactual:\n%v", resource, result)
 }
 
 func TestList(t *testing.T) {
 	resources := []runtime.Object{createResource("default", "foo"), createResource("default", "foo2")}
-	fakeClient := fake.NewSimpleDynamicClient(runtime.NewScheme(), resources...)
-	storage, _ := newStorage(t, &mockedClusterClient{fakeClient}, "", nil)
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClient(runtime.NewScheme(), resources...)
+	storage, _ := newStorage(t, fakeClient, "", nil)
 	ctx := request.WithNamespace(context.Background(), "default")
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.New("foo")})
+	ctx = request.WithCluster(ctx, request.Cluster{Name: "test"})
 
 	lister := storage.(rest.Lister)
 	result, err := lister.List(ctx, &internalversion.ListOptions{})
@@ -179,7 +178,7 @@ func TestList(t *testing.T) {
 	require.Len(t, resultResources, len(resources))
 	for i, resource := range resources {
 		resource := *resource.(*unstructured.Unstructured)
-		require.Truef(t, apiequality.Semantic.DeepEqual(resource, resultResources[i]), "expected:\n%V\nactual:\n%V", resource, resultResources[0])
+		require.Truef(t, apiequality.Semantic.DeepEqual(resource, resultResources[i]), "expected:\n%v\nactual:\n%v", resource, resultResources[0])
 	}
 	require.Len(t, fakeClient.Actions(), 1)
 	require.Equal(t, "noxus", fakeClient.Actions()[0].GetResource().Resource)
@@ -188,19 +187,19 @@ func TestList(t *testing.T) {
 func TestWildcardListWithAPIExportIdentity(t *testing.T) {
 	resources := []runtime.Object{createResource("default", "foo"), createResource("default", "foo2")}
 	noxusGVRWithHash := noxusGVR.GroupVersion().WithResource("noxus:" + "apiExportIdentityHash")
-	fakeClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
 			noxusGVR:         "NoxuList",
 			noxusGVRWithHash: "NoxuList",
 		})
 	for _, resource := range resources {
-		_ = fakeClient.Tracker().Create(noxusGVRWithHash, resource, "default")
+		_ = fakeClient.Tracker().Cluster(logicalcluster.NewPath("test")).Create(noxusGVRWithHash, resource, "default")
 	}
 
-	storage, _ := newStorage(t, &mockedClusterClient{fakeClient}, "apiExportIdentityHash", nil)
-	ctx := request.WithNamespace(context.Background(), "default")
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.Wildcard, Wildcard: true})
+	storage, _ := newStorage(t, fakeClient, "apiExportIdentityHash", nil)
+	ctx := request.WithNamespace(context.Background(), "")
+	ctx = request.WithCluster(ctx, request.Cluster{Wildcard: true})
 
 	lister := storage.(rest.Lister)
 	result, err := lister.List(ctx, &internalversion.ListOptions{})
@@ -210,13 +209,15 @@ func TestWildcardListWithAPIExportIdentity(t *testing.T) {
 	require.Len(t, resultResources, len(resources))
 	for i, resource := range resources {
 		resource := *resource.(*unstructured.Unstructured)
-		require.Truef(t, apiequality.Semantic.DeepEqual(resource, resultResources[i]), "expected:\n%V\nactual:\n%V", resource, resultResources[0])
+		require.Truef(t, apiequality.Semantic.DeepEqual(resource, resultResources[i]), "expected:\n%v\nactual:\n%v", resource, resultResources[0])
 	}
 	require.Len(t, fakeClient.Actions(), 1)
 	require.Equal(t, "noxus:apiExportIdentityHash", fakeClient.Actions()[0].GetResource().Resource)
 }
 
 func checkWatchEvents(t *testing.T, addEvents func(), watchCall func() (watch.Interface, error), expectedEvents []watch.Event) {
+	t.Helper()
+
 	watchingStarted := make(chan bool, 1)
 	go func() {
 		<-watchingStarted
@@ -243,13 +244,13 @@ func checkWatchEvents(t *testing.T, addEvents func(), watchCall func() (watch.In
 
 func TestWatch(t *testing.T) {
 	resources := []runtime.Object{createResource("default", "foo"), createResource("default", "foo2")}
-	fakeClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClient(runtime.NewScheme())
 	fakeWatcher := watch.NewFake()
 	defer fakeWatcher.Stop()
-	fakeClient.PrependWatchReactor("noxus", kubernetestesting.DefaultWatchReactor(fakeWatcher, nil))
-	storage, _ := newStorage(t, &mockedClusterClient{fakeClient}, "", nil)
+	fakeClient.PrependWatchReactor("noxus", kcptesting.DefaultWatchReactor(fakeWatcher, nil))
+	storage, _ := newStorage(t, fakeClient, "", nil)
 	ctx := request.WithNamespace(context.Background(), "default")
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.New("foo")})
+	ctx = request.WithCluster(ctx, request.Cluster{Name: "test"})
 
 	watchedError := &metav1.Status{
 		Status:  "Failure",
@@ -282,7 +283,7 @@ func TestWatch(t *testing.T) {
 func TestWildcardWatchWithPIExportIdentity(t *testing.T) {
 	resources := []runtime.Object{createResource("default", "foo"), createResource("default", "foo2")}
 	noxusGVRWithHash := noxusGVR.GroupVersion().WithResource("noxus:apiExportIdentityHash")
-	fakeClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
 			noxusGVR:         "NoxuList",
@@ -290,10 +291,10 @@ func TestWildcardWatchWithPIExportIdentity(t *testing.T) {
 		})
 	fakeWatcher := watch.NewFake()
 	defer fakeWatcher.Stop()
-	fakeClient.PrependWatchReactor("noxus:apiExportIdentityHash", kubernetestesting.DefaultWatchReactor(fakeWatcher, nil))
-	storage, _ := newStorage(t, &mockedClusterClient{fakeClient}, "apiExportIdentityHash", nil)
-	ctx := request.WithNamespace(context.Background(), "default")
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.Wildcard, Wildcard: true})
+	fakeClient.PrependWatchReactor("noxus:apiExportIdentityHash", kcptesting.DefaultWatchReactor(fakeWatcher, nil))
+	storage, _ := newStorage(t, fakeClient, "apiExportIdentityHash", nil)
+	ctx := request.WithNamespace(context.Background(), "")
+	ctx = request.WithCluster(ctx, request.Cluster{Wildcard: true})
 
 	watchedError := &metav1.Status{
 		Status:  "Failure",
@@ -323,12 +324,12 @@ func TestWildcardWatchWithPIExportIdentity(t *testing.T) {
 	require.Equal(t, "noxus:apiExportIdentityHash", fakeClient.Actions()[0].GetResource().Resource)
 }
 
-func updateReactor(fakeClient *fake.FakeDynamicClient) kubernetestesting.ReactionFunc {
-	return func(action kubernetestesting.Action) (handled bool, ret runtime.Object, err error) {
-		updateAction := action.(kubernetestesting.UpdateAction)
+func updateReactor(fakeClient *kcpfakedynamic.FakeDynamicClusterClientset) kcptesting.ReactionFunc {
+	return func(action kcptesting.Action) (handled bool, ret runtime.Object, err error) {
+		updateAction := action.(kcptesting.UpdateAction)
 		actionResource := updateAction.GetObject().(*unstructured.Unstructured)
 
-		existingObject, err := fakeClient.Tracker().Get(action.GetResource(), action.GetNamespace(), actionResource.GetName())
+		existingObject, err := fakeClient.Tracker().Cluster(logicalcluster.NewPath("test")).Get(action.GetResource(), action.GetNamespace(), actionResource.GetName())
 		if err != nil {
 			return true, nil, err
 		}
@@ -337,7 +338,7 @@ func updateReactor(fakeClient *fake.FakeDynamicClient) kubernetestesting.Reactio
 		if existingResource.GetResourceVersion() != actionResource.GetResourceVersion() {
 			return true, nil, errors.NewConflict(action.GetResource().GroupResource(), existingResource.GetName(), fmt.Errorf(registry.OptimisticLockErrorMsg))
 		}
-		if err := fakeClient.Tracker().Update(action.GetResource(), actionResource, action.GetNamespace()); err != nil {
+		if err := fakeClient.Tracker().Cluster(logicalcluster.NewPath("test")).Update(action.GetResource(), actionResource, action.GetNamespace()); err != nil {
 			return true, nil, err
 		}
 
@@ -349,12 +350,12 @@ func TestUpdate(t *testing.T) {
 	resource := createResource("default", "foo")
 	resource.SetGeneration(1)
 	resource.SetResourceVersion("100")
-	fakeClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClient(runtime.NewScheme())
 	fakeClient.PrependReactor("update", "noxus", updateReactor(fakeClient))
 
-	storage, _ := newStorage(t, &mockedClusterClient{fakeClient}, "", nil)
+	storage, _ := newStorage(t, fakeClient, "", nil)
 	ctx := request.WithNamespace(context.Background(), "default")
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.New("foo")})
+	ctx = request.WithCluster(ctx, request.Cluster{Name: "test"})
 	updated := resource.DeepCopy()
 
 	newReplicas, _, err := unstructured.NestedInt64(updated.UnstructuredContent(), "spec", "replicas")
@@ -368,7 +369,7 @@ func TestUpdate(t *testing.T) {
 	_, _, err = updater.Update(ctx, updated.GetName(), rest.DefaultUpdatedObjectInfo(updated), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 	require.EqualError(t, err, "noxus.mygroup.example.com \"foo\" not found")
 
-	_ = fakeClient.Tracker().Add(resource)
+	_ = fakeClient.Tracker().Cluster(logicalcluster.NewPath("test")).Add(resource)
 	result, _, err := updater.Update(ctx, updated.GetName(), rest.DefaultUpdatedObjectInfo(updated), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 	require.NoError(t, err)
 
@@ -395,12 +396,12 @@ func TestUpdateWithForceAllowCreate(t *testing.T) {
 	resource := createResource("default", "foo")
 	resource.SetGeneration(1)
 	resource.SetResourceVersion("100")
-	fakeClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClient(runtime.NewScheme())
 	fakeClient.PrependReactor("update", "noxus", updateReactor(fakeClient))
 
-	storage, _ := newStorage(t, &mockedClusterClient{fakeClient}, "", nil)
+	storage, _ := newStorage(t, fakeClient, "", nil)
 	ctx := request.WithNamespace(context.Background(), "default")
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.New("foo")})
+	ctx = request.WithCluster(ctx, request.Cluster{Name: "test"})
 	updated := resource.DeepCopy()
 
 	newReplicas, _, err := unstructured.NestedInt64(updated.UnstructuredContent(), "spec", "replicas")
@@ -437,12 +438,12 @@ func TestStatusUpdate(t *testing.T) {
 	resource := createResource("default", "foo")
 	resource.SetGeneration(1)
 	resource.SetResourceVersion("100")
-	fakeClient := fake.NewSimpleDynamicClient(runtime.NewScheme(), resource)
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClient(runtime.NewScheme(), resource)
 	fakeClient.PrependReactor("update", "noxus", updateReactor(fakeClient))
 
-	_, statusStorage := newStorage(t, &mockedClusterClient{fakeClient}, "", nil)
+	_, statusStorage := newStorage(t, fakeClient, "", nil)
 	ctx := request.WithNamespace(context.Background(), "default")
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.New("foo")})
+	ctx = request.WithCluster(ctx, request.Cluster{Name: "test"})
 	statusUpdated := resource.DeepCopy()
 	if err := unstructured.SetNestedField(statusUpdated.UnstructuredContent(), int64(10), "status", "availableReplicas"); err != nil {
 		require.NoError(t, err)
@@ -464,18 +465,18 @@ func TestPatch(t *testing.T) {
 	resource := createResource("default", "foo")
 	resource.SetGeneration(1)
 	resource.SetResourceVersion("100")
-	fakeClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	fakeClient := kcpfakedynamic.NewSimpleDynamicClient(runtime.NewScheme())
 	fakeClient.PrependReactor("update", "noxus", updateReactor(fakeClient))
 
 	backoff := retry.DefaultRetry
 	backoff.Steps = 5
-	storage, _ := newStorage(t, &mockedClusterClient{fakeClient}, "", &backoff)
+	storage, _ := newStorage(t, fakeClient, "", &backoff)
 	ctx := request.WithNamespace(context.Background(), "default")
 	ctx = request.WithRequestInfo(ctx, &request.RequestInfo{Verb: "patch"})
-	ctx = request.WithCluster(ctx, request.Cluster{Name: logicalcluster.New("foo")})
+	ctx = request.WithCluster(ctx, request.Cluster{Name: "test"})
 
 	patcher := func(ctx context.Context, newObj, oldObj runtime.Object) (runtime.Object, error) {
-		if oldObj == nil {
+		if reflect.DeepEqual(&unstructured.Unstructured{}, oldObj.(*unstructured.Unstructured)) {
 			return nil, errors.NewNotFound(schema.ParseGroupResource("noxus.mygroup.example.com"), "foo")
 		}
 		updated := oldObj.DeepCopyObject().(*unstructured.Unstructured)
@@ -492,10 +493,10 @@ func TestPatch(t *testing.T) {
 	_, _, err := updater.Update(ctx, resource.GetName(), rest.DefaultUpdatedObjectInfo(nil, patcher), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 	require.EqualError(t, err, "noxus.mygroup.example.com \"foo\" not found")
 
-	_ = fakeClient.Tracker().Add(resource)
+	_ = fakeClient.Tracker().Cluster(logicalcluster.NewPath("test")).Add(resource)
 	getCallCounts := 0
 	noMoreConflicts := 4
-	fakeClient.PrependReactor("get", "noxus", func(action kubernetestesting.Action) (handled bool, ret runtime.Object, err error) {
+	fakeClient.PrependReactor("get", "noxus", func(action kcptesting.Action) (handled bool, ret runtime.Object, err error) {
 		getCallCounts++
 		if getCallCounts < noMoreConflicts {
 			withChangedResourceVersion := resource.DeepCopy()

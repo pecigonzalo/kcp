@@ -28,14 +28,12 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
-
 	extensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	apimachineryerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	kubeyaml "k8s.io/apimachinery/pkg/util/yaml"
@@ -45,10 +43,11 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/klog/v2"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	tenancyhelper "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1/helper"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
+	"github.com/kcp-dev/kcp/pkg/logging"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/core"
+	tenancyhelper "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1/helper"
+	kcpclient "github.com/kcp-dev/kcp/sdk/client/clientset/versioned"
 )
 
 // TransformFileFunc transforms a resource file before being applied to the cluster.
@@ -78,18 +77,18 @@ func ReplaceOption(pairs ...string) Option {
 // Bootstrap creates resources in a package's fs by
 // continuously retrying the list. This is blocking, i.e. it only returns (with error)
 // when the context is closed or with nil when the bootstrapping is successfully completed.
-func Bootstrap(ctx context.Context, discoveryClient discovery.DiscoveryInterface, dynamicClient dynamic.Interface, batteriesIncluded sets.String, fs embed.FS, opts ...Option) error {
+func Bootstrap(ctx context.Context, discoveryClient discovery.DiscoveryInterface, dynamicClient dynamic.Interface, batteriesIncluded sets.Set[string], fs embed.FS, opts ...Option) error {
 	cache := memory.NewMemCacheClient(discoveryClient)
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(cache)
 
 	// bootstrap non-crd resources
-	var transformers []TransformFileFunc
+	transformers := make([]TransformFileFunc, 0, len(opts))
 	for _, opt := range opts {
 		transformers = append(transformers, opt.TransformFile)
 	}
-	return wait.PollImmediateInfiniteWithContext(ctx, time.Second, func(ctx context.Context) (bool, error) {
+	return wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
 		if err := CreateResourcesFromFS(ctx, dynamicClient, mapper, batteriesIncluded, fs, transformers...); err != nil {
-			klog.Infof("Failed to bootstrap resources, retrying: %v", err)
+			klog.FromContext(ctx).WithValues("err", err).Info("failed to bootstrap resources, retrying")
 			// invalidate cache if resources not found
 			// xref: https://github.com/kcp-dev/kcp/issues/655
 			cache.Invalidate()
@@ -100,7 +99,7 @@ func Bootstrap(ctx context.Context, discoveryClient discovery.DiscoveryInterface
 }
 
 // CreateResourcesFromFS creates all resources from a filesystem.
-func CreateResourcesFromFS(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, batteriesIncluded sets.String, fs embed.FS, transformers ...TransformFileFunc) error {
+func CreateResourcesFromFS(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, batteriesIncluded sets.Set[string], fs embed.FS, transformers ...TransformFileFunc) error {
 	files, err := fs.ReadDir(".")
 	if err != nil {
 		return err
@@ -115,11 +114,11 @@ func CreateResourcesFromFS(ctx context.Context, client dynamic.Interface, mapper
 			errs = append(errs, err)
 		}
 	}
-	return apimachineryerrors.NewAggregate(errs)
+	return utilerrors.NewAggregate(errs)
 }
 
 // CreateResourceFromFS creates given resource file.
-func CreateResourceFromFS(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, batteriesIncluded sets.String, filename string, fs embed.FS, transformers ...TransformFileFunc) error {
+func CreateResourceFromFS(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, batteriesIncluded sets.Set[string], filename string, fs embed.FS, transformers ...TransformFileFunc) error {
 	raw, err := fs.ReadFile(filename)
 	if err != nil {
 		return fmt.Errorf("could not read %s: %w", filename, err)
@@ -153,20 +152,21 @@ func CreateResourceFromFS(ctx context.Context, client dynamic.Interface, mapper 
 			errs = append(errs, fmt.Errorf("failed to create resource %s doc %d: %w", filename, i, err))
 		}
 	}
-	return apimachineryerrors.NewAggregate(errs)
+	return utilerrors.NewAggregate(errs)
 }
 
-const annotationCreateOnlyKey = "bootstrap.kcp.dev/create-only"
-const annotationBattery = "bootstrap.kcp.dev/battery"
+const annotationCreateOnlyKey = "bootstrap.kcp.io/create-only"
+const annotationBattery = "bootstrap.kcp.io/battery"
 
-func createResourceFromFS(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, raw []byte, batteriesIncluded sets.String) error {
+func createResourceFromFS(ctx context.Context, client dynamic.Interface, mapper meta.RESTMapper, raw []byte, batteriesIncluded sets.Set[string]) error {
+	logger := klog.FromContext(ctx)
 	type Input struct {
 		Batteries map[string]bool
 	}
 	input := Input{
 		Batteries: map[string]bool{},
 	}
-	for _, b := range batteriesIncluded.List() {
+	for _, b := range sets.List[string](batteriesIncluded) {
 		input.Batteries[b] = true
 	}
 	tmpl, err := template.New("manifest").Parse(string(raw))
@@ -197,7 +197,7 @@ func createResourceFromFS(ctx context.Context, client dynamic.Interface, mapper 
 			}
 		}
 		if !included {
-			klog.V(4).Infof("Skipping %s because %s is/are not among included batteries %s", u.GetName(), v, batteriesIncluded)
+			logger.V(4).WithValues("resource", u.GetName(), "batteriesRequired", v, "batteriesIncluded", batteriesIncluded).Info("skipping resource because required batteries are not among included batteries")
 			return nil
 		}
 	}
@@ -214,13 +214,10 @@ func createResourceFromFS(ctx context.Context, client dynamic.Interface, mapper 
 			if err != nil {
 				return err
 			}
+			logger := logging.WithObject(logger, existing)
 
 			if _, exists := existing.GetAnnotations()[annotationCreateOnlyKey]; exists {
-				klog.Infof(
-					"Skipping update of %s %s because it has the create-only annotation",
-					gvk,
-					tenancyhelper.QualifiedObjectName(existing),
-				)
+				logger.Info("skipping update of object because it has the create-only annotation")
 
 				return nil
 			}
@@ -229,29 +226,31 @@ func createResourceFromFS(ctx context.Context, client dynamic.Interface, mapper 
 			if _, err = client.Resource(m.Resource).Namespace(u.GetNamespace()).Update(ctx, u, metav1.UpdateOptions{}); err != nil {
 				return fmt.Errorf("could not update %s %s: %w", gvk.Kind, tenancyhelper.QualifiedObjectName(existing), err)
 			} else {
-				klog.Infof("Updated %s %s", gvk, tenancyhelper.QualifiedObjectName(existing))
+				logger.Info("updated object")
 				return nil
 			}
 		}
 		return err
 	}
 
-	klog.Infof("Bootstrapped %s %s", gvk.Kind, tenancyhelper.QualifiedObjectName(upserted))
+	logging.WithObject(logger, upserted).Info("upserted object")
 
 	return nil
 }
 
 func BindRootAPIs(ctx context.Context, kcpClient kcpclient.Interface, exportNames ...string) error {
+	logger := klog.FromContext(ctx)
+
 	for _, exportName := range exportNames {
 		binding := &apisv1alpha1.APIBinding{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: exportName,
 			},
 			Spec: apisv1alpha1.APIBindingSpec{
-				Reference: apisv1alpha1.ExportReference{
-					Workspace: &apisv1alpha1.WorkspaceExportReference{
-						Path:       tenancyv1alpha1.RootCluster.String(),
-						ExportName: exportName,
+				Reference: apisv1alpha1.BindingReference{
+					Export: &apisv1alpha1.ExportBindingReference{
+						Path: core.RootCluster.Path().String(),
+						Name: exportName,
 					},
 				},
 			},
@@ -259,22 +258,43 @@ func BindRootAPIs(ctx context.Context, kcpClient kcpclient.Interface, exportName
 
 		created, err := kcpClient.ApisV1alpha1().APIBindings().Create(ctx, binding, metav1.CreateOptions{})
 		if err == nil {
-			klog.V(2).Infof("Created API binding %s|%s", logicalcluster.From(created), created.Name)
+			logger := logging.WithObject(logger, created)
+			logger.V(2).Info("Created API binding")
 			continue
 		}
 		if !apierrors.IsAlreadyExists(err) {
 			return err
 		}
 
-		existing, err := kcpClient.ApisV1alpha1().APIBindings().Get(ctx, exportName, metav1.GetOptions{})
-		if err != nil {
+		if err := wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
+			existing, err := kcpClient.ApisV1alpha1().APIBindings().Get(ctx, exportName, metav1.GetOptions{})
+			if err != nil {
+				logger.Error(err, "error getting APIBinding", "name", exportName)
+				// Always keep trying. Don't ever return an error out of this function.
+				return false, nil
+			}
+
+			logger := logging.WithObject(logger, existing)
+			logger.V(2).Info("Updating API binding")
+
+			existing.Spec = binding.Spec
+
+			_, err = kcpClient.ApisV1alpha1().APIBindings().Update(ctx, existing, metav1.UpdateOptions{})
+			if err == nil {
+				return true, nil
+			}
+			if apierrors.IsConflict(err) {
+				logger.V(2).Info("API binding update conflict, retrying")
+				return false, nil
+			}
+
+			logger.Error(err, "error updating APIBinding")
+			// Always keep trying. Don't ever return an error out of this function.
+			return false, nil
+		}); err != nil {
 			return err
 		}
-		klog.V(2).Infof("Updating API binding %s", exportName)
-		existing.Spec = binding.Spec
-		if _, err := kcpClient.ApisV1alpha1().APIBindings().Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("could not update API binding %s|%s: %w", logicalcluster.From(existing), existing.Name, err)
-		}
 	}
+
 	return nil
 }

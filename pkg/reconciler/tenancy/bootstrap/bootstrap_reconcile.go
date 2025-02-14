@@ -20,20 +20,17 @@ import (
 	"context"
 	"time"
 
-	kcpclienthelper "github.com/kcp-dev/apimachinery/pkg/client"
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
-	"github.com/kcp-dev/kcp/pkg/apis/tenancy/initialization"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/tenancy/initialization"
 )
 
-func (c *controller) reconcile(ctx context.Context, workspace *tenancyv1alpha1.ClusterWorkspace) error {
+func (c *controller) reconcile(ctx context.Context, workspace *corev1alpha1.LogicalCluster) error {
 	logger := klog.FromContext(ctx)
-	if workspace.Status.Phase != tenancyv1alpha1.ClusterWorkspacePhaseInitializing {
+	if workspace.Status.Phase != corev1alpha1.LogicalClusterPhaseInitializing {
 		return nil
 	}
 
@@ -44,17 +41,12 @@ func (c *controller) reconcile(ctx context.Context, workspace *tenancyv1alpha1.C
 	}
 
 	// bootstrap resources
-	wsClusterName := logicalcluster.From(workspace).Join(workspace.Name)
-	logger.Info("bootstrapping resources for org workspace", "logicalCluster", wsClusterName)
+	clusterName := logicalcluster.From(workspace)
+	logger.Info("bootstrapping resources for workspace", "cluster", clusterName)
 	bootstrapCtx, cancel := context.WithDeadline(ctx, time.Now().Add(time.Second*30)) // to not block the controller
 	defer cancel()
 
-	clusterWsConfig := kcpclienthelper.SetCluster(rest.CopyConfig(c.baseConfig), wsClusterName)
-	crdWsClient, err := apiextensionsclient.NewForConfig(clusterWsConfig)
-	if err != nil {
-		return err
-	}
-	if err := c.bootstrap(logicalcluster.WithCluster(bootstrapCtx, wsClusterName), crdWsClient.Discovery(), c.dynamicClusterClient, c.kcpClusterClient, c.batteriesIncluded); err != nil {
+	if err := c.bootstrap(bootstrapCtx, c.kcpClusterClient.Cluster(clusterName.Path()).Discovery(), c.dynamicClusterClient.Cluster(clusterName.Path()), c.kcpClusterClient.Cluster(clusterName.Path()), c.batteriesIncluded); err != nil {
 		return err // requeue
 	}
 

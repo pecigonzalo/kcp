@@ -25,11 +25,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/admission"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 const (
-	PluginName = "tenancy.kcp.dev/APIResourceSchema"
+	PluginName = "tenancy.kcp.io/APIResourceSchema"
 )
 
 func Register(plugins *admission.Plugins) {

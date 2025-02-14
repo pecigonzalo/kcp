@@ -21,14 +21,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
 	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 
 	"github.com/kcp-dev/kcp/test/e2e/framework"
 )
@@ -37,20 +36,21 @@ const DefaultRootCACertConfigmap = "kube-root-ca.crt"
 
 func TestRootCACertConfigmap(t *testing.T) {
 	t.Parallel()
+	framework.Suite(t, "control-plane")
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	t.Cleanup(cancelFunc)
 
 	server := framework.SharedKcpServer(t)
-	orgClusterName := framework.NewOrganizationFixture(t, server)
-	clusterName := framework.NewWorkspaceFixture(t, server, orgClusterName)
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
+	wsPath, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithName("cluster"))
 
 	cfg := server.BaseConfig(t)
-	kubeClusterClient, err := kubernetes.NewForConfig(cfg)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(cfg)
 	require.NoError(t, err)
 
 	t.Log("Creating namespace")
-	namespace, err := kubeClusterClient.CoreV1().Namespaces().Create(logicalcluster.WithCluster(ctx, clusterName), &corev1.Namespace{
+	namespace, err := kubeClusterClient.Cluster(wsPath).CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "e2e-sa-",
 		},
@@ -59,7 +59,7 @@ func TestRootCACertConfigmap(t *testing.T) {
 
 	t.Log("Waiting for default configmap to be created")
 	require.Eventually(t, func() bool {
-		configmap, err := kubeClusterClient.CoreV1().ConfigMaps(namespace.Name).Get(logicalcluster.WithCluster(ctx, clusterName), DefaultRootCACertConfigmap, metav1.GetOptions{})
+		configmap, err := kubeClusterClient.Cluster(wsPath).CoreV1().ConfigMaps(namespace.Name).Get(ctx, DefaultRootCACertConfigmap, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return false
 		}

@@ -24,7 +24,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"io/ioutil"
 	"math/big"
 	"net/url"
 	"os"
@@ -35,6 +34,7 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/fileutil"
 	"go.etcd.io/etcd/server/v3/embed"
 	"go.etcd.io/etcd/server/v3/wal"
+	"go.uber.org/zap"
 
 	"github.com/kcp-dev/kcp/pkg/embeddedetcd/options"
 )
@@ -56,13 +56,13 @@ func NewConfig(o options.CompletedOptions, enableWatchCache bool) (*Config, erro
 	cfg.Dir = o.Directory
 	cfg.AuthToken = ""
 
-	cfg.LPUrls = []url.URL{{Scheme: "https", Host: "localhost:" + o.PeerPort}}
-	cfg.APUrls = []url.URL{{Scheme: "https", Host: "localhost:" + o.PeerPort}}
-	cfg.LCUrls = []url.URL{{Scheme: "https", Host: "localhost:" + o.ClientPort}}
-	cfg.ACUrls = []url.URL{{Scheme: "https", Host: "localhost:" + o.ClientPort}}
+	cfg.ListenPeerUrls = []url.URL{{Scheme: "https", Host: "localhost:" + o.PeerPort}}
+	cfg.AdvertisePeerUrls = []url.URL{{Scheme: "https", Host: "localhost:" + o.PeerPort}}
+	cfg.ListenClientUrls = []url.URL{{Scheme: "https", Host: "localhost:" + o.ClientPort}}
+	cfg.AdvertiseClientUrls = []url.URL{{Scheme: "https", Host: "localhost:" + o.ClientPort}}
 	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 
-	if err := fileutil.TouchDirAll(cfg.Dir); err != nil {
+	if err := fileutil.TouchDirAll(zap.NewNop(), cfg.Dir); err != nil {
 		return nil, err
 	}
 
@@ -215,11 +215,7 @@ func generateClientAndServerCerts(hosts []string, dir string) error {
 	if err := ecPrivateKeyToFile(clientKey, filepath.Join(dir, "client", "key.pem")); err != nil {
 		return err
 	}
-	if err := certToFile(clientTemplate, caTemplate, &clientKey.PublicKey, caKey, filepath.Join(dir, "client", "cert.pem")); err != nil {
-		return err
-	}
-
-	return nil
+	return certToFile(clientTemplate, caTemplate, &clientKey.PublicKey, caKey, filepath.Join(dir, "client", "cert.pem"))
 }
 
 func certToFile(template *x509.Certificate, parent *x509.Certificate, publicKey *ecdsa.PublicKey, privateKey *ecdsa.PrivateKey, path string) error {
@@ -232,7 +228,7 @@ func certToFile(template *x509.Certificate, parent *x509.Certificate, publicKey 
 	if err := pem.Encode(buf, &pem.Block{Type: "CERTIFICATE", Bytes: b}); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(path, buf.Bytes(), 0600)
+	return os.WriteFile(path, buf.Bytes(), 0600)
 }
 
 func ecPrivateKeyToFile(key *ecdsa.PrivateKey, path string) error {
@@ -247,5 +243,5 @@ func ecPrivateKeyToFile(key *ecdsa.PrivateKey, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(path, buf.Bytes(), 0600)
+	return os.WriteFile(path, buf.Bytes(), 0600)
 }

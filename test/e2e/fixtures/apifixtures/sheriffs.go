@@ -24,8 +24,8 @@ import (
 	"testing"
 	"time"
 
-	kcpdynamic "github.com/kcp-dev/apimachinery/pkg/dynamic"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	"github.com/kcp-dev/logicalcluster/v3"
 	"github.com/stretchr/testify/require"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -35,8 +35,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
 	"github.com/kcp-dev/kcp/test/e2e/framework"
 )
 
@@ -77,16 +77,54 @@ func NewSheriffsCRDWithSchemaDescription(group, description string) *apiextensio
 	return crd
 }
 
+func NewSheriffsCRDWithVersions(group string, versions ...string) *apiextensionsv1.CustomResourceDefinition {
+	crdName := fmt.Sprintf("sheriffs.%s", group)
+
+	crd := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: crdName,
+		},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: group,
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Plural:   "sheriffs",
+				Singular: "sheriff",
+				Kind:     "Sheriff",
+				ListKind: "SheriffList",
+			},
+			Scope: "Namespaced",
+		},
+	}
+
+	for i, version := range versions {
+		crd.Spec.Versions = append(crd.Spec.Versions, apiextensionsv1.CustomResourceDefinitionVersion{
+			Name:    version,
+			Served:  true,
+			Storage: i == len(versions)-1,
+			Schema: &apiextensionsv1.CustomResourceValidation{
+				OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+					Type:        "object",
+					Description: "sheriff " + version,
+				},
+			},
+		})
+	}
+
+	return crd
+}
+
 // CreateSheriffsSchemaAndExport creates a sheriffs apisv1alpha1.APIResourceSchema and then creates a apisv1alpha1.APIExport to export it.
 func CreateSheriffsSchemaAndExport(
 	ctx context.Context,
 	t *testing.T,
-	clusterName logicalcluster.Name,
-	clusterClient kcpclient.Interface,
+	path logicalcluster.Path,
+	clusterClient kcpclientset.ClusterInterface,
 	group string,
 	description string,
 ) {
-	schema := &apisv1alpha1.APIResourceSchema{
+	t.Helper()
+
+	s := &apisv1alpha1.APIResourceSchema{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("today.sheriffs.%s", group),
 		},
@@ -117,22 +155,22 @@ func CreateSheriffsSchemaAndExport(
 		},
 	}
 
-	t.Logf("Creating APIResourceSchema %s|%s", clusterName, schema.Name)
-	_, err := clusterClient.ApisV1alpha1().APIResourceSchemas().Create(logicalcluster.WithCluster(ctx, clusterName), schema, metav1.CreateOptions{})
-	require.NoError(t, err, "error creating APIResourceSchema %s|%s", clusterName, schema.Name)
+	t.Logf("Creating APIResourceSchema %s|%s", path, s.Name)
+	_, err := clusterClient.Cluster(path).ApisV1alpha1().APIResourceSchemas().Create(ctx, s, metav1.CreateOptions{})
+	require.NoError(t, err, "error creating APIResourceSchema %s|%s", path, s.Name)
 
 	export := &apisv1alpha1.APIExport{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: group,
 		},
 		Spec: apisv1alpha1.APIExportSpec{
-			LatestResourceSchemas: []string{schema.Name},
+			LatestResourceSchemas: []string{s.Name},
 		},
 	}
 
-	t.Logf("Creating APIExport %s|%s", clusterName, export.Name)
-	_, err = clusterClient.ApisV1alpha1().APIExports().Create(logicalcluster.WithCluster(ctx, clusterName), export, metav1.CreateOptions{})
-	require.NoError(t, err, "error creating APIExport %s|%s", clusterName, export.Name)
+	t.Logf("Creating APIExport %s|%s", path, export.Name)
+	_, err = clusterClient.Cluster(path).ApisV1alpha1().APIExports().Create(ctx, export, metav1.CreateOptions{})
+	require.NoError(t, err, "error creating APIExport %s|%s", path, export.Name)
 }
 
 // CreateSheriff creates an instance of a Sheriff CustomResource in the logical cluster identified by clusterName, in
@@ -141,10 +179,12 @@ func CreateSheriffsSchemaAndExport(
 func CreateSheriff(
 	ctx context.Context,
 	t *testing.T,
-	dynamicClusterClient *kcpdynamic.ClusterDynamicClient,
-	clusterName logicalcluster.Name,
+	dynamicClusterClient kcpdynamic.ClusterInterface,
+	clusterName logicalcluster.Path,
 	group, name string,
 ) {
+	t.Helper()
+
 	name = strings.ReplaceAll(name, ":", "-")
 
 	t.Logf("Creating %s/v1 sheriffs %s|default/%s", group, clusterName, name)

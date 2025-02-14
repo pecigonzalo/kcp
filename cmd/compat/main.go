@@ -21,7 +21,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 
@@ -51,11 +50,11 @@ Flags:
 	}
 	oldfile, newfile := flag.Args()[0], flag.Args()[1]
 
-	old, err := parse(oldfile)
+	oldFileContent, err := parse(oldfile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	new, err := parse(newfile)
+	newFileContent, err := parse(newfile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -63,16 +62,16 @@ Flags:
 	out, err := schemacompat.EnsureStructuralSchemaCompatibility(
 		field.NewPath(""),
 		// TODO: take flags for desired versions, instead of just assuming the first.
-		old.Spec.Versions[0].Schema.OpenAPIV3Schema,
-		new.Spec.Versions[0].Schema.OpenAPIV3Schema,
+		oldFileContent.Spec.Versions[0].Schema.OpenAPIV3Schema,
+		newFileContent.Spec.Versions[0].Schema.OpenAPIV3Schema,
 		*lcd)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	if *lcd {
-		old.Spec.Versions[0].Schema.OpenAPIV3Schema = out
-		b, err := yaml.Marshal(old)
+		oldFileContent.Spec.Versions[0].Schema.OpenAPIV3Schema = out
+		b, err := yaml.Marshal(oldFileContent)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -83,7 +82,7 @@ Flags:
 }
 
 func parse(fn string) (*apiextensionsv1.CustomResourceDefinition, error) {
-	b, err := ioutil.ReadFile(fn)
+	b, err := os.ReadFile(fn)
 	if err != nil {
 		log.Fatal(err)
 	}

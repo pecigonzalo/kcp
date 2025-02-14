@@ -21,23 +21,25 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpkubernetesinformers "github.com/kcp-dev/client-go/informers"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	aggregateerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
-	kubernetesinformers "k8s.io/client-go/informers"
+	"k8s.io/apiserver/pkg/endpoints/handlers"
 	"k8s.io/klog/v2"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	conditionsv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/apis/conditions/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/util/conditions"
-	"github.com/kcp-dev/kcp/pkg/indexers"
 	"github.com/kcp-dev/kcp/pkg/logging"
+	"github.com/kcp-dev/kcp/pkg/permissionclaim"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	conditionsv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/apis/conditions/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/util/conditions"
 )
 
 // reconcilePermissionClaims determines the resources that need to be labeled for access by a permission claim.
@@ -50,33 +52,38 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 
 	clusterName := logicalcluster.From(apiBinding)
 
-	if apiBinding.Status.BoundAPIExport == nil {
+	if apiBinding.Spec.Reference.Export == nil {
 		return nil
 	}
 
-	exportClusterName := apiBinding.Status.BoundAPIExport.Workspace.Path
-	exportName := apiBinding.Status.BoundAPIExport.Workspace.ExportName
-	apiExport, err := c.getAPIExport(logicalcluster.New(exportClusterName), exportName)
+	exportPath := logicalcluster.NewPath(apiBinding.Spec.Reference.Export.Path)
+	if exportPath.Empty() {
+		exportPath = logicalcluster.From(apiBinding).Path()
+	}
+	apiExport, err := c.getAPIExport(exportPath, apiBinding.Spec.Reference.Export.Name)
 	if err != nil {
-		logger.Error(err, "error getting APIExport", "apiExportWorkspace", exportClusterName, "apiExportName", exportName)
+		logger.Error(err, "error getting APIExport", "apiExportWorkspace", exportPath, "apiExportName", apiBinding.Spec.Reference.Export.Name)
 		return nil // nothing we can do
 	}
 
 	logger = logging.WithObject(logger, apiExport)
 
-	exportedClaims := sets.NewString()
+	exportedClaims := sets.New[string]()
 	for _, claim := range apiExport.Spec.PermissionClaims {
 		exportedClaims.Insert(setKeyForClaim(claim))
 	}
 
-	acceptedClaims := sets.NewString()
+	acceptedClaims := sets.New[string]()
+	acceptedClaimsMap := make(map[string]apisv1alpha1.PermissionClaim)
 	for _, claim := range apiBinding.Spec.PermissionClaims {
 		if claim.State == apisv1alpha1.ClaimAccepted {
-			acceptedClaims.Insert(setKeyForClaim(claim.PermissionClaim))
+			key := setKeyForClaim(claim.PermissionClaim)
+			acceptedClaims.Insert(key)
+			acceptedClaimsMap[key] = claim.PermissionClaim
 		}
 	}
 
-	appliedClaims := sets.NewString()
+	appliedClaims := sets.New[string]()
 	for _, claim := range apiBinding.Status.AppliedPermissionClaims {
 		appliedClaims.Insert(setKeyForClaim(claim))
 	}
@@ -87,7 +94,7 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 	needToRemove := appliedClaims.Difference(acceptedClaims)
 	allChanges := needToApply.Union(needToRemove)
 
-	logger.V(6).Info("claim set details",
+	logger.V(4).Info("claim set details",
 		"expected", expectedClaims,
 		"unexpected", unexpectedClaims,
 		"toApply", needToApply,
@@ -96,10 +103,14 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 	)
 
 	var allErrs []error
-	applyErrors := sets.NewString()
+	applyErrors := sets.New[string]()
 
-	for _, s := range allChanges.List() {
+	for _, s := range sets.List[string](allChanges) {
 		claim := claimFromSetKey(s)
+		if _, nonPersisted := permissionclaim.NonPersistedResourcesClaimable[schema.GroupResource{Group: claim.Group, Resource: claim.Resource}]; nonPersisted {
+			continue
+		}
+
 		claimLogger := logger.WithValues("claim", s)
 
 		informer, gvr, err := c.getInformerForGroupResource(claim.Group, claim.Resource)
@@ -110,9 +121,10 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 			}
 			continue
 		}
+		claimLogger = claimLogger.WithValues("gvr", gvr)
 
 		claimLogger.V(4).Info("listing resources")
-		objs, err := informer.Informer().GetIndexer().ByIndex(indexers.ByLogicalCluster, clusterName.String())
+		objs, err := informer.Lister().ByCluster(clusterName).List(labels.Everything())
 		if err != nil {
 			allErrs = append(allErrs, fmt.Errorf("error listing group=%q, resource=%q: %w", claim.Group, claim.Resource, err))
 			if acceptedClaims.Has(s) {
@@ -132,12 +144,33 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 			}
 
 			logger := logging.WithObject(logger, u)
+
+			if gvr == apisv1alpha1.SchemeGroupVersion.WithResource("apibindings") && logicalcluster.From(u) == clusterName && u.GetName() == apiBinding.Name {
+				// Don't issue a generic patch when obj == the APIBinding being reconciled. That will be covered when
+				// this call to reconcile exits and the controller patches this APIBinding. Otherwise, the generic patch
+				// here will conflict with the controller's attempt to update the APIBinding's status.
+				continue
+			}
+
+			actualGVR := gvr
+			if actualVersion := u.GetAnnotations()[handlers.KCPOriginalAPIVersionAnnotation]; actualVersion != "" {
+				actualGV, err := schema.ParseGroupVersion(actualVersion)
+				if err != nil {
+					logger.Error(err, "error parsing original API version annotation", "annotation", actualVersion)
+					claimErrs = append(claimErrs, fmt.Errorf("error parsing original API version annotation %q: %w", actualVersion, err))
+					continue
+				}
+				actualGVR.Version = actualGV.Version
+				logger.V(4).Info("using actual API version from annotation", "actual", actualVersion)
+			}
+			logger = logger.WithValues("actualGVR", actualGVR)
+
 			logger.V(4).Info("patching to get claim labels updated")
 
 			// Empty patch, allowing the admission plugin to update the resource to the correct labels
-			err = c.patchGenericObject(ctx, u, gvr, clusterName)
+			err = c.patchGenericObject(ctx, u, actualGVR, clusterName.Path())
 			if err != nil {
-				patchErr := fmt.Errorf("error patching %q %s|%s/%s: %w", gvr, clusterName, u.GetNamespace(), u.GetName(), err)
+				patchErr := fmt.Errorf("error patching %q %s|%s/%s: %w", actualGVR, clusterName, u.GetNamespace(), u.GetName(), err)
 				claimErrs = append(claimErrs, patchErr)
 				continue
 			}
@@ -152,8 +185,8 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 		}
 	}
 
-	var unexpectedOrInvalidErrors []error
-	for _, s := range unexpectedClaims.List() {
+	unexpectedOrInvalidErrors := make([]error, 0, unexpectedClaims.Len())
+	for _, s := range sets.List[string](unexpectedClaims) {
 		claim := claimFromSetKey(s)
 		unexpectedOrInvalidErrors = append(unexpectedOrInvalidErrors, fmt.Errorf("unexpected/invalid claim for %s.%s (identity %q)", claim.Resource, claim.Group, claim.IdentityHash))
 	}
@@ -162,7 +195,7 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 		if i > 10 {
 			i = 10
 		}
-		errsToDisplay := aggregateerrors.NewAggregate(unexpectedOrInvalidErrors[0:i])
+		errsToDisplay := utilerrors.NewAggregate(unexpectedOrInvalidErrors[0:i])
 
 		conditions.MarkFalse(
 			apiBinding,
@@ -180,9 +213,10 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 
 	fullyApplied := expectedClaims.Difference(applyErrors)
 	apiBinding.Status.AppliedPermissionClaims = []apisv1alpha1.PermissionClaim{}
-	for _, s := range fullyApplied.UnsortedList() {
-		claim := claimFromSetKey(s)
-		apiBinding.Status.AppliedPermissionClaims = append(apiBinding.Status.AppliedPermissionClaims, claim)
+	for _, s := range sets.List[string](fullyApplied) {
+		// fullyApplied = (exportedClaims ∩ acceptedClaims) ⊖ applyErrors,
+		// hence s must be in acceptedClaims (and exportedClaims).
+		apiBinding.Status.AppliedPermissionClaims = append(apiBinding.Status.AppliedPermissionClaims, acceptedClaimsMap[s])
 	}
 
 	if len(allErrs) > 0 {
@@ -190,7 +224,7 @@ func (c *controller) reconcile(ctx context.Context, apiBinding *apisv1alpha1.API
 		if i > 10 {
 			i = 10
 		}
-		errsToDisplay := aggregateerrors.NewAggregate(allErrs[0:i])
+		errsToDisplay := utilerrors.NewAggregate(allErrs[0:i])
 
 		conditions.MarkFalse(
 			apiBinding,
@@ -230,10 +264,10 @@ func claimFromSetKey(key string) apisv1alpha1.PermissionClaim {
 	}
 }
 
-func (c *controller) getInformerForGroupResource(group, resource string) (kubernetesinformers.GenericInformer, schema.GroupVersionResource, error) {
-	listers, _ := c.ddsif.Listers()
+func (c *controller) getInformerForGroupResource(group, resource string) (kcpkubernetesinformers.GenericClusterInformer, schema.GroupVersionResource, error) {
+	informers, _ := c.ddsif.Informers()
 
-	for gvr := range listers {
+	for gvr := range informers {
 		if gvr.Group == group && gvr.Resource == resource {
 			informer, err := c.ddsif.ForResource(gvr)
 			// once we find one, return.
@@ -243,11 +277,12 @@ func (c *controller) getInformerForGroupResource(group, resource string) (kubern
 	return nil, schema.GroupVersionResource{}, fmt.Errorf("unable to find informer for %s.%s", group, resource)
 }
 
-func (c *controller) patchGenericObject(ctx context.Context, obj metav1.Object, gvr schema.GroupVersionResource, lc logicalcluster.Name) error {
+func (c *controller) patchGenericObject(ctx context.Context, obj metav1.Object, gvr schema.GroupVersionResource, lc logicalcluster.Path) error {
 	_, err := c.dynamicClusterClient.
+		Cluster(lc).
 		Resource(gvr).
 		Namespace(obj.GetNamespace()).
-		Patch(logicalcluster.WithCluster(ctx, lc), obj.GetName(), types.MergePatchType, []byte("{}"), metav1.PatchOptions{})
+		Patch(ctx, obj.GetName(), types.MergePatchType, []byte("{}"), metav1.PatchOptions{})
 	// if we don't find it, and we can update lets continue on.
 	if err != nil && !errors.IsNotFound(err) {
 		return err
