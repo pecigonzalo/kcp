@@ -21,20 +21,18 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clusters"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/authorization"
 	"github.com/kcp-dev/kcp/pkg/authorization/delegated"
-	apisinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/apis/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/indexers"
 	dynamiccontext "github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/context"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	apisv1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/apis/v1alpha1"
 )
 
 type maximalPermissionAuthorizer struct {
@@ -49,24 +47,21 @@ type maximalPermissionAuthorizer struct {
 //
 // If the request is a cluster request the authorizer skips authorization if the request is not for a bound resource.
 // If the request is a wildcard request this check is skipped because no unique API binding can be determined.
-func NewMaximalPermissionAuthorizer(deepSARClient kubernetes.ClusterInterface, apiExportInformer apisinformers.APIExportInformer, apiBindingInformer apisinformers.APIBindingInformer) authorizer.Authorizer {
+func NewMaximalPermissionAuthorizer(deepSARClient kcpkubernetesclientset.ClusterInterface, apiExportInformer apisv1alpha1informers.APIExportClusterInformer) authorizer.Authorizer {
 	apiExportLister := apiExportInformer.Lister()
 	apiExportIndexer := apiExportInformer.Informer().GetIndexer()
 
-	auth := &maximalPermissionAuthorizer{
+	return &maximalPermissionAuthorizer{
 		getAPIExport: func(clusterName, apiExportName string) (*apisv1alpha1.APIExport, error) {
-			return apiExportLister.Get(clusters.ToClusterAwareKey(logicalcluster.New(clusterName), apiExportName))
+			return apiExportLister.Cluster(logicalcluster.Name(clusterName)).Get(apiExportName)
 		},
 		getAPIExportsByIdentity: func(identityHash string) ([]*apisv1alpha1.APIExport, error) {
 			return indexers.ByIndex[*apisv1alpha1.APIExport](apiExportIndexer, indexers.APIExportByIdentity, identityHash)
 		},
 		newDeepSARAuthorizer: func(clusterName logicalcluster.Name) (authorizer.Authorizer, error) {
-			return delegated.NewDelegatedAuthorizer(clusterName, deepSARClient)
+			return delegated.NewDelegatedAuthorizer(clusterName, deepSARClient, delegated.Options{})
 		},
 	}
-
-	return authorization.NewAnonymizer("virtual apiexport maximum permission policy authorizer",
-		authorization.NewAuditLogger("virtual.apiexport.maxpermissionpolicy.authorization.kcp.dev", auth))
 }
 
 func (a *maximalPermissionAuthorizer) Authorize(ctx context.Context, attr authorizer.Attributes) (authorizer.Decision, string, error) {
@@ -94,7 +89,7 @@ func (a *maximalPermissionAuthorizer) Authorize(ctx context.Context, attr author
 			claimingAPIExport.Name, logicalcluster.From(claimingAPIExport)), nil
 	}
 	if claimedIdentityHash == "" {
-		// it's a native k8s resource (secret, configmap, ...), or a system kcp CRD resource (apis.kcp.dev)
+		// it's a native k8s resource (secret, configmap, ...), or a system kcp CRD resource (apis.kcp.io)
 		// For neither case a maximum permission policy can exist.
 		return authorizer.DecisionAllow, fmt.Sprintf("unclaimable resource, identity hash not set in claiming API export: %q, workspace :%q",
 			claimingAPIExport.Name, logicalcluster.From(claimingAPIExport)), nil

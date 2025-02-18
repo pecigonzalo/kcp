@@ -18,67 +18,66 @@ package bootstrap
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
 
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	tenancyinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/tenancy/v1alpha1"
-	tenancylisters "github.com/kcp-dev/kcp/pkg/client/listers/tenancy/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/logging"
+	"github.com/kcp-dev/kcp/pkg/reconciler/committer"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
+	clientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	corev1alpha1client "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/typed/core/v1alpha1"
+	corev1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/core/v1alpha1"
+	corev1alpha1listers "github.com/kcp-dev/kcp/sdk/client/listers/core/v1alpha1"
 )
 
 const (
-	controllerNameBase = "kcp-clusterworkspacetypes-bootstrap"
+	ControllerNameBase = "kcp-workspacetypes-bootstrap"
 )
 
 func NewController(
-	baseConfig *rest.Config,
-	dynamicClusterClient dynamic.Interface,
-	crdClusterClient apiextensionsclient.Interface,
-	kcpClusterClient kcpclient.Interface,
-	workspaceInformer tenancyinformers.ClusterWorkspaceInformer,
-	workspaceType tenancyv1alpha1.ClusterWorkspaceTypeReference,
-	bootstrap func(context.Context, discovery.DiscoveryInterface, dynamic.Interface, kcpclient.Interface, sets.String) error,
-	batteriesIncluded sets.String,
+	dynamicClusterClient kcpdynamic.ClusterInterface,
+	kcpClusterClient kcpclientset.ClusterInterface,
+	logicalClusterInformer corev1alpha1informers.LogicalClusterClusterInformer,
+	workspaceType tenancyv1alpha1.WorkspaceTypeReference,
+	bootstrap func(context.Context, discovery.DiscoveryInterface, dynamic.Interface, clientset.Interface, sets.Set[string]) error,
+	batteriesIncluded sets.Set[string],
 ) (*controller, error) {
-	controllerName := fmt.Sprintf("%s-%s", controllerNameBase, workspaceType)
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), controllerName)
-
+	controllerName := fmt.Sprintf("%s-%s", ControllerNameBase, workspaceType)
 	c := &controller{
-		baseConfig:           baseConfig,
-		controllerName:       controllerName,
-		queue:                queue,
+		controllerName: controllerName,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name: controllerName,
+			},
+		),
 		dynamicClusterClient: dynamicClusterClient,
-		crdClusterClient:     crdClusterClient,
 		kcpClusterClient:     kcpClusterClient,
-		workspaceLister:      workspaceInformer.Lister(),
+		logicalClusterLister: logicalClusterInformer.Lister(),
 		workspaceType:        workspaceType,
 		bootstrap:            bootstrap,
 		batteriesIncluded:    batteriesIncluded,
+
+		commit: committer.NewCommitter[*LogicalCluster, Patcher, *LogicalClusterSpec, *LogicalClusterStatus](kcpClusterClient.CoreV1alpha1().LogicalClusters()),
 	}
 
-	workspaceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = logicalClusterInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj interface{}) { c.enqueue(obj) },
 		UpdateFunc: func(_, obj interface{}) { c.enqueue(obj) },
 	})
@@ -86,41 +85,48 @@ func NewController(
 	return c, nil
 }
 
-// controller watches ClusterWorkspaces of a given type in initializing
+type LogicalCluster = corev1alpha1.LogicalCluster
+type LogicalClusterSpec = corev1alpha1.LogicalClusterSpec
+type LogicalClusterStatus = corev1alpha1.LogicalClusterStatus
+type Patcher = corev1alpha1client.LogicalClusterInterface
+type Resource = committer.Resource[*LogicalClusterSpec, *LogicalClusterStatus]
+type CommitFunc = func(context.Context, *Resource, *Resource) error
+
+// controller watches Workspaces of a given type in initializing
 // state and bootstrap resources from the configs/<lower-case-type> package.
 type controller struct {
 	controllerName string
-	baseConfig     *rest.Config
-	queue          workqueue.RateLimitingInterface
+	queue          workqueue.TypedRateLimitingInterface[string]
 
-	dynamicClusterClient dynamic.Interface
-	crdClusterClient     apiextensionsclient.Interface
-	kcpClusterClient     kcpclient.Interface
+	dynamicClusterClient kcpdynamic.ClusterInterface
+	kcpClusterClient     kcpclientset.ClusterInterface
 
-	workspaceLister tenancylisters.ClusterWorkspaceLister
+	logicalClusterLister corev1alpha1listers.LogicalClusterClusterLister
 
-	workspaceType     tenancyv1alpha1.ClusterWorkspaceTypeReference
-	bootstrap         func(context.Context, discovery.DiscoveryInterface, dynamic.Interface, kcpclient.Interface, sets.String) error
-	batteriesIncluded sets.String
+	workspaceType     tenancyv1alpha1.WorkspaceTypeReference
+	bootstrap         func(context.Context, discovery.DiscoveryInterface, dynamic.Interface, clientset.Interface, sets.Set[string]) error
+	batteriesIncluded sets.Set[string]
+
+	commit CommitFunc
 }
 
 func (c *controller) enqueue(obj interface{}) {
 	key, err := kcpcache.MetaClusterNamespaceKeyFunc(obj)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
 	logger := logging.WithQueueKey(logging.WithReconciler(klog.Background(), c.controllerName), key)
-	logger.V(2).Info("queueing ClusterWorkspace")
+	logger.V(4).Info("queueing LogicalCluster")
 	c.queue.Add(key)
 }
 
 func (c *controller) Start(ctx context.Context, numThreads int) {
-	defer runtime.HandleCrash()
+	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
 	logger := logging.WithReconciler(klog.FromContext(ctx), c.controllerName)
-	logger = logger.WithValues("clusterWorkspaceType", c.workspaceType.String())
+	logger = logger.WithValues("workspacetype", c.workspaceType.String())
 	ctx = klog.NewContext(ctx, logger)
 	logger.Info("Starting controller")
 	defer logger.Info("Shutting down controller")
@@ -143,7 +149,7 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 	if quit {
 		return false
 	}
-	key := k.(string)
+	key := k
 
 	// No matter what, tell the queue we're done with this key, to unblock
 	// other workers.
@@ -151,10 +157,10 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 
 	logger := logging.WithQueueKey(klog.FromContext(ctx), key)
 	ctx = klog.NewContext(ctx, logger)
-	logger.V(1).Info("processing key")
+	logger.V(4).Info("processing key")
 
 	if err := c.process(ctx, key); err != nil {
-		runtime.HandleError(fmt.Errorf("%q controller failed to sync %q, err: %w", c.controllerName, key, err))
+		utilruntime.HandleError(fmt.Errorf("%q controller failed to sync %q, err: %w", c.controllerName, key, err))
 		c.queue.AddRateLimited(key)
 		return true
 	}
@@ -164,15 +170,15 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 
 func (c *controller) process(ctx context.Context, key string) error {
 	logger := klog.FromContext(ctx)
-	clusterName, namespace, name, err := kcpcache.SplitMetaClusterNamespaceKey(key)
+	clusterName, _, name, err := kcpcache.SplitMetaClusterNamespaceKey(key)
 	if err != nil {
 		logger.Error(err, "invalid key")
 		return nil
 	}
 
-	obj, err := c.workspaceLister.Get(key) // TODO: clients need a way to scope down the lister per-cluster
+	obj, err := c.logicalClusterLister.Cluster(clusterName).Get(name)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return nil // object deleted before we handled it
 		}
 		return err
@@ -183,38 +189,20 @@ func (c *controller) process(ctx context.Context, key string) error {
 	logger = logging.WithObject(logger, obj)
 	ctx = klog.NewContext(ctx, logger)
 
+	var errs []error
 	if err := c.reconcile(ctx, obj); err != nil {
-		return err
+		errs = append(errs, err)
 	}
+
+	// Regardless of whether reconcile returned an error or not, always try to patch status if needed. Return the
+	// reconciliation error at the end.
 
 	// If the object being reconciled changed as a result, update it.
-	if !equality.Semantic.DeepEqual(old.Status, obj.Status) {
-		oldData, err := json.Marshal(tenancyv1alpha1.ClusterWorkspace{
-			Status: old.Status,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to Marshal old data for workspace %s|%s/%s: %w", clusterName, namespace, name, err)
-		}
-
-		newData, err := json.Marshal(tenancyv1alpha1.ClusterWorkspace{
-			ObjectMeta: metav1.ObjectMeta{
-				UID:             old.UID,
-				ResourceVersion: old.ResourceVersion,
-			}, // to ensure they appear in the patch as preconditions
-			Status: obj.Status,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to Marshal new data for workspace %s|%s/%s: %w", clusterName, namespace, name, err)
-		}
-
-		patchBytes, err := jsonpatch.CreateMergePatch(oldData, newData)
-		if err != nil {
-			return fmt.Errorf("failed to create patch for workspace %s|%s/%s: %w", clusterName, namespace, name, err)
-		}
-		_, uerr := c.kcpClusterClient.TenancyV1alpha1().ClusterWorkspaces().Patch(logicalcluster.WithCluster(ctx, clusterName), obj.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{}, "status")
-		return uerr
+	oldResource := &Resource{ObjectMeta: old.ObjectMeta, Spec: &old.Spec, Status: &old.Status}
+	newResource := &Resource{ObjectMeta: obj.ObjectMeta, Spec: &obj.Spec, Status: &obj.Status}
+	if err := c.commit(ctx, oldResource, newResource); err != nil {
+		errs = append(errs, err)
 	}
 
-	logger.V(6).Info("processed ClusterWorkspace")
-	return nil
+	return utilerrors.NewAggregate(errs)
 }

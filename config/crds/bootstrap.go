@@ -23,8 +23,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
-
 	crdhelpers "k8s.io/apiextensions-apiserver/pkg/apihelpers"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	extensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
@@ -33,12 +31,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
+
+	"github.com/kcp-dev/kcp/pkg/logging"
 )
 
 //go:embed *.yaml
@@ -69,11 +69,11 @@ func CreateFromFS(ctx context.Context, client apiextensionsv1client.CustomResour
 	}
 	wg.Wait()
 	close(bootstrapErrChan)
-	var bootstrapErrors []error
+	bootstrapErrors := make([]error, 0, len(grs))
 	for err := range bootstrapErrChan {
 		bootstrapErrors = append(bootstrapErrors, err)
 	}
-	if err := kerrors.NewAggregate(bootstrapErrors); err != nil {
+	if err := utilerrors.NewAggregate(bootstrapErrors); err != nil {
 		return fmt.Errorf("could not bootstrap CRDs: %w", err)
 	}
 	return nil
@@ -124,8 +124,9 @@ func CRD(fs embed.FS, gr metav1.GroupResource) (*apiextensionsv1.CustomResourceD
 }
 
 func CreateSingle(ctx context.Context, client apiextensionsv1client.CustomResourceDefinitionInterface, rawCRD *apiextensionsv1.CustomResourceDefinition) error {
+	logger := klog.FromContext(ctx).WithValues("crd", rawCRD.Name)
 	start := time.Now()
-	klog.V(4).Infof("Bootstrapping %v", rawCRD.Name)
+	logger.V(2).Info("bootstrapping CRD")
 
 	updateNeeded := false
 	crd, err := client.Get(ctx, rawCRD.Name, metav1.GetOptions{})
@@ -146,7 +147,7 @@ func CreateSingle(ctx context.Context, client apiextensionsv1client.CustomResour
 					return fmt.Errorf("error creating CRD %s: %w", rawCRD.Name, err)
 				}
 			} else {
-				klog.Infof("Bootstrapped CRD %s|%v after %s", logicalcluster.From(crd), crd.Name, time.Since(start).String())
+				logging.WithObject(logger, crd).WithValues("duration", time.Since(start).String()).Info("bootstrapped CRD")
 			}
 		} else {
 			return fmt.Errorf("error fetching CRD %s: %w", rawCRD.Name, err)
@@ -154,17 +155,20 @@ func CreateSingle(ctx context.Context, client apiextensionsv1client.CustomResour
 	} else {
 		updateNeeded = true
 	}
+	logger = logging.WithObject(logger, crd)
 
 	if updateNeeded {
 		rawCRD.ResourceVersion = crd.ResourceVersion
-		crd, err := client.Update(ctx, rawCRD, metav1.UpdateOptions{})
+		_, err := client.Update(ctx, rawCRD, metav1.UpdateOptions{})
 		if err != nil {
 			return err
 		}
-		klog.Infof("Updated CRD %s|%v after %s", logicalcluster.From(crd), rawCRD.Name, time.Since(start).String())
+		logger.WithValues("duration", time.Since(start).String()).Info("updated CRD")
 	}
 
-	return wait.PollImmediateInfiniteWithContext(ctx, 100*time.Millisecond, func(ctx context.Context) (bool, error) {
+	logger.Info("waiting for CRD to be established")
+	var lastMsg string
+	err = wait.PollUntilContextCancel(ctx, 100*time.Millisecond, true, func(ctx context.Context) (bool, error) {
 		crd, err := client.Get(ctx, rawCRD.Name, metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
@@ -172,9 +176,24 @@ func CreateSingle(ctx context.Context, client apiextensionsv1client.CustomResour
 			}
 			return false, fmt.Errorf("error fetching CRD %s: %w", rawCRD.Name, err)
 		}
-
+		var reason string
+		condition := crdhelpers.FindCRDCondition(crd, apiextensionsv1.Established)
+		if condition == nil {
+			reason = fmt.Sprintf("CRD has no %s condition", apiextensionsv1.Established)
+		} else {
+			reason = fmt.Sprintf("CRD is not established: %s: %s", condition.Reason, condition.Message)
+		}
+		if reason != lastMsg {
+			logger.Info(reason)
+			lastMsg = reason
+		}
 		return crdhelpers.IsCRDConditionTrue(crd, apiextensionsv1.Established), nil
 	})
+	if err != nil {
+		return err
+	}
+	logger.Info("CRD is established")
+	return nil
 }
 
 func retryRetryableErrors(f func() error) error {

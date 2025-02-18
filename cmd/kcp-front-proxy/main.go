@@ -19,18 +19,18 @@ package main
 import (
 	"context"
 	goflags "flag"
-	"math/rand"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"k8s.io/apimachinery/pkg/util/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/component-base/cli"
 	utilflag "k8s.io/component-base/cli/flag"
+	logsapiv1 "k8s.io/component-base/logs/api/v1"
+	_ "k8s.io/component-base/logs/json/register"
 	"k8s.io/component-base/version"
 
 	frontproxyoptions "github.com/kcp-dev/kcp/cmd/kcp-front-proxy/options"
@@ -40,8 +40,6 @@ import (
 
 func main() {
 	ctx := genericapiserver.SetupSignalContext()
-
-	rand.Seed(time.Now().UTC().UnixNano())
 
 	pflag.CommandLine.SetNormalizeFunc(utilflag.WordSepNormalizeFunc)
 	pflag.CommandLine.AddGoFlagSet(goflags.CommandLine)
@@ -61,22 +59,22 @@ forwards Common Name and Organizations to backend API servers in HTTP headers.
 The proxy terminates TLS and communicates with API servers via mTLS. Traffic is
 routed based on paths.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := options.Logs.ValidateAndApply(kcpfeatures.DefaultFeatureGate); err != nil {
+			if err := logsapiv1.ValidateAndApply(options.Logs, kcpfeatures.DefaultFeatureGate); err != nil {
 				return err
 			}
 			if err := options.Complete(); err != nil {
 				return err
 			}
 			if errs := options.Validate(); errs != nil {
-				return errors.NewAggregate(errs)
+				return utilerrors.NewAggregate(errs)
 			}
 
 			if options.Proxy.ProfilerAddress != "" {
-				//nolint:errcheck
+				//nolint:errcheck,gosec
 				go http.ListenAndServe(options.Proxy.ProfilerAddress, nil)
 			}
 
-			config, err := proxy.NewConfig(options.Proxy)
+			config, err := proxy.NewConfig(ctx, options.Proxy)
 			if err != nil {
 				return err
 			}

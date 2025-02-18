@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package Webhook
+package webhook
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"sync"
 	"testing"
@@ -31,7 +32,7 @@ import (
 )
 
 type AdmissionWebhookServer struct {
-	Response     admissionv1.AdmissionResponse
+	ResponseFn   func(review *admissionv1.AdmissionReview) (*admissionv1.AdmissionResponse, error)
 	ObjectGVK    schema.GroupVersionKind
 	Deserializer runtime.Decoder
 
@@ -43,22 +44,24 @@ type AdmissionWebhookServer struct {
 }
 
 func (s *AdmissionWebhookServer) StartTLS(t *testing.T, certFile, keyFile string, port string) {
+	t.Helper()
+
 	s.t = t
 	s.port = port
 
 	serv := &http.Server{Addr: fmt.Sprintf(":%v", port), Handler: s}
 	t.Cleanup(func() {
-		fmt.Printf("Shutting down the HTTP server")
+		t.Log("Shutting down the HTTP server")
 		err := serv.Shutdown(context.TODO())
 		if err != nil {
-			fmt.Printf("unable to shutdown server gracefully err: %v", err)
+			t.Logf("unable to shutdown server gracefully err: %v", err)
 		}
 	})
 
 	go func() {
 		err := serv.ListenAndServeTLS(certFile, keyFile)
-		if err != nil && err != http.ErrServerClosed {
-			fmt.Printf("unable to shutdown server gracefully err: %v", err)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Logf("unable to shutdown server gracefully err: %v", err)
 		}
 	}()
 }
@@ -74,13 +77,15 @@ func (s *AdmissionWebhookServer) ServeHTTP(resp http.ResponseWriter, req *http.R
 		msg := "Expected request body to be non-empty"
 		s.t.Logf("%v", msg)
 		http.Error(resp, msg, http.StatusBadRequest)
+		return
 	}
 
-	data, err := ioutil.ReadAll(req.Body)
+	data, err := io.ReadAll(req.Body)
 	if err != nil {
 		msg := fmt.Sprintf("Request could not be decoded: %v", err)
 		s.t.Logf("%v", msg)
 		http.Error(resp, msg, http.StatusBadRequest)
+		return
 	}
 
 	// verify the content type is accurate
@@ -133,7 +138,13 @@ func (s *AdmissionWebhookServer) ServeHTTP(resp http.ResponseWriter, req *http.R
 	responseAdmissionReview := &admissionv1.AdmissionReview{
 		TypeMeta: requestedAdmissionReview.TypeMeta,
 	}
-	responseAdmissionReview.Response = &s.Response
+	r, err := s.ResponseFn(requestedAdmissionReview)
+	if err != nil {
+		s.t.Logf("%v", err)
+		http.Error(resp, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	responseAdmissionReview.Response = r
 	responseAdmissionReview.Response.UID = requestedAdmissionReview.Request.UID
 
 	respBytes, err := json.Marshal(responseAdmissionReview)

@@ -19,36 +19,36 @@ package indexers
 import (
 	"fmt"
 
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
+	"github.com/kcp-dev/logicalcluster/v3"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 const (
 	// APIExportByIdentity is the indexer name for retrieving APIExports by identity hash.
 	APIExportByIdentity = "APIExportByIdentity"
-	// APIExportBySecret is the indexer name for retrieving APIExports by
+	// APIExportBySecret is the indexer name for retrieving APIExports by secret.
 	APIExportBySecret = "APIExportSecret"
+	// APIExportByClaimedIdentities is the indexer name for retrieving APIExports that have a permission claim for a
+	// particular identity hash.
+	APIExportByClaimedIdentities = "APIExportByClaimedIdentities"
+	// APIExportEndpointSliceByAPIExport is the indexer name for retrieving APIExportEndpointSlices by their APIExport's Reference Path and Name.
+	APIExportEndpointSliceByAPIExport = "APIExportEndpointSliceByAPIExport"
 )
 
 // IndexAPIExportByIdentity is an index function that indexes an APIExport by its identity hash.
 func IndexAPIExportByIdentity(obj interface{}) ([]string, error) {
-	apiExport, ok := obj.(*apisv1alpha1.APIExport)
-	if !ok {
-		return []string{}, fmt.Errorf("obj %T is not an APIExport", obj)
-	}
-
+	apiExport := obj.(*apisv1alpha1.APIExport)
 	return []string{apiExport.Status.IdentityHash}, nil
 }
 
 // IndexAPIExportBySecret is an index function that indexes an APIExport by its identity secret references. Index values
 // are of the form <cluster name>|<secret reference namespace>/<secret reference name> (cache keys).
 func IndexAPIExportBySecret(obj interface{}) ([]string, error) {
-	apiExport, ok := obj.(*apisv1alpha1.APIExport)
-	if !ok {
-		return []string{}, fmt.Errorf("obj %T is not an APIExport", obj)
-	}
+	apiExport := obj.(*apisv1alpha1.APIExport)
 
 	if apiExport.Spec.Identity == nil {
 		return []string{}, nil
@@ -64,4 +64,35 @@ func IndexAPIExportBySecret(obj interface{}) ([]string, error) {
 	}
 
 	return []string{kcpcache.ToClusterAwareKey(logicalcluster.From(apiExport).String(), ref.Namespace, ref.Name)}, nil
+}
+
+// IndexAPIExportByClaimedIdentities is an index function that indexes an APIExport by its permission claims' identity
+// hashes.
+func IndexAPIExportByClaimedIdentities(obj interface{}) ([]string, error) {
+	apiExport := obj.(*apisv1alpha1.APIExport)
+	claimedIdentities := sets.New[string]()
+	for _, claim := range apiExport.Spec.PermissionClaims {
+		claimedIdentities.Insert(claim.IdentityHash)
+	}
+	return sets.List[string](claimedIdentities), nil
+}
+
+// IndexAPIExportEndpointSliceByAPIExportFunc indexes the APIExportEndpointSlice by their APIExport's Reference Path and Name.
+func IndexAPIExportEndpointSliceByAPIExport(obj interface{}) ([]string, error) {
+	apiExportEndpointSlice, ok := obj.(*apisv1alpha1.APIExportEndpointSlice)
+	if !ok {
+		return []string{}, fmt.Errorf("obj %T is not an APIExportEndpointSlice", obj)
+	}
+
+	var result []string
+	pathRemote := logicalcluster.NewPath(apiExportEndpointSlice.Spec.APIExport.Path)
+	if !pathRemote.Empty() {
+		result = append(result, pathRemote.Join(apiExportEndpointSlice.Spec.APIExport.Name).String())
+	}
+	pathLocal := logicalcluster.From(apiExportEndpointSlice).Path()
+	if !pathLocal.Empty() {
+		result = append(result, pathLocal.Join(apiExportEndpointSlice.Spec.APIExport.Name).String())
+	}
+
+	return result, nil
 }
