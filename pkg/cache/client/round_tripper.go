@@ -37,13 +37,13 @@ var (
 	//
 	// Example: shards/name/remainder
 	// Example: /shards/name/remainder
-	// Example: prefix/shards/name/remainder
+	// Example: prefix/shards/name/remainder.
 	shardNameRegex = regexp.MustCompile(`shards/([^/]+)/.+`)
 )
 
 // WithShardNameFromContextRoundTripper wraps an existing config's with ShardRoundTripper.
 //
-// Note: it is the caller responsibility to make a copy of the rest config
+// Note: it is the caller responsibility to make a copy of the rest config.
 func WithShardNameFromContextRoundTripper(cfg *rest.Config) *rest.Config {
 	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
 		return NewShardRoundTripper(rt)
@@ -56,12 +56,12 @@ func WithShardNameFromContextRoundTripper(cfg *rest.Config) *rest.Config {
 // It changes the URL path to target a shard from the context.
 //
 // For example given "amber" shard name in the context it will change
-// apis/apis.kcp.dev/v1alpha1/apiexports to /shards/amber/apis/apis.kcp.dev/v1alpha1/apiexports
+// apis/apis.kcp.io/v1alpha1/apiexports to /shards/amber/apis/apis.kcp.io/v1alpha1/apiexports.
 type ShardRoundTripper struct {
 	delegate http.RoundTripper
 }
 
-// NewShardRoundTripper creates a new shard aware round tripper
+// NewShardRoundTripper creates a new shard aware round tripper.
 func NewShardRoundTripper(delegate http.RoundTripper) *ShardRoundTripper {
 	return &ShardRoundTripper{
 		delegate: delegate,
@@ -72,40 +72,35 @@ func (c *ShardRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	shard := ShardFromContext(req.Context())
 	if !shard.Empty() {
 		req = req.Clone(req.Context())
-		path, err := generatePath(req.URL.Path, shard)
-		if err != nil {
-			return nil, err
-		}
-		req.URL.Path = path
-
-		rawPath, err := generatePath(req.URL.RawPath, shard)
-		if err != nil {
-			return nil, err
-		}
-		req.URL.RawPath = rawPath
+		req.URL.Path = generatePath(req.URL.Path, shard)
+		req.URL.RawPath = generatePath(req.URL.RawPath, shard)
 	}
 	return c.delegate.RoundTrip(req)
 }
 
-// generatePath formats the request path to target the specified shard
-func generatePath(originalPath string, shard clientshard.Name) (string, error) {
+func (c *ShardRoundTripper) WrappedRoundTripper() http.RoundTripper {
+	return c.delegate
+}
+
+// generatePath formats the request path to target the specified shard.
+func generatePath(originalPath string, shard clientshard.Name) string {
 	// if the originalPath already has the shard then the path was already modified and no change needed
 	if strings.HasPrefix(originalPath, shard.Path()) {
-		return originalPath, nil
+		return originalPath
 	}
 	// if the originalPath already has a shard set just overwrite it to the given one
 	if strings.HasPrefix(originalPath, "/shards") {
 		matches := shardNameRegex.FindStringSubmatch(originalPath)
 		if len(matches) >= 2 {
 			// replace /shards/$oldName/reminder with  /shards/$newName/reminder
-			return strings.Replace(originalPath, clientshard.New(matches[1]).Path(), shard.Path(), 1), nil
+			return strings.Replace(originalPath, clientshard.New(matches[1]).Path(), shard.Path(), 1)
 		} else {
 			// the path is either /shards/name/ or /shards/name
 			path := shard.Path()
 			if originalPath[len(originalPath)-1] == '/' {
 				path += "/"
 			}
-			return path, nil
+			return path
 		}
 	}
 
@@ -117,12 +112,12 @@ func generatePath(originalPath string, shard clientshard.Name) (string, error) {
 	}
 	// finally append the original path
 	path += originalPath
-	return path, nil
+	return path
 }
 
 // WithDefaultShardRoundTripper wraps an existing config's with DefaultShardRoundTripper
 //
-// Note: it is the caller responsibility to make a copy of the rest config
+// Note: it is the caller responsibility to make a copy of the rest config.
 func WithDefaultShardRoundTripper(cfg *rest.Config, shard clientshard.Name) *rest.Config {
 	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
 		return NewDefaultShardRoundTripper(rt, shard)
@@ -130,13 +125,13 @@ func WithDefaultShardRoundTripper(cfg *rest.Config, shard clientshard.Name) *res
 	return cfg
 }
 
-// DefaultShardRoundTripper is a http.RoundTripper that sets a default shard name if not specified in the context
+// DefaultShardRoundTripper is a http.RoundTripper that sets a default shard name if not specified in the context.
 type DefaultShardRoundTripper struct {
 	delegate http.RoundTripper
 	shard    clientshard.Name
 }
 
-// NewDefaultShardRoundTripper creates a new round tripper that sets a default shard name
+// NewDefaultShardRoundTripper creates a new round tripper that sets a default shard name.
 func NewDefaultShardRoundTripper(delegate http.RoundTripper, shard clientshard.Name) *DefaultShardRoundTripper {
 	return &DefaultShardRoundTripper{
 		delegate: delegate,
@@ -151,9 +146,13 @@ func (c *DefaultShardRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	return c.delegate.RoundTrip(req)
 }
 
+func (c *DefaultShardRoundTripper) WrappedRoundTripper() http.RoundTripper {
+	return c.delegate
+}
+
 // WithShardNameFromObjectRoundTripper wraps an existing config with ShardNameFromObjectRoundTripper.
 //
-// Note: it is the caller responsibility to make a copy of the rest config
+// Note: it is the caller responsibility to make a copy of the rest config.
 func WithShardNameFromObjectRoundTripper(cfg *rest.Config, requestInfoResolver func(*http.Request) (string, string, error), supportedResources ...string) *rest.Config {
 	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
 		return NewShardNameFromObjectRoundTripper(rt, requestInfoResolver, supportedResources...)
@@ -162,13 +161,13 @@ func WithShardNameFromObjectRoundTripper(cfg *rest.Config, requestInfoResolver f
 	return cfg
 }
 
-// NewShardNameFromObjectRoundTripper creates a new ShardNameFromObjectRoundTripper for the given resources
+// NewShardNameFromObjectRoundTripper creates a new ShardNameFromObjectRoundTripper for the given resources.
 func NewShardNameFromObjectRoundTripper(delegate http.RoundTripper, requestInfoResolver func(*http.Request) (string, string, error), supportedResources ...string) *ShardNameFromObjectRoundTripper {
 	return &ShardNameFromObjectRoundTripper{
 		delegate:            delegate,
 		requestInfoResolver: requestInfoResolver,
-		supportedResources:  sets.NewString(supportedResources...),
-		supportedVerbs:      sets.NewString("create", "update", "patch"),
+		supportedResources:  sets.New[string](supportedResources...),
+		supportedVerbs:      sets.New[string]("create", "update", "patch"),
 	}
 }
 
@@ -178,8 +177,8 @@ func NewShardNameFromObjectRoundTripper(delegate http.RoundTripper, requestInfoR
 type ShardNameFromObjectRoundTripper struct {
 	delegate            http.RoundTripper
 	requestInfoResolver func(*http.Request) (string, string, error) /*res, verb, err*/
-	supportedResources  sets.String
-	supportedVerbs      sets.String
+	supportedResources  sets.Set[string]
+	supportedVerbs      sets.Set[string]
 }
 
 func (c *ShardNameFromObjectRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -221,6 +220,10 @@ func (c *ShardNameFromObjectRoundTripper) RoundTrip(req *http.Request) (*http.Re
 	return c.delegate.RoundTrip(req)
 }
 
+func (c *ShardNameFromObjectRoundTripper) WrappedRoundTripper() http.RoundTripper {
+	return c.delegate
+}
+
 // WithCacheServiceRoundTripper wraps an existing config's with CacheServiceRoundTripper.
 func WithCacheServiceRoundTripper(cfg *rest.Config) *rest.Config {
 	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
@@ -234,7 +237,7 @@ type CacheServiceRoundTripper struct {
 	delegate http.RoundTripper
 }
 
-// NewCacheServiceRoundTripper creates a new CacheServiceRoundTripper
+// NewCacheServiceRoundTripper creates a new CacheServiceRoundTripper.
 func NewCacheServiceRoundTripper(delegate http.RoundTripper) *CacheServiceRoundTripper {
 	return &CacheServiceRoundTripper{
 		delegate: delegate,
@@ -259,4 +262,8 @@ func (c *CacheServiceRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		req.URL = newURL
 	}
 	return c.delegate.RoundTrip(req)
+}
+
+func (c *CacheServiceRoundTripper) WrappedRoundTripper() http.RoundTripper {
+	return c.delegate
 }

@@ -20,25 +20,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	_ "net/http/pprof"
 	"os"
 	"time"
 
-	kcpclienthelper "github.com/kcp-dev/apimachinery/pkg/client"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpapiextensionsclientset "github.com/kcp-dev/client-go/apiextensions/client"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	kcpmetadata "github.com/kcp-dev/client-go/metadata"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	corev1 "k8s.io/api/core/v1"
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionsscheme "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/scheme"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	genericapiserver "k8s.io/apiserver/pkg/server"
+	pluginvalidatingadmissionpolicy "k8s.io/apiserver/pkg/admission/plugin/policy/validating"
+	"k8s.io/apiserver/pkg/cel/openapi/resolver"
 	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/dynamic"
-	kubernetesclient "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/discovery/cached/memory"
+	k8sscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/keyutil"
 	"k8s.io/klog/v2"
@@ -46,50 +50,110 @@ import (
 	"k8s.io/kubernetes/pkg/controller/clusterroleaggregation"
 	"k8s.io/kubernetes/pkg/controller/namespace"
 	serviceaccountcontroller "k8s.io/kubernetes/pkg/controller/serviceaccount"
+	"k8s.io/kubernetes/pkg/controller/validatingadmissionpolicystatus"
+	"k8s.io/kubernetes/pkg/generated/openapi"
 	"k8s.io/kubernetes/pkg/serviceaccount"
 
 	configuniversal "github.com/kcp-dev/kcp/config/universal"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
 	bootstrappolicy "github.com/kcp-dev/kcp/pkg/authorization/bootstrap"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	kcpexternalversions "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
-	"github.com/kcp-dev/kcp/pkg/indexers"
+	kcpfeatures "github.com/kcp-dev/kcp/pkg/features"
 	"github.com/kcp-dev/kcp/pkg/informer"
+	permissionclaimlabler "github.com/kcp-dev/kcp/pkg/permissionclaim"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apibinding"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apibindingdeletion"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apiexport"
-	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apiresource"
+	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apiexportendpointslice"
+	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apiexportendpointsliceurls"
+	"github.com/kcp-dev/kcp/pkg/reconciler/apis/crdcleanup"
+	"github.com/kcp-dev/kcp/pkg/reconciler/apis/extraannotationsync"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/identitycache"
+	"github.com/kcp-dev/kcp/pkg/reconciler/apis/logicalclustercleanup"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/permissionclaimlabel"
+	apisreplicateclusterrole "github.com/kcp-dev/kcp/pkg/reconciler/apis/replicateclusterrole"
+	apisreplicateclusterrolebinding "github.com/kcp-dev/kcp/pkg/reconciler/apis/replicateclusterrolebinding"
+	apisreplicatelogicalcluster "github.com/kcp-dev/kcp/pkg/reconciler/apis/replicatelogicalcluster"
+	"github.com/kcp-dev/kcp/pkg/reconciler/cache/labelclusterrolebindings"
+	"github.com/kcp-dev/kcp/pkg/reconciler/cache/labelclusterroles"
+	"github.com/kcp-dev/kcp/pkg/reconciler/cache/replication"
+	logicalclusterctrl "github.com/kcp-dev/kcp/pkg/reconciler/core/logicalcluster"
+	"github.com/kcp-dev/kcp/pkg/reconciler/core/logicalclusterdeletion"
+	coresreplicateclusterrole "github.com/kcp-dev/kcp/pkg/reconciler/core/replicateclusterrole"
+	corereplicateclusterrolebinding "github.com/kcp-dev/kcp/pkg/reconciler/core/replicateclusterrolebinding"
+	"github.com/kcp-dev/kcp/pkg/reconciler/core/shard"
+	"github.com/kcp-dev/kcp/pkg/reconciler/garbagecollector"
 	"github.com/kcp-dev/kcp/pkg/reconciler/kubequota"
-	schedulinglocationstatus "github.com/kcp-dev/kcp/pkg/reconciler/scheduling/location"
-	schedulingplacement "github.com/kcp-dev/kcp/pkg/reconciler/scheduling/placement"
 	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/bootstrap"
-	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/clusterworkspace"
-	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/clusterworkspacedeletion"
-	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/clusterworkspaceshard"
-	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/clusterworkspacetype"
 	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/initialization"
-	workloadsapiexport "github.com/kcp-dev/kcp/pkg/reconciler/workload/apiexport"
-	workloadsapiexportcreate "github.com/kcp-dev/kcp/pkg/reconciler/workload/apiexportcreate"
-	"github.com/kcp-dev/kcp/pkg/reconciler/workload/defaultplacement"
-	"github.com/kcp-dev/kcp/pkg/reconciler/workload/heartbeat"
-	workloadnamespace "github.com/kcp-dev/kcp/pkg/reconciler/workload/namespace"
-	workloadplacement "github.com/kcp-dev/kcp/pkg/reconciler/workload/placement"
-	workloadresource "github.com/kcp-dev/kcp/pkg/reconciler/workload/resource"
-	synctargetcontroller "github.com/kcp-dev/kcp/pkg/reconciler/workload/synctarget"
-	"github.com/kcp-dev/kcp/pkg/reconciler/workload/synctargetexports"
+	tenancylogicalcluster "github.com/kcp-dev/kcp/pkg/reconciler/tenancy/logicalcluster"
+	tenancyreplicateclusterrole "github.com/kcp-dev/kcp/pkg/reconciler/tenancy/replicateclusterrole"
+	tenancyreplicateclusterrolebinding "github.com/kcp-dev/kcp/pkg/reconciler/tenancy/replicateclusterrolebinding"
+	tenancyreplicatelogicalcluster "github.com/kcp-dev/kcp/pkg/reconciler/tenancy/replicatelogicalcluster"
+	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/workspace"
+	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/workspacemounts"
+	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/workspacetype"
+	"github.com/kcp-dev/kcp/pkg/reconciler/topology/partitionset"
 	initializingworkspacesbuilder "github.com/kcp-dev/kcp/pkg/virtual/initializingworkspaces/builder"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
-func postStartHookName(controllerName string) string {
-	return fmt.Sprintf("kcp-start-%s", controllerName)
+type RunFunc func(ctx context.Context)
+type WaitFunc func(ctx context.Context, s *Server) error
+
+const (
+	waitPollInterval = time.Millisecond * 100
+)
+
+type controllerWrapper struct {
+	Name   string
+	Runner RunFunc
+	Wait   WaitFunc
+}
+
+func (s *Server) startControllers(ctx context.Context) {
+	for _, controller := range s.controllers {
+		go s.runController(ctx, controller)
+	}
+}
+
+func (s *Server) runController(ctx context.Context, controller *controllerWrapper) {
+	log := klog.FromContext(ctx).WithValues("controller", controller.Name)
+	log.Info("waiting for sync")
+
+	// controllers can define their own custom wait functions in case
+	// they need to start early. If they do not define one, we will wait
+	// for everything to sync.
+	var err error
+	if controller.Wait != nil {
+		err = controller.Wait(ctx, s)
+	} else {
+		err = s.WaitForSync(ctx.Done())
+	}
+	if err != nil {
+		log.Error(err, "failed to wait for sync")
+		return
+	}
+
+	log.Info("starting registered controller")
+	controller.Runner(ctx)
+}
+
+func (s *Server) registerController(controller *controllerWrapper) error {
+	if s.controllers[controller.Name] != nil {
+		return fmt.Errorf("controller %s is already registered", controller.Name)
+	}
+
+	s.controllers[controller.Name] = controller
+
+	return nil
 }
 
 func (s *Server) installClusterRoleAggregationController(ctx context.Context, config *rest.Config) error {
 	controllerName := "kube-cluster-role-aggregation-controller"
 	config = rest.AddUserAgent(rest.CopyConfig(config), controllerName)
-	kubeClient, err := kubernetesclient.NewForConfig(config)
+	kubeClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
@@ -97,27 +161,34 @@ func (s *Server) installClusterRoleAggregationController(ctx context.Context, co
 		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles(),
 		kubeClient.RbacV1())
 
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		go c.Run(ctx, 5)
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: controllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Run(ctx, 5)
+		},
 	})
 }
 
 func (s *Server) installKubeNamespaceController(ctx context.Context, config *rest.Config) error {
 	controllerName := "kube-namespace-controller"
 	config = rest.AddUserAgent(rest.CopyConfig(config), controllerName)
-	kubeClient, err := kubernetesclient.NewForConfig(config)
+	kubeClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
-	metadata, err := metadata.NewForConfig(config)
+	metadata, err := kcpmetadata.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
-	discoverResourcesFn := func(clusterName logicalcluster.Name) ([]*metav1.APIResourceList, error) {
+	discoverResourcesFn := func(clusterName logicalcluster.Path) ([]*metav1.APIResourceList, error) {
 		logicalClusterConfig := rest.CopyConfig(config)
-		logicalClusterConfig.Host += clusterName.Path()
+		logicalClusterConfig.Host += clusterName.RequestPath()
 		discoveryClient, err := discovery.NewDiscoveryClientForConfig(logicalClusterConfig)
 		if err != nil {
 			return nil, err
@@ -130,6 +201,7 @@ func (s *Server) installKubeNamespaceController(ctx context.Context, config *res
 	// which informers need to be started. The shared informer factories are started in their
 	// own post-start hook.
 	c := namespace.NewNamespaceController(
+		ctx,
 		kubeClient,
 		metadata,
 		discoverResourcesFn,
@@ -138,22 +210,23 @@ func (s *Server) installKubeNamespaceController(ctx context.Context, config *res
 		corev1.FinalizerKubernetes,
 	)
 
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Run(10, ctx.Done())
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: controllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Core().V1().Namespaces().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Run(ctx, 10)
+		},
 	})
 }
 
 func (s *Server) installKubeServiceAccountController(ctx context.Context, config *rest.Config) error {
 	controllerName := "kube-service-account-controller"
 	config = rest.AddUserAgent(rest.CopyConfig(config), controllerName)
-	kubeClient, err := kubernetesclient.NewForConfig(config)
+	kubeClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
@@ -168,22 +241,24 @@ func (s *Server) installKubeServiceAccountController(ctx context.Context, config
 		return fmt.Errorf("error creating ServiceAccount controller: %w", err)
 	}
 
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Run(ctx, 1)
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: controllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Core().V1().ServiceAccounts().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Core().V1().Namespaces().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Run(ctx, 1)
+		},
 	})
 }
 
 func (s *Server) installKubeServiceAccountTokenController(ctx context.Context, config *rest.Config) error {
 	controllerName := "kube-service-account-token-controller"
 	config = rest.AddUserAgent(rest.CopyConfig(config), controllerName)
-	kubeClient, err := kubernetesclient.NewForConfig(config)
+	kubeClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
@@ -218,30 +293,33 @@ func (s *Server) installKubeServiceAccountTokenController(ctx context.Context, c
 		serviceaccountcontroller.TokensControllerOptions{
 			TokenGenerator: tokenGenerator,
 			RootCA:         rootCA,
-			AutoGenerate:   true,
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("error creating service account controller: %w", err)
 	}
 
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go controller.Run(int(s.Options.Controllers.SAController.ConcurrentSATokenSyncs), ctx.Done())
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: controllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Core().V1().ServiceAccounts().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Core().V1().Secrets().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			controller.Run(
+				ctx,
+				int(s.Options.Controllers.SAController.ConcurrentSATokenSyncs),
+			)
+		},
 	})
 }
 
 func (s *Server) installRootCAConfigMapController(ctx context.Context, config *rest.Config) error {
 	controllerName := "kube-root-ca-configmap-controller"
 	config = rest.AddUserAgent(rest.CopyConfig(config), controllerName)
-	kubeClient, err := kubernetesclient.NewForConfig(config)
+	kubeClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
@@ -267,20 +345,69 @@ func (s *Server) installRootCAConfigMapController(ctx context.Context, config *r
 		return fmt.Errorf("error creating %s controller: %w", controllerName, err)
 	}
 
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
+	return s.registerController(&controllerWrapper{
+		Name: controllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Core().V1().ConfigMaps().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Core().V1().Namespaces().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Run(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installKubeValidatingAdmissionPolicyStatusController(_ context.Context, config *rest.Config) error {
+	controllerName := fmt.Sprintf("kube-%s", validatingadmissionpolicystatus.ControllerName)
+	config = rest.AddUserAgent(rest.CopyConfig(config), controllerName)
+	kubeClient, err := kcpkubernetesclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	schemaResolver := resolver.NewDefinitionsSchemaResolver(openapi.GetOpenAPIDefinitions, k8sscheme.Scheme, apiextensionsscheme.Scheme)
+
+	typeCheckerFn := func(clusterName logicalcluster.Path) (*pluginvalidatingadmissionpolicy.TypeChecker, error) {
+		logicalClusterConfig := rest.CopyConfig(config)
+		logicalClusterConfig.Host += clusterName.RequestPath()
+		kubeClient, err := kcpkubernetesclientset.NewForConfig(config)
+		if err != nil {
+			return nil, err
 		}
 
-		go c.Run(ctx, 2)
-		return nil
+		discoveryClient := memory.NewMemCacheClient(kubeClient.Cluster(clusterName).Discovery())
+
+		return &pluginvalidatingadmissionpolicy.TypeChecker{
+			SchemaResolver: schemaResolver.Combine(&resolver.ClientDiscoveryResolver{Discovery: discoveryClient}),
+			RestMapper:     restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient),
+		}, nil
+	}
+
+	c, err := validatingadmissionpolicystatus.NewController(
+		s.KubeSharedInformerFactory.Admissionregistration().V1().ValidatingAdmissionPolicies(),
+		kubeClient.AdmissionregistrationV1().ValidatingAdmissionPolicies(),
+		typeCheckerFn)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: controllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Admissionregistration().V1().ValidatingAdmissionPolicies().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Run(ctx, 5)
+		},
 	})
 }
 
 func readCA(file string) ([]byte, error) {
-	rootCA, err := ioutil.ReadFile(file)
+	rootCA, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
@@ -291,270 +418,327 @@ func readCA(file string) ([]byte, error) {
 	return rootCA, err
 }
 
-func (s *Server) installWorkspaceDeletionController(ctx context.Context, config *rest.Config) error {
-	controllerName := "kcp-workspace-deletion-controller"
+func (s *Server) installTenancyLogicalClusterController(ctx context.Context, config *rest.Config) error {
 	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
+	config = rest.AddUserAgent(config, tenancylogicalcluster.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
-	metadataClusterClient, err := metadata.NewForConfig(config)
+
+	controller := tenancylogicalcluster.NewController(
+		kubeClusterClient,
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+	)
+
+	return s.registerController(&controllerWrapper{
+		Name: tenancylogicalcluster.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			controller.Start(ctx, 10)
+		},
+	})
+}
+
+func (s *Server) installLogicalClusterDeletionController(ctx context.Context, config *rest.Config, logicalClusterAdminConfig, externalLogicalClusterAdminConfig *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, logicalclusterdeletion.ControllerName)
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
-	discoverResourcesFn := func(clusterName logicalcluster.Name) ([]*metav1.APIResourceList, error) {
+	metadataClusterClient, err := kcpmetadata.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+	discoverResourcesFn := func(clusterName logicalcluster.Path) ([]*metav1.APIResourceList, error) {
 		logicalClusterConfig := rest.CopyConfig(config)
-		logicalClusterConfig.Host += clusterName.Path()
+		logicalClusterConfig.Host += clusterName.RequestPath()
 		discoveryClient, err := discovery.NewDiscoveryClientForConfig(logicalClusterConfig)
 		if err != nil {
 			return nil, err
 		}
 		return discoveryClient.ServerPreferredResources()
 	}
-	kubeClusterClient, err := kubernetesclient.NewClusterForConfig(config)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
-	workspaceDeletionController := clusterworkspacedeletion.NewController(
+
+	logicalClusterDeletionController := logicalclusterdeletion.NewController(
 		kubeClusterClient,
 		kcpClusterClient,
+		logicalClusterAdminConfig,
+		externalLogicalClusterAdminConfig,
 		metadataClusterClient,
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaces(),
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
 		discoverResourcesFn,
-	)
-
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go workspaceDeletionController.Start(ctx, 10)
-		return nil
-	})
-}
-
-func (s *Server) installWorkloadResourceScheduler(ctx context.Context, config *rest.Config, ddsif *informer.DynamicDiscoverySharedInformerFactory) error {
-	controllerName := "kcp-workload-resource-scheduler"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	dynamicClusterClient, err := dynamic.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	resourceScheduler, err := workloadresource.NewController(
-		dynamicClusterClient,
-		s.DynamicDiscoverySharedInformerFactory,
-		s.KcpSharedInformerFactory.Workload().V1alpha1().SyncTargets(),
-		s.KubeSharedInformerFactory.Core().V1().Namespaces(),
-	)
-	if err != nil {
-		return err
-	}
-
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go resourceScheduler.Start(ctx, 2)
-		return nil
-	})
-}
-
-func (s *Server) installWorkspaceScheduler(ctx context.Context, config *rest.Config) error {
-	controllerName := "kcp-workspace-scheduler"
-
-	// TODO(ncdc): this is here because the call to bootstrap.NewController below needs a bootstrap client for kcp,
-	// but it takes in a kcpclient.Interface, not kcpclient.ClusterInterface. The types on Server are all
-	// *.ClusterInterface. We'll be able to unify things once the work to simplify and consolidate our clients is
-	// done.
-	bootstrapConfig := rest.CopyConfig(config)
-	bootstrapConfig = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(bootstrapConfig), controllerName)
-	bootstrapConfig.Impersonate.UserName = kcpBootstrapperUserName
-	bootstrapConfig.Impersonate.Groups = []string{bootstrappolicy.SystemKcpWorkspaceBootstrapper}
-
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	workspaceController, err := clusterworkspace.NewController(
-		kcpClusterClient,
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaces(),
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceShards(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
 	)
+
+	return s.registerController(&controllerWrapper{
+		Name: logicalclusterdeletion.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			logicalClusterDeletionController.Start(ctx, 10)
+		},
+	})
+}
+
+func (s *Server) installWorkspaceScheduler(ctx context.Context, config *rest.Config, logicalClusterAdminConfig, externalLogicalClusterAdminConfig *rest.Config) error {
+	// NOTE: keep `config` unaltered so there isn't cross-use between controllers installed here.
+	workspaceConfig := rest.CopyConfig(config)
+	workspaceConfig = rest.AddUserAgent(workspaceConfig, workspace.ControllerName)
+	kcpClusterClient, err := kcpclientset.NewForConfig(workspaceConfig)
+	if err != nil {
+		return err
+	}
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(workspaceConfig)
 	if err != nil {
 		return err
 	}
 
-	var workspaceShardController *clusterworkspaceshard.Controller
-	if s.Options.Extra.ShardName == tenancyv1alpha1.RootShard {
-		workspaceShardController, err = clusterworkspaceshard.NewController(
+	logicalClusterAdminConfig = rest.CopyConfig(logicalClusterAdminConfig)
+	logicalClusterAdminConfig = rest.AddUserAgent(logicalClusterAdminConfig, workspace.ControllerName+"+"+s.Options.Extra.ShardName)
+
+	externalLogicalClusterAdminConfig = rest.CopyConfig(externalLogicalClusterAdminConfig)
+	externalLogicalClusterAdminConfig = rest.AddUserAgent(externalLogicalClusterAdminConfig, workspace.ControllerName+"+"+s.Options.Extra.ShardName)
+
+	workspaceController, err := workspace.NewController(
+		s.Options.Extra.ShardName,
+		kcpClusterClient,
+		kubeClusterClient,
+		logicalClusterAdminConfig,
+		externalLogicalClusterAdminConfig,
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces(),
+		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
+		s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+	)
+	if err != nil {
+		return err
+	}
+
+	if err := s.registerController(&controllerWrapper{
+		Name: workspace.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			workspaceController.Start(ctx, 2)
+		},
+	}); err != nil {
+		return err
+	}
+
+	clusterShardConfig := rest.CopyConfig(config)
+	clusterShardConfig = rest.AddUserAgent(clusterShardConfig, shard.ControllerName)
+	kcpClusterClient, err = kcpclientset.NewForConfig(clusterShardConfig)
+	if err != nil {
+		return err
+	}
+
+	var workspaceShardController *shard.Controller
+	if s.Options.Extra.ShardName == corev1alpha1.RootShard {
+		workspaceShardController, err = shard.NewController(
 			kcpClusterClient,
-			s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceShards(),
+			s.KcpSharedInformerFactory.Core().V1alpha1().Shards(),
 		)
 		if err != nil {
 			return err
 		}
 	}
+	if workspaceShardController != nil {
+		if err := s.registerController(&controllerWrapper{
+			Name: shard.ControllerName,
+			Wait: func(ctx context.Context, s *Server) error {
+				return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+					return s.KcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().HasSynced(), nil
+				})
+			},
+			Runner: func(ctx context.Context) {
+				workspaceShardController.Start(ctx, 2)
+			},
+		}); err != nil {
+			return err
+		}
+	}
 
-	workspaceTypeController, err := clusterworkspacetype.NewController(
+	workspaceTypeConfig := rest.CopyConfig(config)
+	workspaceTypeConfig = rest.AddUserAgent(workspaceTypeConfig, workspacetype.ControllerName)
+	kcpClusterClient, err = kcpclientset.NewForConfig(workspaceTypeConfig)
+	if err != nil {
+		return err
+	}
+
+	workspaceTypeController, err := workspacetype.NewController(
 		kcpClusterClient,
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceTypes(),
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceShards(),
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
+		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
 	)
 	if err != nil {
 		return err
 	}
 
-	dynamicClusterClient, err := dynamic.NewForConfig(bootstrapConfig)
+	if err := s.registerController(&controllerWrapper{
+		Name: workspacetype.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			workspaceTypeController.Start(ctx, 2)
+		},
+	}); err != nil {
+		return err
+	}
+
+	bootstrapConfig := rest.CopyConfig(config)
+	universalControllerName := fmt.Sprintf("%s-%s", bootstrap.ControllerNameBase, "universal")
+	bootstrapConfig = rest.AddUserAgent(bootstrapConfig, universalControllerName)
+	bootstrapConfig.Impersonate.UserName = KcpBootstrapperUserName
+	bootstrapConfig.Impersonate.Groups = []string{bootstrappolicy.SystemKcpWorkspaceBootstrapper}
+
+	dynamicClusterClient, err := kcpdynamic.NewForConfig(bootstrapConfig)
 	if err != nil {
 		return err
 	}
 
-	crdClusterClient, err := apiextensionsclient.NewForConfig(bootstrapConfig)
-	if err != nil {
-		return err
-	}
-
-	bootstrapKcpClusterClient, err := kcpclient.NewForConfig(bootstrapConfig)
+	bootstrapKcpClusterClient, err := kcpclientset.NewForConfig(bootstrapConfig)
 	if err != nil {
 		return err
 	}
 
 	universalController, err := bootstrap.NewController(
-		bootstrapConfig,
 		dynamicClusterClient,
-		crdClusterClient,
 		bootstrapKcpClusterClient,
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaces(),
-		tenancyv1alpha1.ClusterWorkspaceTypeReference{Path: "root", Name: "universal"},
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+		tenancyv1alpha1.WorkspaceTypeReference{Path: "root", Name: "universal"},
 		configuniversal.Bootstrap,
-		sets.NewString(s.Options.Extra.BatteriesIncluded...),
+		sets.New[string](s.Options.Extra.BatteriesIncluded...),
 	)
 	if err != nil {
 		return err
 	}
 
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go workspaceController.Start(ctx, 2)
-		if workspaceShardController != nil {
-			go workspaceShardController.Start(ctx, 2)
-		}
-		go workspaceTypeController.Start(ctx, 2)
-		go universalController.Start(ctx, 2)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: universalControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			universalController.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) installApiResourceController(ctx context.Context, config *rest.Config) error {
-	controllerName := "kcp-api-resource-controller"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
+func (s *Server) installWorkspaceMountsScheduler(ctx context.Context, config *rest.Config) error {
+	// TODO(mjudeikis): Remove this and move to batteries.
+	if !kcpfeatures.DefaultFeatureGate.Enabled(kcpfeatures.WorkspaceMounts) {
+		return nil
+	}
 
-	crdClusterClient, err := apiextensionsclient.NewForConfig(config)
+	// NOTE: keep `config` unaltered so there isn't cross-use between controllers installed here.
+	workspaceConfig := rest.CopyConfig(config)
+	workspaceConfig = rest.AddUserAgent(workspaceConfig, workspacemounts.ControllerName)
+	kcpClusterClient, err := kcpclientset.NewForConfig(workspaceConfig)
 	if err != nil {
 		return err
 	}
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
+
+	dynamicClusterClient, err := kcpdynamic.NewForConfig(workspaceConfig)
 	if err != nil {
 		return err
 	}
 
-	c, err := apiresource.NewController(
-		crdClusterClient,
+	workspaceMountsController, err := workspacemounts.NewController(
 		kcpClusterClient,
-		s.Options.Controllers.ApiResource.AutoPublishAPIs,
-		s.KcpSharedInformerFactory.Apiresource().V1alpha1().NegotiatedAPIResources(),
-		s.KcpSharedInformerFactory.Apiresource().V1alpha1().APIResourceImports(),
-		s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions(),
+		dynamicClusterClient,
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces(),
+		s.DiscoveringDynamicSharedInformerFactory,
 	)
 	if err != nil {
 		return err
 	}
 
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(ctx, s.Options.Controllers.ApiResource.NumThreads)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: workspacemounts.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				_, notSynced := s.DiscoveringDynamicSharedInformerFactory.Informers()
+				if len(notSynced) > 0 {
+					return false, nil
+				}
+				return s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			workspaceMountsController.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) installSyncTargetHeartbeatController(ctx context.Context, config *rest.Config) error {
-	controllerName := "kcp-synctarget-heartbeat-controller"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
+func (s *Server) installLogicalCluster(ctx context.Context, config *rest.Config) error {
+	logicalClusterConfig := rest.CopyConfig(config)
+	logicalClusterConfig = rest.AddUserAgent(logicalClusterConfig, logicalclusterctrl.ControllerName)
+	kcpClusterClient, err := kcpclientset.NewForConfig(logicalClusterConfig)
 	if err != nil {
 		return err
 	}
 
-	c, err := heartbeat.NewController(
+	logicalClusterController, err := logicalclusterctrl.NewController(
+		s.CompletedConfig.ShardExternalURL,
 		kcpClusterClient,
-		s.KcpSharedInformerFactory.Workload().V1alpha1().SyncTargets(),
-		s.KcpSharedInformerFactory.Apiresource().V1alpha1().APIResourceImports(),
-		s.Options.Controllers.SyncTargetHeartbeat.HeartbeatThreshold,
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
 	)
 	if err != nil {
 		return err
 	}
 
-	return s.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(ctx)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: logicalclusterctrl.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			logicalClusterController.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) installAPIBindingController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer, ddsif *informer.DynamicDiscoverySharedInformerFactory) error {
-	controllerName := "kcp-apibinding-controller"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
+func (s *Server) installAPIBindingController(ctx context.Context, config *rest.Config, ddsif *informer.DiscoveringDynamicSharedInformerFactory) error {
+	// NOTE: keep `config` unaltered so there isn't cross-use between controllers installed here.
+	apiBindingConfig := rest.CopyConfig(config)
+	apiBindingConfig = rest.AddUserAgent(apiBindingConfig, apibinding.ControllerName)
 
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-	dynamicClusterClient, err := dynamic.NewForConfig(config)
+	kcpClusterClient, err := kcpclientset.NewForConfig(apiBindingConfig)
 	if err != nil {
 		return err
 	}
 
-	crdClusterClient, err := apiextensionsclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	metadataClient, err := metadata.NewForConfig(config)
+	crdClusterClient, err := kcpapiextensionsclientset.NewForConfig(apiBindingConfig)
 	if err != nil {
 		return err
 	}
@@ -562,15 +746,50 @@ func (s *Server) installAPIBindingController(ctx context.Context, config *rest.C
 	c, err := apibinding.NewController(
 		crdClusterClient,
 		kcpClusterClient,
-		dynamicClusterClient,
-		ddsif,
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas(),
-		s.TemporaryRootShardKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
-		s.TemporaryRootShardKcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIConversions(),
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIConversions(),
 		s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions(),
 	)
+	if err != nil {
+		return err
+	}
+
+	if err := s.registerController(&controllerWrapper{
+		Name: apibinding.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			// do custom wait logic here because APIExports+APIBindings are special as system CRDs,
+			// and the controllers must run as soon as these two informers are up in order to bootstrap
+			// the rest of the system. Everything else in the kcp clientset is APIBinding based.
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	}); err != nil {
+		return err
+	}
+
+	permissionClaimLabelConfig := rest.CopyConfig(config)
+	permissionClaimLabelConfig = rest.AddUserAgent(permissionClaimLabelConfig, permissionclaimlabel.ControllerName)
+
+	kcpClusterClient, err = kcpclientset.NewForConfig(permissionClaimLabelConfig)
+	if err != nil {
+		return err
+	}
+	dynamicClusterClient, err := kcpdynamic.NewForConfig(permissionClaimLabelConfig)
 	if err != nil {
 		return err
 	}
@@ -581,132 +800,246 @@ func (s *Server) installAPIBindingController(ctx context.Context, config *rest.C
 		ddsif,
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 	)
 	if err != nil {
 		return err
 	}
 
+	if err := s.registerController(&controllerWrapper{
+		Name: permissionclaimlabel.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			permissionClaimLabelController.Start(ctx, 5)
+		},
+	}); err != nil {
+		return err
+	}
+
+	resourceConfig := rest.CopyConfig(config)
+	resourceConfig = rest.AddUserAgent(resourceConfig, permissionclaimlabel.ResourceControllerName)
+
+	kcpClusterClient, err = kcpclientset.NewForConfig(resourceConfig)
+	if err != nil {
+		return err
+	}
+	dynamicClusterClient, err = kcpdynamic.NewForConfig(resourceConfig)
+	if err != nil {
+		return err
+	}
 	permissionClaimLabelResourceController, err := permissionclaimlabel.NewResourceController(
 		kcpClusterClient,
 		dynamicClusterClient,
 		ddsif,
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 	)
 	if err != nil {
 		return err
 	}
 
-	if err := server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		// do custom wait logic here because APIExports+APIBindings are special as system CRDs,
-		// and the controllers must run as soon as these two informers are up in order to bootstrap
-		// the rest of the system. Everything else in the kcp clientset is APIBinding based.
-		if err := wait.PollImmediateInfiniteWithContext(goContext(hookContext), time.Millisecond*100, func(ctx context.Context) (bool, error) {
-			crdsSynced := s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced()
-			exportsSynced := s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced()
-			bindingsSynced := s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced()
-			return crdsSynced && exportsSynced && bindingsSynced, nil
-		}); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-		go permissionClaimLabelController.Start(goContext(hookContext), 5)
-		go permissionClaimLabelResourceController.Start(goContext(hookContext), 2)
-
-		return nil
+	if err := s.registerController(&controllerWrapper{
+		Name: permissionclaimlabel.ResourceControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			permissionClaimLabelResourceController.Start(ctx, 2)
+		},
 	}); err != nil {
 		return err
 	}
 
+	deletionConfig := rest.CopyConfig(config)
+	deletionConfig = rest.AddUserAgent(deletionConfig, apibindingdeletion.ControllerName)
+
+	kcpClusterClient, err = kcpclientset.NewForConfig(deletionConfig)
+	if err != nil {
+		return err
+	}
+	metadataClient, err := kcpmetadata.NewForConfig(deletionConfig)
+	if err != nil {
+		return err
+	}
 	apibindingDeletionController := apibindingdeletion.NewController(
 		metadataClient,
 		kcpClusterClient,
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
 	)
 
-	controllerName = "apibinding-deletion-controller"
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go apibindingDeletionController.Start(goContext(hookContext), 10)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: apibindingdeletion.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			apibindingDeletionController.Start(ctx, 10)
+		},
 	})
 }
 
-func (s *Server) installAPIBinderController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
+func (s *Server) installAPIBinderController(ctx context.Context, config *rest.Config) error {
 	// Client used to create APIBindings within the initializing workspace
 	config = rest.CopyConfig(config)
-	kcpclienthelper.SetMultiClusterRoundTripper(config)
 	config = rest.AddUserAgent(config, initialization.ControllerName)
-	// TODO(ncdc): support standalone vw server when --shard-virtual-workspace-url is set
-	config.Host += initializingworkspacesbuilder.URLFor(tenancyv1alpha1.ClusterWorkspaceAPIBindingsInitializer)
-	initializingWorkspacesKcpClusterClient, err := kcpclient.NewForConfig(config)
+	config.Host += initializingworkspacesbuilder.URLFor(tenancyv1alpha1.WorkspaceAPIBindingsInitializer)
+
+	if !s.Options.Virtual.Enabled && s.Options.Extra.ShardVirtualWorkspaceURL != "" {
+		vwURL := fmt.Sprintf("https://%s", s.GenericConfig.ExternalAddress)
+		if s.Options.Extra.ShardVirtualWorkspaceCAFile == "" {
+			// TODO move verification up
+			return fmt.Errorf("s.Options.Extra.ShardVirtualWorkspaceCAFile is required")
+		}
+		if s.Options.Extra.ShardClientCertFile == "" {
+			// TODO move verification up
+			return fmt.Errorf("s.Options.Extra.ShardClientCertFile is required")
+		}
+		if s.Options.Extra.ShardClientKeyFile == "" {
+			// TODO move verification up
+			return fmt.Errorf("s.Options.Extra.ShardClientKeyFile is required")
+		}
+		config.TLSClientConfig.CAFile = s.Options.Extra.ShardVirtualWorkspaceCAFile
+		config.TLSClientConfig.CertFile = s.Options.Extra.ShardClientCertFile
+		config.TLSClientConfig.KeyFile = s.Options.Extra.ShardClientKeyFile
+		config.Host = fmt.Sprintf("%v%v", vwURL, initializingworkspacesbuilder.URLFor(tenancyv1alpha1.WorkspaceAPIBindingsInitializer))
+	}
+
+	initializingWorkspacesKcpClusterClient, err := kcpclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
-
-	// Wildcard client used for informers
-	informerCfg := rest.CopyConfig(config)
-	kcpclienthelper.SetCluster(informerCfg, logicalcluster.Wildcard)
-	informerClient, err := kcpclient.NewForConfig(informerCfg)
+	informerClient, err := kcpclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
 	// This informer factory is created here because it is specifically against the initializing workspaces virtual
 	// workspace.
-	initializingWorkspacesKcpInformers := kcpexternalversions.NewSharedInformerFactoryWithOptions(
+	initializingWorkspacesKcpInformers := kcpinformers.NewSharedInformerFactoryWithOptions(
 		informerClient,
 		resyncPeriod,
-		kcpexternalversions.WithExtraClusterScopedIndexers(indexers.ClusterScoped()),
-		kcpexternalversions.WithExtraNamespaceScopedIndexers(indexers.NamespaceScoped()),
 	)
 
 	c, err := initialization.NewAPIBinder(
 		initializingWorkspacesKcpClusterClient,
-		initializingWorkspacesKcpInformers.Tenancy().V1alpha1().ClusterWorkspaces(),
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceTypes(),
+		initializingWorkspacesKcpInformers.Core().V1alpha1().LogicalClusters(),
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
+		s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 	)
 	if err != nil {
 		return err
 	}
 
-	return server.AddPostStartHook(postStartHookName(initialization.ControllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(initialization.ControllerName))
+	return s.registerController(&controllerWrapper{
+		Name: initialization.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			initializingWorkspacesKcpInformers.Start(ctx.Done())
+			initializingWorkspacesKcpInformers.WaitForCacheSync(ctx.Done())
 
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		initializingWorkspacesKcpInformers.Start(hookContext.StopCh)
-		initializingWorkspacesKcpInformers.WaitForCacheSync(hookContext.StopCh)
-
-		go c.Start(goContext(hookContext), 2)
-		return nil
+			c.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) installAPIExportController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-apiexport-controller"
+func (s *Server) installCRDCleanupController(ctx context.Context, config *rest.Config) error {
 	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
+	config = rest.AddUserAgent(config, crdcleanup.ControllerName)
 
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
+	crdClusterClient, err := kcpapiextensionsclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
-	kubeClusterClient, err := kubernetesclient.NewForConfig(config)
+	c, err := crdcleanup.NewController(
+		s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions(),
+		crdClusterClient,
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: crdcleanup.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installLogicalClusterCleanupController(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, logicalclustercleanup.ControllerName)
+
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c, err := logicalclustercleanup.NewController(
+		kcpClusterClient,
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+		s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: logicalclustercleanup.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced() &&
+					s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installAPIExportController(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, apiexport.ControllerName)
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
@@ -714,7 +1047,7 @@ func (s *Server) installAPIExportController(ctx context.Context, config *rest.Co
 	c, err := apiexport.NewController(
 		kcpClusterClient,
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceShards(),
+		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
 		kubeClusterClient,
 		s.KubeSharedInformerFactory.Core().V1().Namespaces(),
 		s.KubeSharedInformerFactory.Core().V1().Secrets(),
@@ -723,327 +1056,400 @@ func (s *Server) installAPIExportController(ctx context.Context, config *rest.Co
 		return err
 	}
 
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		// do custom wait logic here because APIExports+APIBindings are special as system CRDs,
-		// and the controllers must run as soon as these two informers are up in order to bootstrap
-		// the rest of the system. Everything else in the kcp clientset is APIBinding based.
-		if err := wait.PollImmediateInfiniteWithContext(goContext(hookContext), time.Millisecond*100, func(ctx context.Context) (bool, error) {
-			crdsSynced := s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced()
-			exportsSynced := s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced()
-			bindingsSynced := s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced()
-			return crdsSynced && exportsSynced && bindingsSynced, nil
-		}); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: apiexport.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			// do custom wait logic here because APIExports+APIBindings are special as system CRDs,
+			// and the controllers must run as soon as these two informers are up in order to bootstrap
+			// the rest of the system. Everything else in the kcp clientset is APIBinding based.
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Core().V1().Namespaces().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Core().V1().Secrets().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) installSchedulingLocationStatusController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-scheduling-location-status-controller"
+func (s *Server) installApisReplicateClusterRoleControllers(ctx context.Context, config *rest.Config) error {
 	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
+	config = rest.AddUserAgent(config, apisreplicateclusterrole.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
-	c, err := schedulinglocationstatus.NewController(
-		kcpClusterClient,
-		s.KcpSharedInformerFactory.Scheduling().V1alpha1().Locations(),
-		s.KcpSharedInformerFactory.Workload().V1alpha1().SyncTargets(),
-	)
-	if err != nil {
-		return err
-	}
-
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
-	})
-}
-
-func (s *Server) installDefaultPlacementController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-workload-default-placement"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	c, err := defaultplacement.NewController(
-		kcpClusterClient,
-		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
-		s.KcpSharedInformerFactory.Scheduling().V1alpha1().Placements(),
-	)
-	if err != nil {
-		return err
-	}
-
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
-	})
-}
-
-func (s *Server) installWorkloadNamespaceScheduler(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-workload-namespace-scheduler"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kubeClusterClient, err := kubernetesclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	c, err := workloadnamespace.NewController(
+	c := apisreplicateclusterrole.NewController(
 		kubeClusterClient,
-		s.KubeSharedInformerFactory.Core().V1().Namespaces(),
-		s.KcpSharedInformerFactory.Scheduling().V1alpha1().Placements(),
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles(),
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
 	)
-	if err != nil {
-		return err
-	}
 
-	if err := server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *Server) installWorkloadPlacementScheduler(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-workload-placement-scheduler"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	c, err := workloadplacement.NewController(
-		kcpClusterClient,
-		s.KcpSharedInformerFactory.Scheduling().V1alpha1().Locations(),
-		s.KcpSharedInformerFactory.Workload().V1alpha1().SyncTargets(),
-		s.KcpSharedInformerFactory.Scheduling().V1alpha1().Placements(),
-	)
-	if err != nil {
-		return err
-	}
-
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: apisreplicateclusterrole.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) installSchedulingPlacementController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-scheduling-placement-controller"
+func (s *Server) installCoreReplicateClusterRoleControllers(ctx context.Context, config *rest.Config) error {
 	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
+	config = rest.AddUserAgent(config, coresreplicateclusterrole.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
-	c, err := schedulingplacement.NewController(
-		kcpClusterClient,
-		s.KubeSharedInformerFactory.Core().V1().Namespaces(),
-		s.KcpSharedInformerFactory.Scheduling().V1alpha1().Locations(),
-		s.KcpSharedInformerFactory.Scheduling().V1alpha1().Placements(),
+	c := coresreplicateclusterrole.NewController(
+		kubeClusterClient,
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles(),
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
 	)
-	if err != nil {
-		return err
-	}
 
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: coresreplicateclusterrole.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) installWorkloadsAPIExportController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-workloads-apiexport-controller"
+func (s *Server) installApisReplicateClusterRoleBindingControllers(ctx context.Context, config *rest.Config) error {
 	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
+	config = rest.AddUserAgent(config, apisreplicateclusterrolebinding.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
-	c, err := workloadsapiexport.NewController(
+	c := apisreplicateclusterrolebinding.NewController(
+		kubeClusterClient,
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles(),
+	)
+
+	return s.registerController(&controllerWrapper{
+		Name: apisreplicateclusterrolebinding.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installApisReplicateLogicalClusterControllers(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, apisreplicatelogicalcluster.ControllerName)
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c := apisreplicatelogicalcluster.NewController(
 		kcpClusterClient,
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
-		s.KcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas(),
-		s.KcpSharedInformerFactory.Apiresource().V1alpha1().NegotiatedAPIResources(),
+	)
+
+	return s.registerController(&controllerWrapper{
+		Name: apisreplicatelogicalcluster.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installTenancyReplicateLogicalClusterControllers(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, tenancyreplicatelogicalcluster.ControllerName)
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c := tenancyreplicatelogicalcluster.NewController(
+		kcpClusterClient,
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
+	)
+
+	return s.registerController(&controllerWrapper{
+		Name: tenancyreplicatelogicalcluster.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installCoreReplicateClusterRoleBindingControllers(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, corereplicateclusterrolebinding.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c := corereplicateclusterrolebinding.NewController(
+		kubeClusterClient,
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles(),
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+	)
+
+	return s.registerController(&controllerWrapper{
+		Name: corereplicateclusterrolebinding.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installTenancyReplicateClusterRoleControllers(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, tenancyreplicateclusterrole.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c := tenancyreplicateclusterrole.NewController(
+		kubeClusterClient,
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles(),
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+	)
+
+	return s.registerController(&controllerWrapper{
+		Name: tenancyreplicateclusterrole.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installTenancyReplicateClusterRoleBindingControllers(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, tenancyreplicateclusterrolebinding.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c := tenancyreplicateclusterrolebinding.NewController(
+		kubeClusterClient,
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles(),
+	)
+
+	return s.registerController(&controllerWrapper{
+		Name: tenancyreplicateclusterrolebinding.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KubeSharedInformerFactory.Rbac().V1().ClusterRoles().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installAPIExportEndpointSliceController(_ context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, apiexportendpointslice.ControllerName)
+
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c, err := apiexportendpointslice.NewController(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		// Shards and APIExports get retrieved from cache server
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.KcpSharedInformerFactory.Topology().V1alpha1().Partitions(),
+		kcpClusterClient,
 	)
 	if err != nil {
 		return err
 	}
 
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: apiexportendpointslice.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Topology().V1alpha1().Partitions().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) installWorkloadsAPIExportCreateController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-workloads-apiexport-create-controller"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
+func (s *Server) installAPIExportEndpointSliceURLsController(_ context.Context, _ *rest.Config) error {
+	config := rest.CopyConfig(s.ExternalLogicalClusterAdminConfig)
+	config = rest.AddUserAgent(config, apiexportendpointsliceurls.ControllerName)
+
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
-	c, err := workloadsapiexportcreate.NewController(
+	c, err := apiexportendpointsliceurls.NewController(
+		s.Options.Extra.ShardName,
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+		// Shards and APIExports get retrieved from cache server
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 		kcpClusterClient,
-		s.KcpSharedInformerFactory.Workload().V1alpha1().SyncTargets(),
+	)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: apiexportendpointsliceurls.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installPartitionSetController(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, partitionset.ControllerName)
+
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c, err := partitionset.NewController(
+		s.KcpSharedInformerFactory.Topology().V1alpha1().PartitionSets(),
+		s.KcpSharedInformerFactory.Topology().V1alpha1().Partitions(),
+		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
+		kcpClusterClient,
+	)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: partitionset.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Topology().V1alpha1().PartitionSets().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Topology().V1alpha1().Partitions().Informer().HasSynced() &&
+					s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installExtraAnnotationSyncController(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, extraannotationsync.ControllerName)
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	c, err := extraannotationsync.NewController(kcpClusterClient,
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
 		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
-		s.KcpSharedInformerFactory.Scheduling().V1alpha1().Locations(),
 	)
 	if err != nil {
 		return err
 	}
 
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
-	})
-}
-
-func (s *Server) installWorkloadsSyncTargetExportController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-workloads-synctarget-exports-controller"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	c, err := synctargetexports.NewController(
-		kcpClusterClient,
-		s.KcpSharedInformerFactory.Workload().V1alpha1().SyncTargets(),
-		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
-		s.KcpSharedInformerFactory.Apis().V1alpha1().APIResourceSchemas(),
-		s.KcpSharedInformerFactory.Apiresource().V1alpha1().APIResourceImports(),
-	)
-	if err != nil {
-		return err
-	}
-
-	return server.AddPostStartHook(controllerName, func(hookContext genericapiserver.PostStartHookContext) error {
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			klog.Errorf("failed to finish post-start-hook %s: %v", controllerName, err)
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
-	})
-}
-
-func (s *Server) installSyncTargetController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	controllerName := "kcp-synctarget-controller"
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), controllerName)
-	kcpClusterClient, err := kcpclient.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	c := synctargetcontroller.NewController(
-		kcpClusterClient,
-		s.KcpSharedInformerFactory.Workload().V1alpha1().SyncTargets(),
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceShards(),
-	)
-	if err != nil {
-		return err
-	}
-
-	return server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: extraannotationsync.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() &&
+					s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
 	})
 }
 
 func (s *Server) installKubeQuotaController(
 	ctx context.Context,
 	config *rest.Config,
-	server *genericapiserver.GenericAPIServer,
 ) error {
-	controllerName := "kcp-kube-quota-controller"
 	config = rest.CopyConfig(config)
-	// TODO(ncdc): figure out if we need kcpclienthelper.SetMultiClusterRoundTripper(config)
-	config = rest.AddUserAgent(config, controllerName)
-	kubeClusterClient, err := kubernetesclient.NewClusterForConfig(config)
+	// TODO(ncdc): figure out if we need config
+	config = rest.AddUserAgent(config, kubequota.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return err
 	}
@@ -1056,11 +1462,10 @@ func (s *Server) installKubeQuotaController(
 	)
 
 	c, err := kubequota.NewController(
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaces(),
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
 		kubeClusterClient,
 		s.KubeSharedInformerFactory,
-		s.DynamicDiscoverySharedInformerFactory,
-		s.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions(),
+		s.DiscoveringDynamicSharedInformerFactory,
 		quotaResyncPeriod,
 		replenishmentPeriod,
 		workersPerLogicalCluster,
@@ -1070,57 +1475,126 @@ func (s *Server) installKubeQuotaController(
 		return err
 	}
 
-	if err := server.AddPostStartHook(postStartHookName(controllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(controllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 2)
-
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	if err := server.AddPreShutdownHook(controllerName, func() error {
-		close(s.quotaAdmissionStopCh)
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *Server) installApiExportIdentityController(ctx context.Context, config *rest.Config, server *genericapiserver.GenericAPIServer) error {
-	if s.Options.Extra.ShardName == tenancyv1alpha1.RootShard {
-		return nil
-	}
-	config = rest.CopyConfig(config)
-	config = rest.AddUserAgent(kcpclienthelper.SetMultiClusterRoundTripper(config), identitycache.ControllerName)
-	kubeClusterClient, err := kubernetesclient.NewClusterForConfig(config)
-	if err != nil {
-		return err
-	}
-	c, err := identitycache.NewApiExportIdentityProviderController(kubeClusterClient, s.TemporaryRootShardKcpSharedInformerFactory.Apis().V1alpha1().APIExports(), s.KubeSharedInformerFactory.Core().V1().ConfigMaps())
-	if err != nil {
-		return err
-	}
-	return server.AddPostStartHook(postStartHookName(identitycache.ControllerName), func(hookContext genericapiserver.PostStartHookContext) error {
-		logger := klog.FromContext(ctx).WithValues("postStartHook", postStartHookName(identitycache.ControllerName))
-		if err := s.waitForSync(hookContext.StopCh); err != nil {
-			logger.Error(err, "failed to finish post-start-hook")
-			return nil // don't klog.Fatal. This only happens when context is cancelled.
-		}
-
-		go c.Start(goContext(hookContext), 1)
-		return nil
+	return s.registerController(&controllerWrapper{
+		Name: kubequota.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				_, notSynced := s.DiscoveringDynamicSharedInformerFactory.Informers()
+				if len(notSynced) > 0 {
+					return false, nil
+				}
+				return s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced() &&
+					s.KubeSharedInformerFactory.Core().V1().ResourceQuotas().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
 	})
 }
 
-func (s *Server) waitForSync(stop <-chan struct{}) error {
+func (s *Server) installApiExportIdentityController(ctx context.Context, config *rest.Config) error {
+	if s.Options.Extra.ShardName == corev1alpha1.RootShard {
+		return nil
+	}
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, identitycache.ControllerName)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+	c, err := identitycache.NewApiExportIdentityProviderController(kubeClusterClient, s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(), s.KubeSharedInformerFactory.Core().V1().ConfigMaps())
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: identitycache.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				return s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports().Informer().HasSynced() && s.KubeSharedInformerFactory.Core().V1().ConfigMaps().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 1)
+		},
+	})
+}
+
+func (s *Server) installReplicationController(ctx context.Context, config *rest.Config, gvrs map[schema.GroupVersionResource]replication.ReplicatedGVR) error {
+	// TODO(sttts): set user agent
+	controller, err := replication.NewController(s.Options.Extra.ShardName, s.CacheDynamicClient, gvrs)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: replication.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				for _, gvr := range controller.Gvrs {
+					if !gvr.Local.HasSynced() || !gvr.Global.HasSynced() {
+						return false, nil
+					}
+				}
+				return true, nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			controller.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) installGarbageCollectorController(ctx context.Context, config *rest.Config) error {
+	config = rest.CopyConfig(config)
+	config = rest.AddUserAgent(config, garbagecollector.ControllerName)
+
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	metadataClient, err := kcpmetadata.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	// TODO: make it configurable
+	const (
+		workersPerLogicalCluster = 1
+	)
+
+	c, err := garbagecollector.NewController(
+		s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters(),
+		kubeClusterClient,
+		metadataClient,
+		s.DiscoveringDynamicSharedInformerFactory,
+		workersPerLogicalCluster,
+		s.syncedCh,
+	)
+	if err != nil {
+		return err
+	}
+
+	return s.registerController(&controllerWrapper{
+		Name: garbagecollector.ControllerName,
+		Wait: func(ctx context.Context, s *Server) error {
+			return wait.PollUntilContextCancel(ctx, waitPollInterval, true, func(ctx context.Context) (bool, error) {
+				_, notSynced := s.DiscoveringDynamicSharedInformerFactory.Informers()
+				if len(notSynced) > 0 {
+					return false, nil
+				}
+				return s.KcpSharedInformerFactory.Core().V1alpha1().LogicalClusters().Informer().HasSynced(), nil
+			})
+		},
+		Runner: func(ctx context.Context) {
+			c.Start(ctx, 2)
+		},
+	})
+}
+
+func (s *Server) WaitForSync(stop <-chan struct{}) error {
 	// Wait for shared informer factories to by synced.
 	// factory. Otherwise, informer list calls may go into backoff (before the CRDs are ready) and
 	// take ~10 seconds to succeed.
@@ -1130,4 +1604,61 @@ func (s *Server) waitForSync(stop <-chan struct{}) error {
 	case <-s.syncedCh:
 		return nil
 	}
+}
+
+// addIndexerstoInformers is separated out from controllers as the re-election calls for controller re-initialization,
+// it would panics in indexer addition to informers as they are already started at bootup.
+func (s *Server) addIndexersToInformers(_ context.Context) map[schema.GroupVersionResource]replication.ReplicatedGVR {
+	permissionclaimlabel.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	permissionclaimlabler.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports())
+	apibinding.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+	)
+	apiexport.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports())
+	apiexportendpointslice.InstallIndexers(
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+	)
+	apiexportendpointsliceurls.InstallIndexers(
+		s.CacheKcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExportEndpointSlices(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	labelclusterrolebindings.InstallIndexers(
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+	)
+	labelclusterroles.InstallIndexers(
+		s.KubeSharedInformerFactory.Rbac().V1().ClusterRoleBindings(),
+	)
+	workspace.InstallIndexers(
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces(),
+		s.CacheKcpSharedInformerFactory.Core().V1alpha1().Shards(),
+		s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
+	)
+	workspacemounts.InstallIndexers(
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces(),
+	)
+	extraannotationsync.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIExports(),
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	initialization.InstallIndexers(
+		s.KcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes(),
+		s.CacheKcpSharedInformerFactory.Tenancy().V1alpha1().WorkspaceTypes())
+	crdcleanup.InstallIndexers(
+		s.KcpSharedInformerFactory.Apis().V1alpha1().APIBindings(),
+	)
+	return replication.InstallIndexers(
+		s.KcpSharedInformerFactory,
+		s.CacheKcpSharedInformerFactory,
+		s.KubeSharedInformerFactory,
+		s.CacheKubeSharedInformerFactory,
+	)
 }

@@ -21,13 +21,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpapiextensionsclientset "github.com/kcp-dev/client-go/apiextensions/client"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	configcrds "github.com/kcp-dev/kcp/config/crds"
 	cacheclient "github.com/kcp-dev/kcp/pkg/cache/client"
@@ -36,24 +36,41 @@ import (
 
 // SystemCRDLogicalCluster holds a logical cluster name under which we store system-related CRDs.
 // We use the same name as the KCP for symmetry.
-var SystemCRDLogicalCluster = logicalcluster.New("system:system-crds")
+var SystemCRDLogicalCluster = logicalcluster.Name("system:system-crds")
 
-// SystemCacheServerShard holds a default shard name
+// SystemCacheServerShard holds a default shard name.
 const SystemCacheServerShard = "system:cache:server"
 
-func Bootstrap(ctx context.Context, apiExtensionsClusterClient apiextensionsclient.ClusterInterface) error {
-	crds := []*apiextensionsv1.CustomResourceDefinition{}
-	for _, resource := range []string{"apiresourceschemas", "apiexports"} {
+func Bootstrap(ctx context.Context, apiExtensionsClusterClient kcpapiextensionsclientset.ClusterInterface) error {
+	var crds []*apiextensionsv1.CustomResourceDefinition //nolint:prealloc
+
+	for _, gr := range []struct{ group, resource string }{
+		{"apis.kcp.io", "apiresourceschemas"},
+		{"apis.kcp.io", "apiconversions"},
+		{"apis.kcp.io", "apiexports"},
+		{"apis.kcp.io", "apiexportendpointslices"},
+		{"core.kcp.io", "logicalclusters"},
+		{"core.kcp.io", "shards"},
+		{"tenancy.kcp.io", "workspacetypes"},
+		{"rbac.authorization.k8s.io", "roles"},
+		{"rbac.authorization.k8s.io", "clusterroles"},
+		{"rbac.authorization.k8s.io", "rolebindings"},
+		{"rbac.authorization.k8s.io", "clusterrolebindings"},
+		{"admissionregistration.k8s.io", "mutatingwebhookconfigurations"},
+		{"admissionregistration.k8s.io", "validatingwebhookconfigurations"},
+		{"admissionregistration.k8s.io", "validatingadmissionpolicies"},
+		{"admissionregistration.k8s.io", "validatingadmissionpolicybindings"},
+	} {
 		crd := &apiextensionsv1.CustomResourceDefinition{}
-		if err := configcrds.Unmarshal(fmt.Sprintf("apis.kcp.dev_%s.yaml", resource), crd); err != nil {
-			panic(fmt.Errorf("failed to unmarshal %v resource: %w", resource, err))
+		if err := configcrds.Unmarshal(fmt.Sprintf("%s_%s.yaml", gr.group, gr.resource), crd); err != nil {
+			panic(fmt.Errorf("failed to unmarshal %v resource: %w", gr, err))
 		}
 		for i := range crd.Spec.Versions {
 			v := &crd.Spec.Versions[i]
 			v.Schema = &apiextensionsv1.CustomResourceValidation{
 				OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
 					Type:                   "object",
-					XPreserveUnknownFields: pointer.BoolPtr(true),
+					XPreserveUnknownFields: ptr.To(true),
 				},
 			} // wipe the schema, we don't need validation
 			v.Subresources = nil // wipe subresources so that updates don't have to be made against the status endpoint
@@ -63,9 +80,9 @@ func Bootstrap(ctx context.Context, apiExtensionsClusterClient apiextensionsclie
 
 	logger := klog.FromContext(ctx)
 	ctx = cacheclient.WithShardInContext(ctx, SystemCacheServerShard)
-	return wait.PollInfiniteWithContext(ctx, time.Second, func(ctx context.Context) (bool, error) {
+	return wait.PollUntilContextCancel(ctx, time.Second, false, func(ctx context.Context) (bool, error) {
 		for _, crd := range crds {
-			err := configcrds.CreateSingle(ctx, apiExtensionsClusterClient.Cluster(SystemCRDLogicalCluster).ApiextensionsV1().CustomResourceDefinitions(), crd)
+			err := configcrds.CreateSingle(ctx, apiExtensionsClusterClient.Cluster(SystemCRDLogicalCluster.Path()).ApiextensionsV1().CustomResourceDefinitions(), crd)
 			if err != nil {
 				logging.WithObject(logger, crd).Error(err, "failed to create CustomResourceDefinition")
 				return false, nil

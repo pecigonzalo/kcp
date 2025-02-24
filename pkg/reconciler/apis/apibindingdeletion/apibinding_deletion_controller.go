@@ -18,51 +18,49 @@ package apibindingdeletion
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
+	kcpmetadata "github.com/kcp-dev/client-go/metadata"
+	"github.com/kcp-dev/logicalcluster/v3"
 
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	conditionsv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/apis/conditions/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/util/conditions"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	apisinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/apis/v1alpha1"
-	apislisters "github.com/kcp-dev/kcp/pkg/client/listers/apis/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/logging"
-	"github.com/kcp-dev/kcp/pkg/reconciler/tenancy/clusterworkspacedeletion/deletion"
+	"github.com/kcp-dev/kcp/pkg/reconciler/committer"
+	"github.com/kcp-dev/kcp/pkg/reconciler/core/logicalclusterdeletion/deletion"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	conditionsv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/apis/conditions/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/util/conditions"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	apisv1alpha1client "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/typed/apis/v1alpha1"
+	apisv1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/apis/v1alpha1"
 )
 
 const (
-	controllerName = "kcp-apibindingdeletion"
+	ControllerName = "kcp-apibindingdeletion"
 
-	APIBindingFinalizer = "apis.kcp.dev/apibinding-finalizer"
+	APIBindingFinalizer = "apis.kcp.io/apibinding-finalizer"
 
 	DeletionRecheckEstimateSeconds = 5
 
 	// ResourceDeletionFailedReason is the reason for condition BindingResourceDeleteSuccess that deletion of
-	// some CRs is failed
+	// some CRs is failed.
 	ResourceDeletionFailedReason = "ResourceDeletionFailed"
 
 	// ResourceRemainingReason is the reason for condition BindingResourceDeleteSuccess that some CR resource still
-	// exists when apibinding is deleting
+	// exists when apibinding is deleting.
 	ResourceRemainingReason = "SomeResourcesRemain"
 
 	// ResourceFinalizersRemainReason is the reason for condition BindingResourceDeleteSuccess that finalizers on some
@@ -71,20 +69,32 @@ const (
 )
 
 func NewController(
-	metadataClient metadata.Interface,
-	kcpClusterClient kcpclient.Interface,
-	apiBindingInformer apisinformers.APIBindingInformer,
+	metadataClient kcpmetadata.ClusterInterface,
+	kcpClusterClient kcpclientset.ClusterInterface,
+	apiBindingInformer apisv1alpha1informers.APIBindingClusterInformer,
 ) *Controller {
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), controllerName)
-
 	c := &Controller{
-		queue:             queue,
-		metadataClient:    metadataClient,
-		kcpClusterClient:  kcpClusterClient,
-		apiBindingsLister: apiBindingInformer.Lister(),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name: ControllerName,
+			},
+		),
+		listResources: func(ctx context.Context, cluster logicalcluster.Path, gvr schema.GroupVersionResource) (*metav1.PartialObjectMetadataList, error) {
+			return metadataClient.Cluster(cluster).Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+		},
+		deleteResources: func(ctx context.Context, cluster logicalcluster.Path, gvr schema.GroupVersionResource, namespace string) error {
+			background := metav1.DeletePropagationBackground
+			opts := metav1.DeleteOptions{PropagationPolicy: &background}
+			return metadataClient.Cluster(cluster).Resource(gvr).Namespace(namespace).DeleteCollection(ctx, opts, metav1.ListOptions{})
+		},
+		getAPIBinding: func(cluster logicalcluster.Name, name string) (*apisv1alpha1.APIBinding, error) {
+			return apiBindingInformer.Lister().Cluster(cluster).Get(name)
+		},
+		commit: committer.NewCommitter[*APIBinding, Patcher, *APIBindingSpec, *APIBindingStatus](kcpClusterClient.ApisV1alpha1().APIBindings()),
 	}
 
-	apiBindingInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+	_, _ = apiBindingInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
 		FilterFunc: func(obj interface{}) bool {
 			switch obj := obj.(type) {
 			case *apisv1alpha1.APIBinding:
@@ -102,31 +112,39 @@ func NewController(
 	return c
 }
 
+type APIBinding = apisv1alpha1.APIBinding
+type APIBindingSpec = apisv1alpha1.APIBindingSpec
+type APIBindingStatus = apisv1alpha1.APIBindingStatus
+type Patcher = apisv1alpha1client.APIBindingInterface
+type Resource = committer.Resource[*APIBindingSpec, *APIBindingStatus]
+type CommitFunc = func(context.Context, *Resource, *Resource) error
+
 type Controller struct {
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
-	metadataClient   metadata.Interface
-	kcpClusterClient kcpclient.Interface
+	listResources   func(ctx context.Context, cluster logicalcluster.Path, gvr schema.GroupVersionResource) (*metav1.PartialObjectMetadataList, error)
+	deleteResources func(ctx context.Context, cluster logicalcluster.Path, gvr schema.GroupVersionResource, namespace string) error
 
-	apiBindingsLister apislisters.APIBindingLister
+	getAPIBinding func(cluster logicalcluster.Name, name string) (*apisv1alpha1.APIBinding, error)
+	commit        CommitFunc
 }
 
 func (c *Controller) enqueue(obj interface{}) {
-	key, err := kcpcache.MetaClusterNamespaceKeyFunc(obj)
+	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
-	logger := logging.WithQueueKey(logging.WithReconciler(klog.Background(), controllerName), key)
-	logger.V(2).Info("queueing APIBinding")
+	logger := logging.WithQueueKey(logging.WithReconciler(klog.Background(), ControllerName), key)
+	logger.V(4).Info("queueing APIBinding")
 	c.queue.Add(key)
 }
 
 func (c *Controller) Start(ctx context.Context, numThreads int) {
-	defer runtime.HandleCrash()
+	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	logger := logging.WithReconciler(klog.FromContext(ctx), controllerName)
+	logger := logging.WithReconciler(klog.FromContext(ctx), ControllerName)
 	ctx = klog.NewContext(ctx, logger)
 	logger.Info("Starting controller")
 	defer logger.Info("Shutting down controller")
@@ -149,11 +167,11 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	if quit {
 		return false
 	}
-	key := k.(string)
+	key := k
 
 	logger := logging.WithQueueKey(klog.FromContext(ctx), key)
 	ctx = klog.NewContext(ctx, logger)
-	logger.V(1).Info("processing key")
+	logger.V(4).Info("processing key")
 
 	// No matter what, tell the queue we're done with this key, to unblock
 	// other workers.
@@ -171,12 +189,12 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	if errors.As(err, &estimate) {
 		t := estimate.Estimate/2 + 1
 		duration := time.Duration(t) * time.Second
-		logger.V(2).Info("custom resources remaining for APIBinding, waiting", "duration", duration)
+		logger.V(3).Info("custom resources remaining for APIBinding, waiting", "duration", duration)
 		c.queue.AddAfter(key, duration)
 	} else {
 		// rather than wait for a full resync, re-add the workspace to the queue to be processed
 		c.queue.AddRateLimited(key)
-		runtime.HandleError(fmt.Errorf("deletion of apibinding %v failed: %w", key, err))
+		utilruntime.HandleError(fmt.Errorf("deletion of apibinding %v failed: %w", key, err))
 	}
 
 	return true
@@ -185,18 +203,24 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 func (c *Controller) process(ctx context.Context, key string) error {
 	logger := klog.FromContext(ctx)
 	startTime := time.Now()
+	cluster, _, name, err := kcpcache.SplitMetaClusterNamespaceKey(key)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return nil
+	}
+	clusterName := logicalcluster.Name(cluster.String()) // TODO: remove when SplitMetaClusterNamespaceKey is updated
 
 	defer func() {
 		logger.V(4).Info("finished syncing", "duration", time.Since(startTime))
 	}()
 
-	apibinding, deleteErr := c.apiBindingsLister.Get(key)
+	apibinding, deleteErr := c.getAPIBinding(clusterName, name)
 	if apierrors.IsNotFound(deleteErr) {
 		logger.V(3).Info("APIBinding has been deleted")
 		return nil
 	}
 	if deleteErr != nil {
-		runtime.HandleError(fmt.Errorf("unable to retrieve apibinding %v from store: %w", key, deleteErr))
+		utilruntime.HandleError(fmt.Errorf("unable to retrieve apibinding %v from store: %w", key, deleteErr))
 		return deleteErr
 	}
 	logger = logging.WithObject(logger, apibinding)
@@ -206,6 +230,7 @@ func (c *Controller) process(ctx context.Context, key string) error {
 		return nil
 	}
 
+	oldResource := &Resource{ObjectMeta: apibinding.ObjectMeta, Spec: &apibinding.Spec, Status: &apibinding.Status}
 	apibindingCopy := apibinding.DeepCopy()
 	resourceRemaining, deleteErr := c.deleteAllCRs(ctx, apibindingCopy)
 	if deleteErr != nil {
@@ -214,10 +239,12 @@ func (c *Controller) process(ctx context.Context, key string) error {
 			apisv1alpha1.BindingResourceDeleteSuccess,
 			ResourceDeletionFailedReason,
 			conditionsv1alpha1.ConditionSeverityError,
-			deleteErr.Error(),
+			"%v",
+			deleteErr,
 		)
 
-		if err := c.patchCondition(ctx, apibinding, apibindingCopy); err != nil {
+		newResource := &Resource{ObjectMeta: apibindingCopy.ObjectMeta, Spec: &apibindingCopy.Spec, Status: &apibindingCopy.Status}
+		if err := c.commit(ctx, oldResource, newResource); err != nil {
 			return err
 		}
 
@@ -226,14 +253,29 @@ func (c *Controller) process(ctx context.Context, key string) error {
 
 	apibindingCopy, remainingErr := c.mutateResourceRemainingStatus(resourceRemaining, apibindingCopy)
 	if remainingErr != nil {
-		if err := c.patchCondition(ctx, apibinding, apibindingCopy); err != nil {
+		newResource := &Resource{ObjectMeta: apibindingCopy.ObjectMeta, Spec: &apibindingCopy.Spec, Status: &apibindingCopy.Status}
+		if err := c.commit(ctx, oldResource, newResource); err != nil {
 			return err
 		}
 
 		return remainingErr
 	}
 
-	return c.finalizeAPIBinding(ctx, apibindingCopy)
+	apibindingCopy = apibinding.DeepCopy()
+	filtered := make([]string, 0, len(apibindingCopy.Finalizers))
+	for i := range apibindingCopy.Finalizers {
+		if apibindingCopy.Finalizers[i] == APIBindingFinalizer {
+			continue
+		}
+		filtered = append(filtered, apibindingCopy.Finalizers[i])
+	}
+	if len(apibindingCopy.Finalizers) == len(filtered) {
+		return nil
+	}
+	apibindingCopy.Finalizers = filtered
+	logger.V(2).Info("finalizing APIBinding")
+	newResource := &Resource{ObjectMeta: apibindingCopy.ObjectMeta, Spec: &apibindingCopy.Spec, Status: &apibindingCopy.Status}
+	return c.commit(ctx, oldResource, newResource)
 }
 
 func (c *Controller) mutateResourceRemainingStatus(resourceRemaining gvrDeletionMetadataTotal, apibinding *apisv1alpha1.APIBinding) (*apisv1alpha1.APIBinding, error) {
@@ -253,7 +295,8 @@ func (c *Controller) mutateResourceRemainingStatus(resourceRemaining gvrDeletion
 			apisv1alpha1.BindingResourceDeleteSuccess,
 			ResourceFinalizersRemainReason,
 			conditionsv1alpha1.ConditionSeverityError,
-			fmt.Sprintf("Some content in the workspace has finalizers remaining: %s", strings.Join(remainingByFinalizer, ", ")),
+			"Some content in the workspace has finalizers remaining: %s",
+			strings.Join(remainingByFinalizer, ", "),
 		)
 
 		return apibinding, &deletion.ResourcesRemainingError{
@@ -279,7 +322,8 @@ func (c *Controller) mutateResourceRemainingStatus(resourceRemaining gvrDeletion
 			apisv1alpha1.BindingResourceDeleteSuccess,
 			ResourceRemainingReason,
 			conditionsv1alpha1.ConditionSeverityError,
-			fmt.Sprintf("Some resources are remaining: %s", strings.Join(remainingResources, ", ")),
+			"Some resources are remaining: %s",
+			strings.Join(remainingResources, ", "),
 		)
 
 		return apibinding, &deletion.ResourcesRemainingError{
@@ -291,63 +335,4 @@ func (c *Controller) mutateResourceRemainingStatus(resourceRemaining gvrDeletion
 	conditions.MarkTrue(apibinding, apisv1alpha1.BindingResourceDeleteSuccess)
 
 	return apibinding, nil
-}
-
-func (c *Controller) patchCondition(ctx context.Context, old, new *apisv1alpha1.APIBinding) error {
-	logger := klog.FromContext(ctx)
-	if equality.Semantic.DeepEqual(old.Status.Conditions, new.Status.Conditions) {
-		return nil
-	}
-
-	oldData, err := json.Marshal(apisv1alpha1.APIBinding{
-		Status: apisv1alpha1.APIBindingStatus{
-			Conditions: old.Status.Conditions,
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to Marshal old data for apibinding %s: %w", old.Name, err)
-	}
-
-	newData, err := json.Marshal(apisv1alpha1.APIBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			UID:             old.UID,
-			ResourceVersion: old.ResourceVersion,
-		}, // to ensure they appear in the patch as preconditions
-		Status: apisv1alpha1.APIBindingStatus{
-			Conditions: new.Status.Conditions,
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("failed to Marshal new data for apibinding %s: %w", new.Name, err)
-	}
-
-	patchBytes, err := jsonpatch.CreateMergePatch(oldData, newData)
-	if err != nil {
-		return fmt.Errorf("failed to create patch for apibinding %s: %w", new.Name, err)
-	}
-
-	logger.V(2).Info("patching APIBinding", "patch", string(patchBytes))
-	_, err = c.kcpClusterClient.ApisV1alpha1().APIBindings().Patch(logicalcluster.WithCluster(ctx, logicalcluster.From(new)), new.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{}, "status")
-	return err
-}
-
-// finalizeAPIBinding removes the specified finalizer and finalizes the apibinding
-func (c *Controller) finalizeAPIBinding(ctx context.Context, apibinding *apisv1alpha1.APIBinding) error {
-	logger := klog.FromContext(ctx)
-	filtered := make([]string, 0, len(apibinding.Finalizers))
-	for i := range apibinding.Finalizers {
-		if apibinding.Finalizers[i] == APIBindingFinalizer {
-			continue
-		}
-		filtered = append(filtered, APIBindingFinalizer)
-	}
-	if len(apibinding.Finalizers) == len(filtered) {
-		return nil
-	}
-	apibinding.Finalizers = filtered
-
-	logger.V(2).Info("finalizing APIBinding")
-	_, err := c.kcpClusterClient.ApisV1alpha1().APIBindings().Update(logicalcluster.WithCluster(ctx, logicalcluster.From(apibinding)), apibinding, metav1.UpdateOptions{})
-
-	return err
 }

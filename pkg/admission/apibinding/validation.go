@@ -21,7 +21,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 // ValidateAPIBinding validates an APIBinding.
@@ -51,20 +51,14 @@ func ValidateAPIBindingUpdate(oldBinding, newBinding *apisv1alpha1.APIBinding) f
 	return allErrs
 }
 
-// ValidateAPIBindingReference validates an APIBinding's ExportReference.
-func ValidateAPIBindingReference(reference apisv1alpha1.ExportReference, path *field.Path) field.ErrorList {
+// ValidateAPIBindingReference validates an APIBinding's BindingReference.
+func ValidateAPIBindingReference(reference apisv1alpha1.BindingReference, path *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 
-	// For now, workspace is required via OpenAPI. But just in case...
-	if workspace := reference.Workspace; workspace != nil {
-		// These are required by OpenAPI, but just in case...
-		if workspace.Path == "" {
-			allErrs = append(allErrs, field.Required(path.Child("workspace").Child("path"), ""))
-		}
-
-		if workspace.ExportName == "" {
-			allErrs = append(allErrs, field.Required(path.Child("workspace").Child("exportName"), ""))
-		}
+	if reference.Export == nil {
+		allErrs = append(allErrs, field.Required(path.Child("export"), ""))
+	} else if reference.Export.Name == "" {
+		allErrs = append(allErrs, field.Required(path.Child("export").Child("name"), ""))
 	}
 
 	return allErrs

@@ -19,30 +19,29 @@ package options
 import (
 	cryptorand "crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/spf13/pflag"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/keyutil"
 	"k8s.io/klog/v2"
 	kcmoptions "k8s.io/kubernetes/cmd/kube-controller-manager/app/options"
-
-	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apiresource"
-	"github.com/kcp-dev/kcp/pkg/reconciler/workload/heartbeat"
 )
 
 type Controllers struct {
 	EnableAll           bool
 	IndividuallyEnabled []string
-	ApiResource         ApiResourceController
-	SyncTargetHeartbeat SyncTargetHeartbeatController
-	SAController        kcmoptions.SAControllerOptions
-}
 
-type ApiResourceController = apiresource.Options
-type SyncTargetHeartbeatController = heartbeat.Options
+	EnableLeaderElection    bool
+	LeaderElectionNamespace string
+	LeaderElectionName      string
+
+	SAController kcmoptions.SAControllerOptions
+}
 
 var kcmDefaults *kcmoptions.KubeControllerManagerOptions
 
@@ -51,7 +50,7 @@ func init() {
 
 	kcmDefaults, err = kcmoptions.NewKubeControllerManagerOptions()
 	if err != nil {
-		klog.Fatal(err)
+		panic(err)
 	}
 }
 
@@ -59,9 +58,11 @@ func NewControllers() *Controllers {
 	return &Controllers{
 		EnableAll: true,
 
-		ApiResource:         *apiresource.DefaultOptions(),
-		SyncTargetHeartbeat: *heartbeat.DefaultOptions(),
-		SAController:        *kcmDefaults.SAController,
+		EnableLeaderElection:    false,
+		LeaderElectionNamespace: metav1.NamespaceSystem,
+		LeaderElectionName:      "kcp-controllers",
+
+		SAController: *kcmDefaults.SAController,
 	}
 }
 
@@ -71,14 +72,18 @@ func (c *Controllers) AddFlags(fs *pflag.FlagSet) {
 	fs.StringSliceVar(&c.IndividuallyEnabled, "unsupported-run-individual-controllers", c.IndividuallyEnabled, "Run individual controllers in-process. The controller names can change at any time.")
 	fs.MarkHidden("unsupported-run-individual-controllers") //nolint:errcheck
 
-	apiresource.BindOptions(&c.ApiResource, fs)
-	heartbeat.BindOptions(&c.SyncTargetHeartbeat, fs)
+	fs.BoolVar(&c.EnableLeaderElection, "enable-leader-election", c.EnableLeaderElection, "Enable a leader election for kcp controllers running in the system:admin workspace")
+	fs.StringVar(&c.LeaderElectionNamespace, "leader-election-namespace", c.LeaderElectionNamespace, "Namespace in system:admin workspace to use for leader election")
+	fs.StringVar(&c.LeaderElectionName, "leader-election-name", c.LeaderElectionName, "Name of the lease to use for leader election")
 
 	c.SAController.AddFlags(fs)
 }
 
 func (c *Controllers) Complete(rootDir string) error {
 	if c.SAController.ServiceAccountKeyFile == "" {
+		if rootDir == "" {
+			return errors.New("no serviceaccount key file loaded and no root directory set")
+		}
 		// use sa.key and auto-generate if not existing
 		c.SAController.ServiceAccountKeyFile = filepath.Join(rootDir, "sa.key")
 		if _, err := os.Stat(c.SAController.ServiceAccountKeyFile); os.IsNotExist(err) {
@@ -106,12 +111,6 @@ func (c *Controllers) Complete(rootDir string) error {
 func (c *Controllers) Validate() []error {
 	var errs []error
 
-	if err := c.ApiResource.Validate(); err != nil {
-		errs = append(errs, err)
-	}
-	if err := c.SyncTargetHeartbeat.Validate(); err != nil {
-		errs = append(errs, err)
-	}
 	if saErrs := c.SAController.Validate(); saErrs != nil {
 		errs = append(errs, saErrs...)
 	}

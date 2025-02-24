@@ -28,8 +28,10 @@ import (
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	genericapiserveroptions "k8s.io/apiserver/pkg/server/options"
 	"k8s.io/component-base/logs"
+	logsapiv1 "k8s.io/component-base/logs/api/v1"
 
-	virtualworkspacesoptions "github.com/kcp-dev/kcp/pkg/virtual/options"
+	cacheoptions "github.com/kcp-dev/kcp/pkg/cache/client/options"
+	corevwoptions "github.com/kcp-dev/kcp/pkg/virtual/options"
 )
 
 // DefaultRootPathPrefix is basically constant forever, or we risk a breaking change. The
@@ -40,35 +42,40 @@ const DefaultRootPathPrefix string = "/services"
 type Options struct {
 	Output io.Writer
 
-	KubeconfigFile string
-	Context        string
-	RootPathPrefix string
+	KubeconfigFile   string
+	Context          string
+	RootPathPrefix   string
+	ShardExternalURL string
 
+	Cache          cacheoptions.Cache
 	SecureServing  genericapiserveroptions.SecureServingOptions
 	Authentication genericapiserveroptions.DelegatingAuthenticationOptions
-	Authorization  virtualworkspacesoptions.Authorization
+	Authorization  corevwoptions.Authorization
 	Audit          genericapiserveroptions.AuditOptions
 
-	Logs logs.Options
+	Logs *logs.Options
 
-	VirtualWorkspaces virtualworkspacesoptions.Options
-	ProfilerAddress   string
+	CoreVirtualWorkspaces corevwoptions.Options
+
+	ProfilerAddress string
 }
 
 func NewOptions() *Options {
 	opts := &Options{
 		Output: nil,
 
-		RootPathPrefix: DefaultRootPathPrefix,
+		RootPathPrefix:   DefaultRootPathPrefix,
+		ShardExternalURL: "",
 
+		Cache:          *cacheoptions.NewCache(),
 		SecureServing:  *genericapiserveroptions.NewSecureServingOptions(),
 		Authentication: *genericapiserveroptions.NewDelegatingAuthenticationOptions(),
-		Authorization:  *virtualworkspacesoptions.NewAuthorization(),
+		Authorization:  *corevwoptions.NewAuthorization(),
 		Audit:          *genericapiserveroptions.NewAuditOptions(),
-		Logs:           *logs.NewOptions(),
+		Logs:           logs.NewOptions(),
 
-		VirtualWorkspaces: *virtualworkspacesoptions.NewOptions(),
-		ProfilerAddress:   "",
+		CoreVirtualWorkspaces: *corevwoptions.NewOptions(),
+		ProfilerAddress:       "",
 	}
 
 	opts.SecureServing.ServerCert.CertKey.CertFile = filepath.Join(".", ".kcp", "apiserver.crt")
@@ -79,10 +86,14 @@ func NewOptions() *Options {
 }
 
 func (o *Options) AddFlags(flags *pflag.FlagSet) {
+	o.Cache.AddFlags(flags)
 	o.SecureServing.AddFlags(flags)
 	o.Authentication.AddFlags(flags)
-	o.Logs.AddFlags(flags)
-	o.VirtualWorkspaces.AddFlags(flags)
+	o.Audit.AddFlags(flags)
+	logsapiv1.AddFlags(o.Logs, flags)
+	o.CoreVirtualWorkspaces.AddFlags(flags)
+
+	flags.StringVar(&o.ShardExternalURL, "shard-external-url", o.ShardExternalURL, "URL used by outside clients to talk to the kcp shard this virtual workspace is related to")
 
 	flags.StringVar(&o.KubeconfigFile, "kubeconfig", o.KubeconfigFile,
 		"The kubeconfig file of the KCP instance that hosts workspaces.")
@@ -94,14 +105,20 @@ func (o *Options) AddFlags(flags *pflag.FlagSet) {
 
 func (o *Options) Validate() error {
 	errs := []error{}
+	errs = append(errs, o.Cache.Validate()...)
 	errs = append(errs, o.SecureServing.Validate()...)
 	errs = append(errs, o.Authentication.Validate()...)
-	errs = append(errs, o.VirtualWorkspaces.Validate()...)
+	errs = append(errs, o.CoreVirtualWorkspaces.Validate()...)
+
+	if len(o.ShardExternalURL) == 0 {
+		errs = append(errs, fmt.Errorf(("--shard-external-url is required")))
+	}
 
 	if len(o.KubeconfigFile) == 0 {
 		errs = append(errs, fmt.Errorf("--kubeconfig is required for this command"))
 	}
 	if !strings.HasPrefix(o.RootPathPrefix, "/") {
+		//nolint:revive
 		errs = append(errs, fmt.Errorf("RootPathPrefix %q must start with /", o.RootPathPrefix))
 	}
 

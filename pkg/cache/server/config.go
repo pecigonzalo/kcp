@@ -20,27 +20,23 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
+	"strings"
 	"time"
 
-	kcpclienthelper "github.com/kcp-dev/apimachinery/pkg/client"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpapiextensionsclientset "github.com/kcp-dev/client-go/apiextensions/client"
+	kcpapiextensionsinformers "github.com/kcp-dev/client-go/apiextensions/informers"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	apiextensionsexternalversions "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/conversion"
 	apiextensionsoptions "k8s.io/apiextensions-apiserver/pkg/cmd/server/options"
+	"k8s.io/apiextensions-apiserver/pkg/generated/openapi"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apiserver/pkg/features"
+	apiopenapi "k8s.io/apiserver/pkg/endpoints/openapi"
 	genericapiserver "k8s.io/apiserver/pkg/server"
-	genericoptions "k8s.io/apiserver/pkg/server/options"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/genericcontrolplane/clientutils"
 
 	cacheclient "github.com/kcp-dev/kcp/pkg/cache/client"
 	"github.com/kcp-dev/kcp/pkg/cache/client/shard"
@@ -68,9 +64,8 @@ type completedConfig struct {
 }
 
 type ExtraConfig struct {
-	ApiExtensionsClusterClient apiextensionsclient.ClusterInterface
-
-	ApiExtensionsSharedInformerFactory apiextensionsexternalversions.SharedInformerFactory
+	ApiExtensionsClusterClient         kcpapiextensionsclientset.ClusterInterface
+	ApiExtensionsSharedInformerFactory kcpapiextensionsinformers.SharedInformerFactory
 }
 
 type CompletedConfig struct {
@@ -112,12 +107,8 @@ func NewConfig(opts *cacheserveroptions.CompletedOptions, optionalLocalShardRest
 	opts.Etcd.StorageConfig.Prefix = "/cache"
 
 	serverConfig := genericapiserver.NewRecommendedConfig(apiextensionsapiserver.Codecs)
+	serverConfig.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(openapi.GetOpenAPIDefinitions, apiopenapi.NewDefinitionNamer(apiextensionsapiserver.Scheme))
 
-	// disable SSA since the cache server should not change objects in any way
-	// note, that this will break when (if) the feature is locked, until then we should be fine
-	if err := utilfeature.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=false", features.ServerSideApply)); err != nil {
-		return nil, err
-	}
 	if err := opts.ServerRunOptions.ApplyTo(&serverConfig.Config); err != nil {
 		return nil, err
 	}
@@ -146,30 +137,26 @@ func NewConfig(opts *cacheserveroptions.CompletedOptions, optionalLocalShardRest
 	}
 
 	serverConfig.Config.BuildHandlerChainFunc = func(apiHandler http.Handler, genericConfig *genericapiserver.Config) (secure http.Handler) {
-		apiHandler = genericapiserver.DefaultBuildHandlerChainFromAuthz(apiHandler, genericConfig)
-		apiHandler = genericapiserver.DefaultBuildHandlerChainBeforeAuthz(apiHandler, genericConfig)
+		apiHandler = genericapiserver.DefaultBuildHandlerChainFromAuthzToCompletion(apiHandler, genericConfig)
+		apiHandler = genericapiserver.DefaultBuildHandlerChainFromImpersonationToAuthz(apiHandler, genericConfig)
+		apiHandler = genericapiserver.DefaultBuildHandlerChainFromStartToBeforeImpersonation(apiHandler, genericConfig)
+
 		apiHandler = filters.WithAuditEventClusterAnnotation(apiHandler)
 		apiHandler = filters.WithClusterScope(apiHandler)
 		apiHandler = WithShardScope(apiHandler)
 		apiHandler = WithServiceScope(apiHandler)
+		apiHandler = WithSyntheticDelay(apiHandler, opts.SyntheticDelay)
 		return apiHandler
 	}
 
-	opts.Etcd.StorageConfig.Paging = utilfeature.DefaultFeatureGate.Enabled(features.APIListChunking)
 	// this is where the true decodable levels come from.
 	opts.Etcd.StorageConfig.Codec = apiextensionsapiserver.Codecs.LegacyCodec(apiextensionsv1beta1.SchemeGroupVersion, apiextensionsv1.SchemeGroupVersion)
 	// prefer the more compact serialization (v1beta1) for storage until http://issue.k8s.io/82292 is resolved for objects whose v1 serialization is too big but whose v1beta1 serialization can be stored
 	opts.Etcd.StorageConfig.EncodeVersioner = runtime.NewMultiGroupVersioner(apiextensionsv1beta1.SchemeGroupVersion, schema.GroupKind{Group: apiextensionsv1beta1.GroupName})
-	serverConfig.RESTOptionsGetter = &genericoptions.SimpleRestOptionsFactory{Options: *opts.Etcd}
-
-	// use protobufs for self-communication.
-	// Since not every generic apiserver has to support protobufs, we
-	// cannot default to it in generic apiserver and need to explicitly
-	// set it in kube-apiserver.
-	serverConfig.LoopbackClientConfig.ContentConfig.ContentType = "application/vnd.kubernetes.protobuf"
-	// disable compression for self-communication, since we are going to be
-	// on a fast local network
-	serverConfig.LoopbackClientConfig.DisableCompression = true
+	opts.Etcd.SkipHealthEndpoints = true // avoid double wiring of health checks
+	if err := opts.Etcd.ApplyTo(&serverConfig.Config); err != nil {
+		return nil, err
+	}
 
 	// an ordered list of HTTP round trippers that add
 	// shard and cluster awareness to all clients that use
@@ -181,53 +168,67 @@ func NewConfig(opts *cacheserveroptions.CompletedOptions, optionalLocalShardRest
 		rt,
 		func(rq *http.Request) (string, string, error) {
 			if serverConfig.Config.RequestInfoResolver == nil {
-				return "", "", fmt.Errorf("RequestInfoResolver wasn't provided")
+				return "", "", errors.New("no RequestInfoResolver provided")
 			}
-			requestInfo, err := serverConfig.Config.RequestInfoResolver.NewRequestInfo(rq)
+			// the k8s request info resolver expects a cluster-less path, but the client we're using knows how to
+			// add the cluster we are targeting to the path before this round-tripper fires, so we need to strip it
+			// to use the k8s library
+			parts := strings.Split(rq.URL.Path, "/")
+			if len(parts) < 4 {
+				//nolint:revive
+				return "", "", fmt.Errorf("RequestInfoResolver: got invalid path: %v", rq.URL.Path)
+			}
+			if parts[1] != "clusters" {
+				//nolint:revive
+				return "", "", fmt.Errorf("RequestInfoResolver: got path without cluster prefix: %v", rq.URL.Path)
+			}
+			// we clone the request here to safely mutate the URL path, but this cloned request is never realized
+			// into anything on the network, just inspected by the k8s request info libraries
+			clone := rq.Clone(rq.Context())
+			clone.URL.Path = strings.Join(parts[3:], "/")
+			requestInfo, err := serverConfig.Config.RequestInfoResolver.NewRequestInfo(clone)
 			if err != nil {
 				return "", "", err
 			}
 			return requestInfo.Resource, requestInfo.Verb, nil
 		},
 		"customresourcedefinitions")
-
-	kcpclienthelper.SetMultiClusterRoundTripper(rt)
-	clientutils.EnableMultiCluster(rt, &serverConfig.Config, "namespaces", "apiservices", "customresourcedefinitions", "clusterroles", "clusterrolebindings", "roles", "rolebindings", "serviceaccounts", "secrets")
+	rt = rest.AddUserAgent(rt, "kcp-cache-server")
 
 	var err error
-	c.ApiExtensionsClusterClient, err = apiextensionsclient.NewClusterForConfig(rt)
+	c.ApiExtensionsClusterClient, err = kcpapiextensionsclientset.NewForConfig(rt)
 	if err != nil {
 		return nil, err
 	}
 
-	c.ApiExtensionsSharedInformerFactory = apiextensionsexternalversions.NewSharedInformerFactoryWithOptions(
-		c.ApiExtensionsClusterClient.Cluster(logicalcluster.Wildcard),
+	c.ApiExtensionsSharedInformerFactory = kcpapiextensionsinformers.NewSharedInformerFactoryWithOptions(
+		c.ApiExtensionsClusterClient,
 		resyncPeriod,
 	)
+
+	crdRESTOptionsGetter := apiextensionsoptions.NewCRDRESTOptionsGetter(*opts.Etcd, serverConfig.ResourceTransformers, serverConfig.StorageObjectCountTracker)
 
 	c.ApiExtensions = &apiextensionsapiserver.Config{
 		GenericConfig: serverConfig,
 		ExtraConfig: apiextensionsapiserver.ExtraConfig{
-			CRDRESTOptionsGetter: apiextensionsoptions.NewCRDRESTOptionsGetter(*opts.Etcd),
-			// Wire in a ServiceResolver that always returns an error that ResolveEndpoint is not yet
-			// supported. The effect is that CRD webhook conversions are not supported and will always get an
-			// error.
-			ServiceResolver:       &unimplementedServiceResolver{},
+			CRDRESTOptionsGetter:  crdRESTOptionsGetter,
 			MasterCount:           1,
-			AuthResolverWrapper:   webhook.NewDefaultAuthenticationInfoResolverWrapper(nil, nil, rt, nil),
-			ClusterAwareCRDLister: &crdLister{lister: c.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Lister()},
+			Client:                c.ApiExtensionsClusterClient,
+			Informers:             c.ApiExtensionsSharedInformerFactory,
+			ClusterAwareCRDLister: &crdClusterLister{lister: c.ApiExtensionsSharedInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Lister()},
+			ConversionFactory:     &nopCRConversionFactory{},
 		},
 	}
 
 	return c, nil
 }
 
-// unimplementedServiceResolver is a webhook.ServiceResolver that always returns an error, because
-// we have not implemented support for this yet. As a result, CRD webhook conversions are not
-// supported.
-type unimplementedServiceResolver struct{}
+// nopCRConversionFactory implements conversion.Factory and always returns a no-op converter because we currently have
+// no need to perform CR conversions in the cache server.
+type nopCRConversionFactory struct{}
 
-// ResolveEndpoint always returns an error that this is not yet supported.
-func (r *unimplementedServiceResolver) ResolveEndpoint(namespace string, name string, port int32) (*url.URL, error) {
-	return nil, errors.New("CRD webhook conversions are not supported")
+// NewConverter always returns a no-op converter because we currently have no need to perform CR conversions in the
+// cache server.
+func (n nopCRConversionFactory) NewConverter(_ *apiextensionsv1.CustomResourceDefinition) (conversion.CRConverter, error) {
+	return conversion.NewNOPConverter(), nil
 }

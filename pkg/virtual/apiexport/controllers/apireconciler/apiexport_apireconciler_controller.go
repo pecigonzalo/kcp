@@ -23,29 +23,30 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
+	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	apisinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/apis/v1alpha1"
-	apislisters "github.com/kcp-dev/kcp/pkg/client/listers/apis/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/indexers"
 	"github.com/kcp-dev/kcp/pkg/logging"
+	"github.com/kcp-dev/kcp/pkg/reconciler/events"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/apidefinition"
 	dynamiccontext "github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/context"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	apisv1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/apis/v1alpha1"
+	apisv1alpha1listers "github.com/kcp-dev/kcp/sdk/client/listers/apis/v1alpha1"
 )
 
 const (
 	ControllerName = "kcp-virtual-apiexport-api-reconciler"
-	byWorkspace    = ControllerName + "-byWorkspace" // will go away with scoping
 )
 
 type CreateAPIDefinitionFunc func(apiResourceSchema *apisv1alpha1.APIResourceSchema, version string, identityHash string, additionalLabelRequirements labels.Requirements) (apidefinition.APIDefinition, error)
@@ -53,13 +54,12 @@ type CreateAPIDefinitionFunc func(apiResourceSchema *apisv1alpha1.APIResourceSch
 // NewAPIReconciler returns a new controller which reconciles APIResourceImport resources
 // and delegates the corresponding SyncTargetAPI management to the given SyncTargetAPIManager.
 func NewAPIReconciler(
-	kcpClusterClient kcpclient.ClusterInterface,
-	apiResourceSchemaInformer apisinformers.APIResourceSchemaInformer,
-	apiExportInformer apisinformers.APIExportInformer,
+	kcpClusterClient kcpclientset.ClusterInterface,
+	apiResourceSchemaInformer apisv1alpha1informers.APIResourceSchemaClusterInformer,
+	apiExportInformer apisv1alpha1informers.APIExportClusterInformer,
 	createAPIDefinition CreateAPIDefinitionFunc,
+	createAPIBindingAPIDefinition func(ctx context.Context, clusterName logicalcluster.Name, apiExportName string) (apidefinition.APIDefinition, error),
 ) (*APIReconciler, error) {
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), ControllerName)
-
 	c := &APIReconciler{
 		kcpClusterClient: kcpClusterClient,
 
@@ -68,10 +68,19 @@ func NewAPIReconciler(
 
 		apiExportLister:  apiExportInformer.Lister(),
 		apiExportIndexer: apiExportInformer.Informer().GetIndexer(),
+		listAPIExports: func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIExport, error) {
+			return apiExportInformer.Lister().Cluster(clusterName).List(labels.Everything())
+		},
 
-		queue: queue,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name: ControllerName,
+			},
+		),
 
-		createAPIDefinition: createAPIDefinition,
+		createAPIDefinition:           createAPIDefinition,
+		createAPIBindingAPIDefinition: createAPIBindingAPIDefinition,
 
 		apiSets: map[dynamiccontext.APIDomainKey]apidefinition.APIDefinitionSet{},
 	}
@@ -79,33 +88,33 @@ func NewAPIReconciler(
 	indexers.AddIfNotPresentOrDie(
 		apiExportInformer.Informer().GetIndexer(),
 		cache.Indexers{
-			byWorkspace:                  indexByWorkspace,
-			indexers.APIExportByIdentity: indexers.IndexAPIExportByIdentity,
+			indexers.APIExportByIdentity:          indexers.IndexAPIExportByIdentity,
+			indexers.APIExportByClaimedIdentities: indexers.IndexAPIExportByClaimedIdentities,
 		},
 	)
 
 	logger := logging.WithReconciler(klog.Background(), ControllerName)
 
-	apiExportInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = apiExportInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			c.enqueueAPIExport(obj, logger)
+			c.enqueueAPIExport(obj.(*apisv1alpha1.APIExport), logger)
 		},
 		UpdateFunc: func(_, obj interface{}) {
-			c.enqueueAPIExport(obj, logger)
+			c.enqueueAPIExport(obj.(*apisv1alpha1.APIExport), logger)
 		},
 		DeleteFunc: func(obj interface{}) {
-			c.enqueueAPIExport(obj, logger)
+			c.enqueueAPIExport(obj.(*apisv1alpha1.APIExport), logger)
 		},
 	})
 
-	apiResourceSchemaInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = apiResourceSchemaInformer.Informer().AddEventHandler(events.WithoutSyncs(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			c.enqueueAPIResourceSchema(obj, logger)
+			c.enqueueAPIResourceSchema(obj.(*apisv1alpha1.APIResourceSchema), logger)
 		},
 		DeleteFunc: func(obj interface{}) {
-			c.enqueueAPIResourceSchema(obj, logger)
+			c.enqueueAPIResourceSchema(obj.(*apisv1alpha1.APIResourceSchema), logger)
 		},
-	})
+	}))
 
 	return c, nil
 }
@@ -113,60 +122,82 @@ func NewAPIReconciler(
 // APIReconciler is a controller watching APIExports and APIResourceSchemas, and updates the
 // API definitions driving the virtual workspace.
 type APIReconciler struct {
-	kcpClusterClient kcpclient.ClusterInterface
+	kcpClusterClient kcpclientset.ClusterInterface
 
-	apiResourceSchemaLister  apislisters.APIResourceSchemaLister
+	apiResourceSchemaLister  apisv1alpha1listers.APIResourceSchemaClusterLister
 	apiResourceSchemaIndexer cache.Indexer
 
-	apiExportLister  apislisters.APIExportLister
+	apiExportLister  apisv1alpha1listers.APIExportClusterLister
 	apiExportIndexer cache.Indexer
+	listAPIExports   func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIExport, error)
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
-	createAPIDefinition CreateAPIDefinitionFunc
+	createAPIDefinition           CreateAPIDefinitionFunc
+	createAPIBindingAPIDefinition func(ctx context.Context, clusterName logicalcluster.Name, apiExportName string) (apidefinition.APIDefinition, error)
 
 	mutex   sync.RWMutex // protects the map, not the values!
 	apiSets map[dynamiccontext.APIDomainKey]apidefinition.APIDefinitionSet
 }
 
-func (c *APIReconciler) enqueueAPIResourceSchema(obj interface{}, logger logr.Logger) {
-	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
+func (c *APIReconciler) enqueueAPIResourceSchema(apiResourceSchema *apisv1alpha1.APIResourceSchema, logger logr.Logger) {
+	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(apiResourceSchema)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
 
 	clusterName, _, name, err := kcpcache.SplitMetaClusterNamespaceKey(key)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
-	exports, err := c.apiExportIndexer.ByIndex(byWorkspace, clusterName.String())
+	exports, err := c.listAPIExports(clusterName)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
+
+	logger = logging.WithObject(logger, apiResourceSchema)
 
 	if len(exports) == 0 {
-		klog.V(2).Infof("No kubernetes APIExport found for APIResourceSchema %s|%s", clusterName, name)
+		logger.V(3).Info("No APIExports found")
 		return
 	}
 
-	for _, obj := range exports {
-		export := obj.(*apisv1alpha1.APIExport)
-		klog.V(2).Infof("Queueing APIExport %s|%s for APIResourceSchema %s", clusterName, export.Name, name)
-		c.enqueueAPIExport(obj, logger.WithValues("reason", "APIResourceSchema change", "apiResourceSchema", name))
+	for _, export := range exports {
+		logger.WithValues("apiexport", export.Name).V(4).Info("Queueing APIExport for APIResourceSchema")
+		c.enqueueAPIExport(export, logger.WithValues("reason", "APIResourceSchema change", "apiResourceSchema", name))
 	}
 }
 
-func (c *APIReconciler) enqueueAPIExport(obj interface{}, logger logr.Logger) {
-	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
+func (c *APIReconciler) enqueueAPIExport(apiExport *apisv1alpha1.APIExport, logger logr.Logger) {
+	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(apiExport)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
-	logging.WithQueueKey(logger, key).V(2).Info("queueing APIExport")
+	logging.WithQueueKey(logger, key).V(4).Info("queueing APIExport")
 	c.queue.Add(key)
+
+	if apiExport.Status.IdentityHash != "" {
+		logger.V(4).Info("looking for APIExports to queue that have claims against this identity", "identity", apiExport.Status.IdentityHash)
+		others, err := indexers.ByIndex[*apisv1alpha1.APIExport](c.apiExportIndexer, indexers.APIExportByClaimedIdentities, apiExport.Status.IdentityHash)
+		if err != nil {
+			logger.Error(err, "error getting APIExports for claimed identity", "identity", apiExport.Status.IdentityHash)
+			return
+		}
+		logger.V(4).Info("got APIExports", "identity", apiExport.Status.IdentityHash, "count", len(others))
+		for _, other := range others {
+			key, err := kcpcache.MetaClusterNamespaceKeyFunc(other)
+			if err != nil {
+				logger.Error(err, "error getting key!")
+				continue
+			}
+			logging.WithQueueKey(logger, key).V(4).Info("queueing APIExport for claim")
+			c.queue.Add(key)
+		}
+	}
 }
 
 func (c *APIReconciler) startWorker(ctx context.Context) {
@@ -175,7 +206,7 @@ func (c *APIReconciler) startWorker(ctx context.Context) {
 }
 
 func (c *APIReconciler) Start(ctx context.Context) {
-	defer runtime.HandleCrash()
+	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
 	logger := logging.WithReconciler(klog.FromContext(ctx), ControllerName)
@@ -209,18 +240,18 @@ func (c *APIReconciler) processNextWorkItem(ctx context.Context) bool {
 	if quit {
 		return false
 	}
-	key := k.(string)
+	key := k
 
 	logger := logging.WithQueueKey(klog.FromContext(ctx), key)
 	ctx = klog.NewContext(ctx, logger)
-	logger.V(1).Info("processing key")
+	logger.V(4).Info("processing key")
 
 	// No matter what, tell the queue we're done with this key, to unblock
 	// other workers.
 	defer c.queue.Done(key)
 
 	if err := c.process(ctx, key); err != nil {
-		runtime.HandleError(fmt.Errorf("%s: failed to sync %q, err: %w", ControllerName, key, err))
+		utilruntime.HandleError(fmt.Errorf("%s: failed to sync %q, err: %w", ControllerName, key, err))
 		c.queue.AddRateLimited(key)
 		return true
 	}
@@ -232,14 +263,14 @@ func (c *APIReconciler) processNextWorkItem(ctx context.Context) bool {
 func (c *APIReconciler) process(ctx context.Context, key string) error {
 	clusterName, _, apiExportName, err := kcpcache.SplitMetaClusterNamespaceKey(key)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return nil
 	}
 	apiDomainKey := dynamiccontext.APIDomainKey(clusterName.String() + "/" + apiExportName)
 
 	logger := klog.FromContext(ctx).WithValues("apiDomainKey", apiDomainKey)
 
-	apiExport, err := c.apiExportLister.Get(key)
+	apiExport, err := c.apiExportLister.Cluster(clusterName).Get(apiExportName)
 	if err != nil && !apierrors.IsNotFound(err) {
 		logger.Error(err, "error getting APIExport")
 		return nil // nothing we can do here

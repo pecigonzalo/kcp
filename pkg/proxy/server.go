@@ -22,49 +22,47 @@ import (
 	"net/http"
 	"time"
 
-	kcpclienthelper "github.com/kcp-dev/apimachinery/pkg/client"
-	"github.com/kcp-dev/logicalcluster/v2"
-
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	genericfilters "k8s.io/apiserver/pkg/server/filters"
 	restclient "k8s.io/client-go/rest"
+	_ "k8s.io/component-base/metrics/prometheus/workqueue"
 	"k8s.io/klog/v2"
 
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
 	frontproxyfilters "github.com/kcp-dev/kcp/pkg/proxy/filters"
 	"github.com/kcp-dev/kcp/pkg/proxy/index"
-	"github.com/kcp-dev/kcp/pkg/server"
+	"github.com/kcp-dev/kcp/pkg/proxy/metrics"
+	kcpfilters "github.com/kcp-dev/kcp/pkg/server/filters"
 	"github.com/kcp-dev/kcp/pkg/server/requestinfo"
+	"github.com/kcp-dev/kcp/sdk/apis/core"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 type Server struct {
 	CompletedConfig
 	Handler                  http.Handler
 	IndexController          *index.Controller
-	KcpSharedInformerFactory kcpinformers.SharedInformerFactory
+	KcpSharedInformerFactory kcpinformers.SharedScopedInformerFactory
 }
 
 func NewServer(ctx context.Context, c CompletedConfig) (*Server, error) {
 	s := &Server{
 		CompletedConfig: c,
 	}
-	rootShardConfigInformerConfig := kcpclienthelper.SetCluster(restclient.CopyConfig(s.CompletedConfig.RootShardConfig), tenancyv1alpha1.RootCluster)
-	rootShardConfigInformerClient, err := kcpclient.NewForConfig(rootShardConfigInformerConfig)
+	rootShardConfigInformerClient, err := kcpclientset.NewForConfig(s.CompletedConfig.RootShardConfig)
 	if err != nil {
 		return s, fmt.Errorf("failed to create client for informers: %w", err)
 	}
-	s.KcpSharedInformerFactory = kcpinformers.NewSharedInformerFactoryWithOptions(rootShardConfigInformerClient, 30*time.Minute)
+	s.KcpSharedInformerFactory = kcpinformers.NewSharedScopedInformerFactoryWithOptions(rootShardConfigInformerClient.Cluster(core.RootCluster.Path()), 30*time.Minute)
 	s.IndexController = index.NewController(
 		ctx,
-		s.CompletedConfig.RootShardConfig.Host,
-		s.KcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceShards(),
-		func(shard *tenancyv1alpha1.ClusterWorkspaceShard) (kcpclient.Interface, error) {
-			shardConfig := restclient.CopyConfig(s.CompletedConfig.RootShardConfig)
+		s.KcpSharedInformerFactory.Core().V1alpha1().Shards(),
+		func(shard *corev1alpha1.Shard) (kcpclientset.ClusterInterface, error) {
+			shardConfig := restclient.CopyConfig(s.CompletedConfig.ShardsConfig)
 			shardConfig.Host = shard.Spec.BaseURL
-			shardClient, err := kcpclient.NewForConfig(kcpclienthelper.SetCluster(restclient.CopyConfig(shardConfig), logicalcluster.Wildcard))
+			shardClient, err := kcpclientset.NewForConfig(shardConfig)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create shard %q client: %w", shard.Name, err)
 			}
@@ -72,10 +70,41 @@ func NewServer(ctx context.Context, c CompletedConfig) (*Server, error) {
 		},
 	)
 
-	s.Handler, err = NewHandler(ctx, s.CompletedConfig.Options, s.IndexController)
+	handler, err := NewHandler(ctx, s.CompletedConfig.Options, s.IndexController)
 	if err != nil {
 		return s, err
 	}
+
+	failedHandler := frontproxyfilters.NewUnauthorizedHandler()
+	handler = frontproxyfilters.WithOptionalAuthentication(
+		handler,
+		failedHandler,
+		s.CompletedConfig.AuthenticationInfo.Authenticator,
+		s.CompletedConfig.AdditionalAuthEnabled)
+
+	requestInfoFactory := requestinfo.NewFactory()
+	handler = kcpfilters.WithInClusterServiceAccountRequestRewrite(handler)
+	handler = genericapifilters.WithRequestInfo(handler, requestInfoFactory)
+	handler = genericfilters.WithHTTPLogging(handler)
+	handler = metrics.WithLatencyTracking(handler)
+	handler = genericfilters.WithPanicRecovery(handler, requestInfoFactory)
+	handler = genericfilters.WithCORS(handler, c.Options.CorsAllowedOriginList, nil, nil, nil, "true")
+
+	mux := http.NewServeMux()
+	// TODO: implement proper readyz handler
+	mux.Handle("/readyz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK")) //nolint:errcheck
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// TODO: implement proper livez handler
+	mux.Handle("/livez", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK")) //nolint:errcheck
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	mux.Handle("/", handler)
+	s.Handler = mux
 
 	return s, nil
 }
@@ -92,7 +121,7 @@ func (s *Server) PrepareRun(ctx context.Context) (preparedServer, error) {
 func (s preparedServer) Run(ctx context.Context) error {
 	logger := klog.FromContext(ctx).WithValues("component", "proxy")
 
-	if err := wait.PollImmediateInfiniteWithContext(ctx, time.Millisecond*500, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextCancel(ctx, time.Millisecond*500, true, func(ctx context.Context) (bool, error) {
 		if err := s.CompletedConfig.ResolveIdentities(ctx); err != nil {
 			logger.V(3).Info("failed to resolve identities, keeping trying", "err", err)
 			return false, nil
@@ -108,15 +137,6 @@ func (s preparedServer) Run(ctx context.Context) error {
 	s.KcpSharedInformerFactory.Start(ctx.Done())
 	s.KcpSharedInformerFactory.WaitForCacheSync(ctx.Done())
 
-	// start the server
-	failedHandler := frontproxyfilters.NewUnauthorizedHandler()
-	s.Handler = frontproxyfilters.WithOptionalClientCert(s.Handler, failedHandler, s.CompletedConfig.AuthenticationInfo.Authenticator)
-
-	requestInfoFactory := requestinfo.NewFactory()
-	s.Handler = server.WithInClusterServiceAccountRequestRewrite(s.Handler)
-	s.Handler = genericapifilters.WithRequestInfo(s.Handler, requestInfoFactory)
-	s.Handler = genericfilters.WithHTTPLogging(s.Handler)
-	s.Handler = genericfilters.WithPanicRecovery(s.Handler, requestInfoFactory)
 	doneCh, _, err := s.CompletedConfig.ServingInfo.Serve(s.Handler, time.Second*60, ctx.Done())
 	if err != nil {
 		return err

@@ -19,64 +19,54 @@ package delegated
 import (
 	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpkubernetesclient "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	"k8s.io/apiserver/pkg/server/options"
-	kubernetesclient "k8s.io/client-go/kubernetes"
-	authorizationv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
-	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 )
 
-type DelegatedAuthorizerFactory func(clusterName logicalcluster.Name, client kubernetesclient.ClusterInterface) (authorizer.Authorizer, error)
+type DelegatedAuthorizerFactory func(clusterName logicalcluster.Name, client kcpkubernetesclient.ClusterInterface, opts Options) (authorizer.Authorizer, error)
+
+// Options provides options to customize the
+// created DelegatedAuthorizer.
+type Options struct {
+	// AllowCacheTTL is the length of time that a successful authorization response will be cached
+	AllowCacheTTL time.Duration
+
+	// DenyCacheTTL is the length of time that an unsuccessful authorization response will be cached.
+	// You generally want more responsive, "deny, try again" flows.
+	DenyCacheTTL time.Duration
+}
+
+func (d *Options) defaults() {
+	if d.AllowCacheTTL == 0 {
+		d.AllowCacheTTL = 5 * time.Minute
+	}
+	if d.DenyCacheTTL == 0 {
+		d.DenyCacheTTL = 30 * time.Second
+	}
+}
 
 // NewDelegatedAuthorizer returns a new authorizer for use in e.g. admission plugins that delegates
 // to the kube API server via SubjectAccessReview.
-func NewDelegatedAuthorizer(clusterName logicalcluster.Name, client kubernetesclient.ClusterInterface) (authorizer.Authorizer, error) {
+func NewDelegatedAuthorizer(clusterName logicalcluster.Name, client kcpkubernetesclient.ClusterInterface, opts Options) (authorizer.Authorizer, error) {
+	opts.defaults()
+
 	delegatingAuthorizerConfig := &authorizerfactory.DelegatingAuthorizerConfig{
-		SubjectAccessReviewClient: &clusterAwareAuthorizationV1Client{
-			AuthorizationV1Interface: client.Cluster(clusterName).AuthorizationV1(),
-			cluster:                  clusterName,
-		},
-		AllowCacheTTL:       5 * time.Minute,
-		DenyCacheTTL:        30 * time.Second,
-		WebhookRetryBackoff: options.DefaultAuthWebhookRetryBackoff(),
+		SubjectAccessReviewClient: client.Cluster(clusterName.Path()).AuthorizationV1(),
+		AllowCacheTTL:             opts.AllowCacheTTL,
+		DenyCacheTTL:              opts.DenyCacheTTL,
+		WebhookRetryBackoff:       options.DefaultAuthWebhookRetryBackoff(),
 	}
 
 	authz, err := delegatingAuthorizerConfig.New()
 	if err != nil {
-		klog.Errorf("error creating authorizer from delegating authorizer config: %v", err)
+		klog.Background().Error(err, "error creating authorizer from delegating authorizer config")
 		return nil, err
 	}
 
 	return authz, nil
-}
-
-// clusterAwareAuthorizationV1Client is a thin wrapper around AuthorizationV1Interface that exposes a RESTClient()
-// implementation that supports logical clusters for POST calls.
-// TODO(ncdc) replace with generated clientset wrappers that are logical cluster aware.
-type clusterAwareAuthorizationV1Client struct {
-	authorizationv1client.AuthorizationV1Interface
-	cluster logicalcluster.Name
-}
-
-// RESTClient returns a rest.Interface that supports logical clusters for POST calls.
-func (c *clusterAwareAuthorizationV1Client) RESTClient() rest.Interface {
-	return &clusterAwareRESTClient{
-		Interface: c.AuthorizationV1Interface.RESTClient(),
-		cluster:   c.cluster,
-	}
-}
-
-// clusterAwareRESTClient supports logical clusters for POST calls.
-type clusterAwareRESTClient struct {
-	rest.Interface
-	cluster logicalcluster.Name
-}
-
-// Post returns a *rest.Request for a specific logical cluster.
-func (c *clusterAwareRESTClient) Post() *rest.Request {
-	return c.Interface.Post().Cluster(c.cluster)
 }
