@@ -26,47 +26,49 @@ import (
 	"testing"
 	"time"
 
-	kcpdynamic "github.com/kcp-dev/apimachinery/pkg/dynamic"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpapiextensionsclientset "github.com/kcp-dev/client-go/apiextensions/client"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
 	"github.com/stretchr/testify/require"
 
 	v1 "k8s.io/api/core/v1"
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
-	kubernetesclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	kcpclientset "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
 	"github.com/kcp-dev/kcp/test/e2e/fixtures/apifixtures"
 	"github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest"
 	wildwestv1alpha1 "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/apis/wildwest/v1alpha1"
-	wildwestclientset "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/client/clientset/versioned"
+	wildwestclientset "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/client/clientset/versioned/cluster"
 	"github.com/kcp-dev/kcp/test/e2e/framework"
 )
 
 func TestWatchCacheEnabledForCRD(t *testing.T) {
 	t.Parallel()
+	framework.Suite(t, "control-plane")
+
 	server := framework.SharedKcpServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	org := framework.NewOrganizationFixture(t, server)
-	cluster := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
-	rootShardConfig := server.RootShardSystemMasterBaseConfig(t)
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
+	// note that we schedule the workspace on the root shard because
+	// we need a direct and privileged access to it for downloading the metrics
+	wsPath, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
+	clusterConfig := server.BaseConfig(t)
 	cowBoysGR := metav1.GroupResource{Group: "wildwest.dev", Resource: "cowboys"}
 
 	t.Log("Creating wildwest.dev CRD")
-	rootCRDClusterClient, err := apiextensionsclient.NewForConfig(rootShardConfig)
+	kcpClusterClient, err := kcpapiextensionsclientset.NewForConfig(clusterConfig)
 	require.NoError(t, err)
-	rootShardCRDWildcardClient := rootCRDClusterClient.ApiextensionsV1().CustomResourceDefinitions()
+	kcpCRDClusterClient := kcpClusterClient.ApiextensionsV1().CustomResourceDefinitions()
 
 	t.Log("Creating wildwest.dev.cowboys CR")
-	wildwest.Create(t, cluster, rootShardCRDWildcardClient, cowBoysGR)
-	wildwestClusterClient, err := wildwestclientset.NewForConfig(rootShardConfig)
+	wildwest.Create(t, wsPath, kcpCRDClusterClient, cowBoysGR)
+	wildwestClusterClient, err := wildwestclientset.NewForConfig(clusterConfig)
 	require.NoError(t, err)
-	_, err = wildwestClusterClient.WildwestV1alpha1().Cowboys("default").Create(logicalcluster.WithCluster(ctx, cluster), &wildwestv1alpha1.Cowboy{
+	_, err = wildwestClusterClient.Cluster(wsPath).WildwestV1alpha1().Cowboys("default").Create(ctx, &wildwestv1alpha1.Cowboy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "efficientluke",
 		},
@@ -75,9 +77,9 @@ func TestWatchCacheEnabledForCRD(t *testing.T) {
 		},
 	}, metav1.CreateOptions{})
 	require.NoError(t, err)
-	t.Logf("Waiting until the watch cache is primed for %v for cluster %v", cowBoysGR, cluster)
+	t.Logf("Waiting until the watch cache is primed for %v for cluster %v", cowBoysGR, wsPath)
 	assertWatchCacheIsPrimed(t, func() error {
-		res, err := wildwestClusterClient.WildwestV1alpha1().Cowboys("default").List(logicalcluster.WithCluster(ctx, cluster), metav1.ListOptions{ResourceVersion: "0"})
+		res, err := wildwestClusterClient.Cluster(wsPath).WildwestV1alpha1().Cowboys("default").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
 		if err != nil {
 			return err
 		}
@@ -89,7 +91,7 @@ func TestWatchCacheEnabledForCRD(t *testing.T) {
 
 	t.Log("Getting wildwest.dev.cowboys 10 times from the watch cache")
 	for i := 0; i < 10; i++ {
-		res, err := wildwestClusterClient.WildwestV1alpha1().Cowboys("default").List(logicalcluster.WithCluster(ctx, cluster), metav1.ListOptions{ResourceVersion: "0"})
+		res, err := wildwestClusterClient.Cluster(wsPath).WildwestV1alpha1().Cowboys("default").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
 		require.NoError(t, err)
 		require.Equal(t, 1, len(res.Items), "expected to get exactly one cowboy")
 	}
@@ -105,28 +107,32 @@ func TestWatchCacheEnabledForCRD(t *testing.T) {
 
 func TestWatchCacheEnabledForAPIBindings(t *testing.T) {
 	t.Parallel()
+	framework.Suite(t, "control-plane")
+
 	server := framework.SharedKcpServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	rootShardConfig := server.RootShardSystemMasterBaseConfig(t)
-	kcpClusterClient, err := kcpclientset.NewForConfig(rootShardConfig)
+	clusterConfig := server.BaseConfig(t)
+	kcpClusterClient, err := kcpclientset.NewForConfig(clusterConfig)
 	require.NoError(t, err)
-	dynamicClusterClient, err := kcpdynamic.NewClusterDynamicClientForConfig(rootShardConfig)
+	dynamicKcpClusterClient, err := kcpdynamic.NewForConfig(clusterConfig)
 	require.NoError(t, err)
 
-	org := framework.NewOrganizationFixture(t, server)
-	wsExport1a := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
-	wsConsume1a := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
+	// note that we schedule the workspaces on the root shard because
+	// we need a direct and privileged access to it for downloading the metrics
+	wsExport1aPath, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
+	wsConsume1aPath, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
 	group := "newyork.io"
 
-	apifixtures.CreateSheriffsSchemaAndExport(ctx, t, wsExport1a, kcpClusterClient, group, "export1")
-	apifixtures.BindToExport(ctx, t, wsExport1a, group, wsConsume1a, kcpClusterClient)
-	apifixtures.CreateSheriff(ctx, t, dynamicClusterClient, wsConsume1a, group, wsConsume1a.String())
+	apifixtures.CreateSheriffsSchemaAndExport(ctx, t, wsExport1aPath, kcpClusterClient, group, "export1")
+	apifixtures.BindToExport(ctx, t, wsExport1aPath, group, wsConsume1aPath, kcpClusterClient)
+	apifixtures.CreateSheriff(ctx, t, dynamicKcpClusterClient, wsConsume1aPath, group, wsConsume1aPath.String())
 
 	sheriffsGVR := schema.GroupVersionResource{Group: group, Resource: "sheriffs", Version: "v1"}
-	t.Logf("Waiting until the watch cache is primed for %v for cluster %v", sheriffsGVR, wsConsume1a)
+	t.Logf("Waiting until the watch cache is primed for %v for cluster %v", sheriffsGVR, wsConsume1aPath)
 	assertWatchCacheIsPrimed(t, func() error {
-		res, err := dynamicClusterClient.Cluster(wsConsume1a).Resource(sheriffsGVR).Namespace("default").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
+		res, err := dynamicKcpClusterClient.Cluster(wsConsume1aPath).Resource(sheriffsGVR).Namespace("default").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
 		if err != nil {
 			return err
 		}
@@ -137,7 +143,7 @@ func TestWatchCacheEnabledForAPIBindings(t *testing.T) {
 	})
 	t.Log("Getting sheriffs.newyork.io 10 times from the watch cache")
 	for i := 0; i < 10; i++ {
-		res, err := dynamicClusterClient.Cluster(wsConsume1a).Resource(sheriffsGVR).Namespace("default").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
+		res, err := dynamicKcpClusterClient.Cluster(wsConsume1aPath).Resource(sheriffsGVR).Namespace("default").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
 		require.NoError(t, err)
 		require.Equal(t, 1, len(res.Items), "expected to get exactly one sheriff")
 	}
@@ -153,23 +159,27 @@ func TestWatchCacheEnabledForAPIBindings(t *testing.T) {
 
 func TestWatchCacheEnabledForBuiltinTypes(t *testing.T) {
 	t.Parallel()
+	framework.Suite(t, "control-plane")
+
 	server := framework.SharedKcpServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	rootShardConfig := server.RootShardSystemMasterBaseConfig(t)
-	kubeClusterClient, err := kubernetesclientset.NewForConfig(rootShardConfig)
+	clusterConfig := server.BaseConfig(t)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(clusterConfig)
 	require.NoError(t, err)
 	secretsGR := metav1.GroupResource{Group: "", Resource: "secrets"}
 
-	org := framework.NewOrganizationFixture(t, server)
-	cluster := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
+	// note that we schedule the workspace on the root shard because
+	// we need a direct and privileged access to it for downloading the metrics
+	wsPath, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
 
-	t.Logf("Creating a secret in the default namespace for %q cluster", cluster)
-	_, err = kubeClusterClient.CoreV1().Secrets("default").Create(logicalcluster.WithCluster(ctx, cluster), &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "topsecret"}}, metav1.CreateOptions{})
+	t.Logf("Creating a secret in the default namespace for %q cluster", wsPath)
+	_, err = kubeClusterClient.Cluster(wsPath).CoreV1().Secrets("default").Create(ctx, &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "topsecret"}}, metav1.CreateOptions{})
 	require.NoError(t, err)
-	t.Logf("Waiting until the watch cache is primed for %v for cluster %v", secretsGR, cluster)
+	t.Logf("Waiting until the watch cache is primed for %v for cluster %v", secretsGR, wsPath)
 	assertWatchCacheIsPrimed(t, func() error {
-		res, err := kubeClusterClient.CoreV1().Secrets("default").List(logicalcluster.WithCluster(ctx, cluster), metav1.ListOptions{ResourceVersion: "0"})
+		res, err := kubeClusterClient.Cluster(wsPath).CoreV1().Secrets("default").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
 		if err != nil {
 			return err
 		}
@@ -180,9 +190,9 @@ func TestWatchCacheEnabledForBuiltinTypes(t *testing.T) {
 	})
 
 	// since secrets might be common resources to LIST, try to get them an odd number of times
-	t.Logf("Getting core.secret 115 times from the watch cache for %q cluster", cluster)
+	t.Logf("Getting core.secret 115 times from the watch cache for %q cluster", wsPath)
 	for i := 0; i < 115; i++ {
-		res, err := kubeClusterClient.CoreV1().Secrets("default").List(logicalcluster.WithCluster(ctx, cluster), metav1.ListOptions{ResourceVersion: "0"})
+		res, err := kubeClusterClient.Cluster(wsPath).CoreV1().Secrets("default").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
 		require.NoError(t, err)
 		require.GreaterOrEqual(t, len(res.Items), 1, "expected to get at least one secret")
 
@@ -194,7 +204,7 @@ func TestWatchCacheEnabledForBuiltinTypes(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Fatalf("havent't found the %q secret for %q cluster", "topsecret", cluster)
+			t.Fatalf("havent't found the %q secret for %q cluster", "topsecret", wsPath)
 		}
 	}
 
@@ -208,7 +218,9 @@ func TestWatchCacheEnabledForBuiltinTypes(t *testing.T) {
 }
 
 func collectCacheHitsFor(ctx context.Context, t *testing.T, rootCfg *rest.Config, metricResourcePrefix string) (int, int) {
-	rootShardKubeClusterClient, err := kubernetesclientset.NewForConfig(rootCfg)
+	t.Helper()
+
+	rootShardKubeClusterClient, err := kcpkubernetesclientset.NewForConfig(rootCfg)
 	require.NoError(t, err)
 
 	t.Logf("Reading %q metrics from the API server via %q endpoint for %q prefix", "apiserver_cache_list_total", "/metrics", metricResourcePrefix)
@@ -235,6 +247,7 @@ func collectCacheHitsFor(ctx context.Context, t *testing.T, rootCfg *rest.Config
 }
 
 func assertWatchCacheIsPrimed(t *testing.T, fn func() error) {
+	t.Helper()
 	framework.Eventually(t, func() (success bool, reason string) {
 		if err := fn(); err != nil {
 			return false, err.Error()

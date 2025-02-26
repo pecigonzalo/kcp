@@ -20,10 +20,15 @@ import (
 	"context"
 	"fmt"
 
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	"k8s.io/apiextensions-apiserver/pkg/registry/customresource"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/validation/path"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -31,31 +36,70 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/registry/rest"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/klog/v2"
-	"k8s.io/kube-openapi/pkg/validation/validate"
 
-	"github.com/kcp-dev/kcp/pkg/apis/tenancy/initialization"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/apiserver"
 	registry "github.com/kcp-dev/kcp/pkg/virtual/framework/forwardingregistry"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/tenancy/initialization"
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
 )
 
-func provideFilteredReadOnlyRestStorage(ctx context.Context, clusterClient dynamic.ClusterInterface, initializer tenancyv1alpha1.ClusterWorkspaceInitializer) (apiserver.RestProviderFunc, error) {
+func initializingWorkspaceRequirements(initializer corev1alpha1.LogicalClusterInitializer) (labels.Requirements, error) {
 	labelSelector := map[string]string{
-		tenancyv1alpha1.ClusterWorkspacePhaseLabel: string(tenancyv1alpha1.ClusterWorkspacePhaseInitializing),
+		tenancyv1alpha1.WorkspacePhaseLabel: string(corev1alpha1.LogicalClusterPhaseInitializing),
 	}
+
 	key, value := initialization.InitializerToLabel(initializer)
 	labelSelector[key] = value
+
 	requirements, selectable := labels.SelectorFromSet(labelSelector).Requirements()
 	if !selectable {
 		return nil, fmt.Errorf("unable to create a selector from the provided labels")
 	}
-	return registry.ProvideReadOnlyRestStorage(ctx, clusterClient, registry.WithStaticLabelSelector(requirements))
+
+	return requirements, nil
 }
 
-func provideDelegatingRestStorage(ctx context.Context, clusterClient dynamic.ClusterInterface, initializer tenancyv1alpha1.ClusterWorkspaceInitializer) (apiserver.RestProviderFunc, error) {
-	return func(resource schema.GroupVersionResource, kind schema.GroupVersionKind, listKind schema.GroupVersionKind, typer runtime.ObjectTyper, tableConvertor rest.TableConvertor, namespaceScoped bool, schemaValidator *validate.SchemaValidator, subresourcesSchemaValidator map[string]*validate.SchemaValidator, structuralSchema *structuralschema.Structural) (mainStorage rest.Storage, subresourceStorages map[string]rest.Storage) {
+func filteredLogicalClusterReadOnlyRestStorage(
+	ctx context.Context,
+	clusterClient kcpdynamic.ClusterInterface,
+	initializer corev1alpha1.LogicalClusterInitializer,
+) (apiserver.RestProviderFunc, error) {
+	requirements, err := initializingWorkspaceRequirements(initializer)
+	if err != nil {
+		return nil, err
+	}
+
+	return registry.ProvideReadOnlyRestStorage(
+		ctx,
+		func(ctx context.Context) (kcpdynamic.ClusterInterface, error) { return clusterClient, nil },
+		registry.WithStaticLabelSelector(requirements),
+		nil,
+	)
+}
+
+func delegatingLogicalClusterReadOnlyRestStorage(
+	ctx context.Context,
+	clusterClient kcpdynamic.ClusterInterface,
+	initializer corev1alpha1.LogicalClusterInitializer,
+) (apiserver.RestProviderFunc, error) {
+	requirements, err := initializingWorkspaceRequirements(initializer)
+	if err != nil {
+		return nil, err
+	}
+
+	return func(
+		resource schema.GroupVersionResource,
+		kind schema.GroupVersionKind,
+		listKind schema.GroupVersionKind,
+		typer runtime.ObjectTyper,
+		tableConvertor rest.TableConvertor,
+		namespaceScoped bool,
+		schemaValidator validation.SchemaValidator,
+		subresourcesSchemaValidator map[string]validation.SchemaValidator,
+		structuralSchema *structuralschema.Structural,
+	) (mainStorage rest.Storage, subresourceStorages map[string]rest.Storage) {
 		statusSchemaValidate, statusEnabled := subresourcesSchemaValidator["status"]
 
 		var statusSpec *apiextensions.CustomResourceSubresourceStatus
@@ -69,26 +113,31 @@ func provideDelegatingRestStorage(ctx context.Context, clusterClient dynamic.Clu
 			typer,
 			namespaceScoped,
 			kind,
+			path.ValidatePathSegmentName,
 			schemaValidator,
 			statusSchemaValidate,
-			map[string]*structuralschema.Structural{resource.Version: structuralSchema},
+			structuralSchema,
 			statusSpec,
 			scaleSpec,
+			[]apiextensionsv1.SelectableField{},
 		)
 
 		storage, statusStorage := registry.NewStorage(
 			ctx,
 			resource,
-			"", // ClusterWorkspaces have no identity
+			"",
 			kind,
 			listKind,
 			strategy,
 			nil,
 			tableConvertor,
 			nil,
-			clusterClient,
+			func(ctx context.Context) (kcpdynamic.ClusterInterface, error) { return clusterClient, nil },
 			nil,
-			withUpdateValidation(initializer),
+			&registry.StorageWrappers{
+				registry.WithStaticLabelSelector(requirements),
+				withUpdateValidation(initializer),
+			},
 		)
 
 		// we want to expose some but not all the allowed endpoints, so filter by exposing just the funcs we need
@@ -144,12 +193,12 @@ func provideDelegatingRestStorage(ctx context.Context, clusterClient dynamic.Clu
 }
 
 // withUpdateValidation adds further validation to ensure that a user of this virtual workspace can only
-// remove their own initializer from the list
-func withUpdateValidation(initializer tenancyv1alpha1.ClusterWorkspaceInitializer) registry.StorageWrapper {
-	return func(resource schema.GroupResource, storage *registry.StoreFuncs) *registry.StoreFuncs {
+// remove their own initializer from the list.
+func withUpdateValidation(initializer corev1alpha1.LogicalClusterInitializer) registry.StorageWrapper {
+	return registry.StorageWrapperFunc(func(resource schema.GroupResource, storage *registry.StoreFuncs) {
 		delegateUpdater := storage.UpdaterFunc
 		storage.UpdaterFunc = func(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
-			validation := rest.ValidateObjectUpdateFunc(func(ctx context.Context, obj, old runtime.Object) error {
+			validationFunc := rest.ValidateObjectUpdateFunc(func(ctx context.Context, obj, old runtime.Object) error {
 				logger := klog.FromContext(ctx)
 				previous, _, err := unstructured.NestedStringSlice(old.(*unstructured.Unstructured).UnstructuredContent(), "status", "initializers")
 				if err != nil {
@@ -161,7 +210,7 @@ func withUpdateValidation(initializer tenancyv1alpha1.ClusterWorkspaceInitialize
 					return errors.NewInternalError(fmt.Errorf("error accessing initializers from old object: %w", err))
 				}
 				invalidUpdateErr := errors.NewInvalid(
-					tenancyv1alpha1.Kind("ClusterWorkspace"),
+					tenancyv1alpha1.Kind("Workspace"),
 					name,
 					field.ErrorList{field.Invalid(
 						field.NewPath("status", "initializers"),
@@ -179,9 +228,7 @@ func withUpdateValidation(initializer tenancyv1alpha1.ClusterWorkspaceInitialize
 				}
 				return updateValidation(ctx, obj, old)
 			})
-			return delegateUpdater.Update(ctx, name, objInfo, createValidation, validation, forceAllowCreate, options)
+			return delegateUpdater.Update(ctx, name, objInfo, createValidation, validationFunc, forceAllowCreate, options)
 		}
-
-		return storage
-	}
+	})
 }

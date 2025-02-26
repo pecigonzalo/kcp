@@ -19,36 +19,11 @@ package apibinding
 import (
 	"fmt"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/clusters"
-
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/client"
 )
-
-const indexAPIBindingsByWorkspaceExport = "apiBindingsByWorkspaceExport"
-
-// indexAPIBindingsByWorkspaceExportFunc is an index function that maps an APIBinding to the key for its
-// spec.reference.workspace.
-func indexAPIBindingsByWorkspaceExportFunc(obj interface{}) ([]string, error) {
-	apiBinding, ok := obj.(*apisv1alpha1.APIBinding)
-	if !ok {
-		return []string{}, fmt.Errorf("obj is supposed to be an APIBinding, but is %T", obj)
-	}
-
-	if apiBinding.Spec.Reference.Workspace != nil {
-		apiExportClusterName := logicalcluster.New(apiBinding.Spec.Reference.Workspace.Path)
-		if !ok {
-			// this will never happen due to validation
-			return []string{}, fmt.Errorf("invalid export reference")
-		}
-		key := clusters.ToClusterAwareKey(apiExportClusterName, apiBinding.Spec.Reference.Workspace.ExportName)
-		return []string{key}, nil
-	}
-
-	return []string{}, nil
-}
 
 const indexAPIExportsByAPIResourceSchema = "apiExportsByAPIResourceSchema"
 
@@ -61,20 +36,8 @@ func indexAPIExportsByAPIResourceSchemasFunc(obj interface{}) ([]string, error) 
 
 	ret := make([]string, len(apiExport.Spec.LatestResourceSchemas))
 	for i := range apiExport.Spec.LatestResourceSchemas {
-		ret[i] = clusters.ToClusterAwareKey(logicalcluster.From(apiExport), apiExport.Spec.LatestResourceSchemas[i])
+		ret[i] = client.ToClusterAwareKey(logicalcluster.From(apiExport).Path(), apiExport.Spec.LatestResourceSchemas[i])
 	}
 
 	return ret, nil
-}
-
-const indexByWorkspace = "apiBindingsByWorkspace"
-
-func indexByWorkspaceFunc(obj interface{}) ([]string, error) {
-	metaObj, ok := obj.(metav1.Object)
-	if !ok {
-		return []string{}, fmt.Errorf("obj is supposed to be a metav1.Object, but is %T", obj)
-	}
-
-	lcluster := logicalcluster.From(metaObj)
-	return []string{lcluster.String()}, nil
 }

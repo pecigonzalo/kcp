@@ -17,13 +17,9 @@ limitations under the License.
 package options
 
 import (
-	"fmt"
-	"net/url"
-
 	"github.com/spf13/pflag"
 
-	genericoptions "k8s.io/apiserver/pkg/server/options"
-
+	cacheclientoptions "github.com/kcp-dev/kcp/pkg/cache/client/options"
 	cacheoptions "github.com/kcp-dev/kcp/pkg/cache/server/options"
 )
 
@@ -34,12 +30,12 @@ type cacheCompleted struct {
 
 func (c cacheCompleted) Validate() []error {
 	var errs []error
-	if _, err := url.Parse(c.URL); err != nil {
-		errs = append(errs, err)
-	}
+
 	if err := c.Server.Validate(); err != nil {
 		errs = append(errs, err...)
 	}
+	errs = append(errs, c.Extra.Client.Validate()...)
+
 	return errs
 }
 
@@ -52,31 +48,28 @@ type Extra struct {
 	// Enabled if true indicates that the cache server should be run with the kcp-server (in-process)
 	Enabled bool
 
-	// URL the url address of the cache server
-	URL string
+	Client cacheclientoptions.Cache
 }
 
 func NewCache(rootDir string) *Cache {
 	return &Cache{
 		Server: cacheoptions.NewOptions(rootDir),
+		Extra: Extra{
+			Client: *cacheclientoptions.NewCache(),
+		},
 	}
 }
 
 func (c *Cache) AddFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&c.URL, "cache-url", c.URL, "A URL address of a cache server associated with this instance (default https://localhost:6443)")
-	fs.BoolVar(&c.Enabled, "run-cache-server", c.Enabled, "If set to true it runs the cache server with this instance (default false)")
+	c.Client.AddFlags(fs)
 
-	c.Server.AddFlags(fs)
+	// note do not add cache server's flag c.Server.AddFlags(fs)
+	// it will cause an undefined behavior as some flags will be overwritten (also defined by the kcp server)
+	// as of today all required flags (embedded etcd, secure port)) are provided by the kcp server, so we are fine for now
+	// it will be finally addressed in https://github.com/kcp-dev/kcp/issues/2021
 }
 
-func (c *Cache) Complete(secureServing *genericoptions.SecureServingOptionsWithLoopback) (cacheCompleted, error) {
-	if len(c.URL) == 0 {
-		bindPort := 6443
-		if secureServing != nil && secureServing.BindPort != bindPort {
-			bindPort = secureServing.BindPort
-		}
-		c.URL = fmt.Sprintf("https://localhost:%v", bindPort)
-	}
+func (c *Cache) Complete() (cacheCompleted, error) {
 	serverCompletedOptions, err := c.Server.Complete()
 	if err != nil {
 		return cacheCompleted{}, err

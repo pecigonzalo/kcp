@@ -22,35 +22,38 @@ import (
 	"testing"
 	"time"
 
-	kcpdynamic "github.com/kcp-dev/apimachinery/pkg/dynamic"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpapiextensionsclientset "github.com/kcp-dev/client-go/apiextensions/client"
+	kcpapiextensionsv1client "github.com/kcp-dev/client-go/apiextensions/client/typed/apiextensions/v1"
+	kcpapiextensionsinformers "github.com/kcp-dev/client-go/apiextensions/informers"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	apiextensionsv1client "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/typed/apiextensions/v1"
-	apiextensionsexternalversions "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 
 	configcrds "github.com/kcp-dev/kcp/config/crds"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	kcpclientset "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	"github.com/kcp-dev/kcp/pkg/indexers"
 	"github.com/kcp-dev/kcp/pkg/informer"
 	metadataclient "github.com/kcp-dev/kcp/pkg/metadata"
+	"github.com/kcp-dev/kcp/sdk/apis/core"
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
 	"github.com/kcp-dev/kcp/test/e2e/fixtures/apifixtures"
 	"github.com/kcp-dev/kcp/test/e2e/framework"
 )
 
 func TestCrossLogicalClusterList(t *testing.T) {
 	t.Parallel()
+	framework.Suite(t, "control-plane")
 
 	server := framework.SharedKcpServer(t)
 
@@ -64,62 +67,62 @@ func TestCrossLogicalClusterList(t *testing.T) {
 	require.NoError(t, err, "failed to construct kcp client for server")
 
 	// Note: we put all consumer workspaces onto root shard in order to enforce conflicts.
+	_, ws1 := framework.NewOrganizationFixture(t, server, framework.WithRootShard())
+	_, ws2 := framework.NewOrganizationFixture(t, server, framework.WithRootShard())
 	logicalClusters := []logicalcluster.Name{
-		framework.NewOrganizationFixture(t, server, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"})),
-		framework.NewOrganizationFixture(t, server, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"})),
+		logicalcluster.Name(ws1.Spec.Cluster),
+		logicalcluster.Name(ws2.Spec.Cluster),
 	}
-	expectedWorkspaces := sets.NewString()
-	for i, lcluster := range logicalClusters {
-		wsName := fmt.Sprintf("ws-%d", i)
-
-		clustername := lcluster
-		t.Logf("Creating ClusterWorkspace CRs in logical cluster %s", lcluster)
-		sourceWorkspace := &tenancyv1alpha1.ClusterWorkspace{
+	expectedWorkspaces := sets.New[string]()
+	for i, clusterName := range logicalClusters {
+		t.Logf("Creating Workspace CRs in logical cluster %s", clusterName)
+		sourceWorkspace := &tenancyv1alpha1.Workspace{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: wsName,
+				Name: fmt.Sprintf("ws-%d", i),
 			},
 		}
-		_, err = kcpClusterClient.TenancyV1alpha1().ClusterWorkspaces().Create(logicalcluster.WithCluster(ctx, lcluster), sourceWorkspace, metav1.CreateOptions{})
+		ws, err := kcpClusterClient.Cluster(clusterName.Path()).TenancyV1alpha1().Workspaces().Create(ctx, sourceWorkspace, metav1.CreateOptions{})
 		require.NoError(t, err, "error creating source workspace")
 
-		expectedWorkspaces.Insert(lcluster.Join(wsName).String())
+		expectedWorkspaces.Insert(logicalcluster.From(ws).String())
 		server.Artifact(t, func() (runtime.Object, error) {
-			obj, err := kcpClusterClient.TenancyV1alpha1().ClusterWorkspaces().Get(logicalcluster.WithCluster(ctx, clustername), sourceWorkspace.Name, metav1.GetOptions{})
+			obj, err := kcpClusterClient.Cluster(clusterName.Path()).TenancyV1alpha1().Workspaces().Get(ctx, sourceWorkspace.Name, metav1.GetOptions{})
 			return obj, err
 		})
 	}
 
-	t.Logf("Listing ClusterWorkspace CRs across logical clusters with identity")
-	tenancyExport, err := kcpClusterClient.ApisV1alpha1().APIExports().Get(logicalcluster.WithCluster(ctx, tenancyv1alpha1.RootCluster), "tenancy.kcp.dev", metav1.GetOptions{})
+	t.Log("Listing Workspace CRs across logical clusters with identity")
+	tenancyExport, err := kcpClusterClient.ApisV1alpha1().APIExports().Cluster(core.RootCluster.Path()).Get(ctx, "tenancy.kcp.io", metav1.GetOptions{})
 	require.NoError(t, err, "error getting tenancy API export")
 	require.NotEmptyf(t, tenancyExport.Status.IdentityHash, "tenancy API export has no identity hash")
-	dynamicClusterClient, err := kcpdynamic.NewClusterDynamicClientForConfig(rootShardCfg)
+	dynamicClusterClient, err := kcpdynamic.NewForConfig(rootShardCfg)
 	require.NoError(t, err, "failed to construct kcp client for server")
-	client := dynamicClusterClient.Cluster(logicalcluster.Wildcard).Resource(tenancyv1alpha1.SchemeGroupVersion.WithResource(fmt.Sprintf("clusterworkspaces:%s", tenancyExport.Status.IdentityHash)))
+	client := dynamicClusterClient.Resource(tenancyv1alpha1.SchemeGroupVersion.WithResource(fmt.Sprintf("workspaces:%s", tenancyExport.Status.IdentityHash)))
 	workspaces, err := client.List(ctx, metav1.ListOptions{})
 	require.NoError(t, err, "error listing workspaces")
-
-	got := sets.NewString()
+	got := sets.New[string]()
 	for _, ws := range workspaces.Items {
-		got.Insert(logicalcluster.From(&ws).Join(ws.GetName()).String())
+		got.Insert(logicalcluster.From(&ws).String())
 	}
-	require.True(t, got.IsSuperset(expectedWorkspaces), "unexpected workspaces detected")
+	require.True(t, got.IsSuperset(expectedWorkspaces), "unexpected workspaces detected, got: %v, expected: %v", sets.List[string](got), sets.List[string](expectedWorkspaces))
 }
 
 func bootstrapCRD(
 	t *testing.T,
-	clusterName logicalcluster.Name,
-	clusterClient apiextensionsv1client.CustomResourceDefinitionInterface,
+	clusterName logicalcluster.Path,
+	clusterClient kcpapiextensionsv1client.CustomResourceDefinitionClusterInterface,
 	crd *apiextensionsv1.CustomResourceDefinition,
 ) {
-	ctx, cancelFunc := context.WithTimeout(logicalcluster.WithCluster(context.Background(), clusterName), wait.ForeverTestTimeout)
+	t.Helper()
+
+	ctx, cancelFunc := context.WithTimeout(context.Background(), wait.ForeverTestTimeout)
 	t.Cleanup(cancelFunc)
 
-	err := configcrds.CreateSingle(ctx, clusterClient, crd)
+	err := configcrds.CreateSingle(ctx, clusterClient.Cluster(clusterName), crd)
 	require.NoError(t, err, "error bootstrapping CRD %s in cluster %s", crd.Name, clusterName)
 }
 
-// ensure PartialObjectMetadata wildcard list works even with different CRD schemas
+// ensure PartialObjectMetadata wildcard list works even with different CRD schemas.
 func TestCRDCrossLogicalClusterListPartialObjectMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -128,40 +131,40 @@ func TestCRDCrossLogicalClusterListPartialObjectMetadata(t *testing.T) {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	t.Cleanup(cancelFunc)
 
-	org := framework.NewOrganizationFixture(t, server)
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
 
 	// Note: we put all consumer workspaces onto root shard in order to enforce conflicts.
 
 	// These 2 workspaces will have the same sheriffs CRD schema as normal CRDs
-	wsNormalCRD1a := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
-	wsNormalCRD1b := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
+	wsNormalCRD1a, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
+	wsNormalCRD1b, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
 
 	// This workspace will have a different sherrifs CRD schema as a normal CRD - will conflict with 1a/1b.
-	wsNormalCRD2 := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
+	wsNormalCRD2, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
 
 	// These 2 workspaces will export a sheriffs API with the same schema
-	wsExport1a := framework.NewWorkspaceFixture(t, server, org)
-	wsExport1b := framework.NewWorkspaceFixture(t, server, org)
+	wsExport1a, _ := framework.NewWorkspaceFixture(t, server, orgPath)
+	wsExport1b, _ := framework.NewWorkspaceFixture(t, server, orgPath)
 
 	// This workspace will export a sheriffs API with a different schema
-	wsExport2 := framework.NewWorkspaceFixture(t, server, org)
+	wsExport2, _ := framework.NewWorkspaceFixture(t, server, orgPath)
 
 	// This workspace will consume from wsExport1a
-	wsConsume1a := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
+	wsConsume1a, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
 
 	// This workspace will consume from wsExport1b
-	wsConsume1b := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
+	wsConsume1b, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
 
 	// This workspace will consume from wsExport2
-	wsConsume2 := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
+	wsConsume2, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
 
 	cfg := server.BaseConfig(t)
 	rootShardConfig := server.RootShardSystemMasterBaseConfig(t)
 
-	crdClusterClient, err := apiextensionsclient.NewForConfig(cfg)
+	crdClusterClient, err := kcpapiextensionsclientset.NewForConfig(cfg)
 	require.NoError(t, err, "failed to construct apiextensions client for server")
 
-	dynamicClusterClient, err := kcpdynamic.NewClusterDynamicClientForConfig(cfg)
+	dynamicClusterClient, err := kcpdynamic.NewForConfig(cfg)
 	require.NoError(t, err, "failed to construct dynamic client for server")
 
 	kcpClusterClient, err := kcpclientset.NewForConfig(cfg)
@@ -181,11 +184,11 @@ func TestCRDCrossLogicalClusterListPartialObjectMetadata(t *testing.T) {
 	bootstrapCRD(t, wsNormalCRD1b, crdClusterClient.ApiextensionsV1().CustomResourceDefinitions(), sheriffCRD1)
 
 	t.Logf("Create a root shard client that is able to do wildcard requests")
-	rootShardDynamicClients, err := kcpdynamic.NewClusterDynamicClientForConfig(rootShardConfig)
+	rootShardDynamicClients, err := kcpdynamic.NewForConfig(rootShardConfig)
 	require.NoError(t, err)
 
 	t.Logf("Trying to wildcard list without identity. It should fail.")
-	_, err = rootShardDynamicClients.Cluster(logicalcluster.Wildcard).Resource(sheriffsGVR).List(ctx, metav1.ListOptions{})
+	_, err = rootShardDynamicClients.Resource(sheriffsGVR).List(ctx, metav1.ListOptions{})
 	require.Error(t, err, "expected wildcard list to fail because CRD have no identity cross-workspace")
 
 	t.Logf("Install a different sheriffs CRD into workspace %q", wsNormalCRD2)
@@ -209,22 +212,30 @@ func TestCRDCrossLogicalClusterListPartialObjectMetadata(t *testing.T) {
 	t.Logf("Trying to wildcard list with PartialObjectMetadata content-type and it should work")
 	rootShardMetadataClusterClient, err := metadataclient.NewDynamicMetadataClusterClientForConfig(rootShardConfig)
 	require.NoError(t, err, "failed to construct dynamic client for server")
-	_, err = rootShardMetadataClusterClient.Cluster(logicalcluster.Wildcard).Resource(sheriffsGVR).List(ctx, metav1.ListOptions{})
+	_, err = rootShardMetadataClusterClient.Resource(sheriffsGVR).List(ctx, metav1.ListOptions{})
 	require.NoError(t, err, "expected wildcard list to work with metadata client even though schemas are different")
 
-	rootShardCRDClusterClient, err := apiextensionsclient.NewClusterForConfig(rootShardConfig)
+	rootShardCRDClusterClient, err := kcpapiextensionsclientset.NewForConfig(rootShardConfig)
 	require.NoError(t, err, "error creating root shard crd client")
 
-	apiExtensionsInformerFactory := apiextensionsexternalversions.NewSharedInformerFactoryWithOptions(
-		rootShardCRDClusterClient.Cluster(logicalcluster.Wildcard),
+	apiExtensionsInformerFactory := kcpapiextensionsinformers.NewSharedInformerFactoryWithOptions(
+		rootShardCRDClusterClient,
 		0,
 	)
 
-	informerFactory, err := informer.NewDynamicDiscoverySharedInformerFactory(
-		rootShardConfig,
+	metadataClusterClient, err := metadataclient.NewDynamicMetadataClusterClientForConfig(
+		rest.AddUserAgent(rest.CopyConfig(rootShardConfig), "kcp-partial-metadata-informers"))
+	require.NoError(t, err, "error creating metadata cluster client")
+
+	crdGVRSource, err := informer.NewCRDGVRSource(apiExtensionsInformerFactory.Apiextensions().V1().CustomResourceDefinitions().Informer())
+	require.NoError(t, err, "error creating CRD-based GVR source")
+
+	informerFactory, err := informer.NewDiscoveringDynamicSharedInformerFactory(
+		metadataClusterClient,
 		func(obj interface{}) bool { return true },
-		apiExtensionsInformerFactory.Apiextensions().V1().CustomResourceDefinitions(),
-		indexers.NamespaceScoped(),
+		nil,
+		crdGVRSource,
+		cache.Indexers{},
 	)
 	require.NoError(t, err, "error creating DynamicDiscoverySharedInformerFactory")
 
@@ -240,17 +251,17 @@ func TestCRDCrossLogicalClusterListPartialObjectMetadata(t *testing.T) {
 	go informerFactory.StartWorker(ctx)
 
 	t.Logf("Wait for the sheriff to show up in the informer")
-	// key := "default/" + clusters.ToClusterAwareKey(wsNormalCRD1a, "john-hicks-adams")
+	// key := "default/" + client.ToClusterAwareKey(wsNormalCRD1a, "john-hicks-adams")
 	require.Eventually(t, func() bool {
-		listers, _ := informerFactory.Listers()
+		informers, _ := informerFactory.Informers()
 
-		lister := listers[sheriffsGVR]
-		if lister == nil {
+		informer := informers[sheriffsGVR]
+		if informer == nil {
 			t.Logf("Waiting for sheriffs to show up in dynamic informer")
 			return false
 		}
 
-		l, err := lister.List(labels.Everything())
+		l, err := informer.Lister().List(labels.Everything())
 		if err != nil {
 			t.Logf("Error listing sheriffs: %v", err)
 			return false
@@ -268,16 +279,16 @@ func TestBuiltInCrossLogicalClusterListPartialObjectMetadata(t *testing.T) {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	t.Cleanup(cancelFunc)
 
-	org := framework.NewOrganizationFixture(t, server)
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
 
 	cfg := server.BaseConfig(t)
 	rootShardCfg := server.RootShardSystemMasterBaseConfig(t)
 
-	kubeClusterClient, err := kubernetes.NewForConfig(cfg)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(cfg)
 	require.NoError(t, err, "error creating kube cluster client")
 
 	for i := 0; i < 3; i++ {
-		ws := framework.NewWorkspaceFixture(t, server, org, framework.WithShardConstraints(tenancyv1alpha1.ShardConstraints{Name: "root"}))
+		wsPath, _ := framework.NewWorkspaceFixture(t, server, orgPath, framework.WithRootShard())
 
 		configMapName := fmt.Sprintf("test-cm-%d", i)
 		configMap := &corev1.ConfigMap{
@@ -286,8 +297,8 @@ func TestBuiltInCrossLogicalClusterListPartialObjectMetadata(t *testing.T) {
 			},
 		}
 
-		t.Logf("Creating configmap %s|default/%s", ws, configMapName)
-		_, err = kubeClusterClient.CoreV1().ConfigMaps("default").Create(logicalcluster.WithCluster(ctx, ws), configMap, metav1.CreateOptions{})
+		t.Logf("Creating configmap %s|default/%s", wsPath, configMapName)
+		_, err = kubeClusterClient.Cluster(wsPath).CoreV1().ConfigMaps("default").Create(ctx, configMap, metav1.CreateOptions{})
 		require.NoError(t, err, "error creating configmap %s", configMapName)
 	}
 
@@ -296,15 +307,15 @@ func TestBuiltInCrossLogicalClusterListPartialObjectMetadata(t *testing.T) {
 	t.Logf("Trying to wildcard list with PartialObjectMetadata content-type and it should work")
 	metadataClusterClient, err := metadataclient.NewDynamicMetadataClusterClientForConfig(rootShardCfg)
 	require.NoError(t, err, "failed to construct dynamic client for server")
-	list, err := metadataClusterClient.Cluster(logicalcluster.Wildcard).Resource(configMapGVR).List(ctx, metav1.ListOptions{})
+	list, err := metadataClusterClient.Resource(configMapGVR).List(ctx, metav1.ListOptions{})
 	require.NoError(t, err, "expected wildcard list to work")
 
-	names := sets.NewString()
+	names := sets.New[string]()
 	for i := range list.Items {
 		names.Insert(list.Items[i].GetName())
 	}
 
 	expected := []string{"test-cm-0", "test-cm-1", "test-cm-2"}
 
-	require.Subset(t, names.List(), expected)
+	require.Subset(t, sets.List[string](names), expected)
 }

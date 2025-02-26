@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/kcp-dev/logicalcluster/v3"
+
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,25 +30,26 @@ import (
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/initializer"
 	"k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle"
+	"k8s.io/apiserver/pkg/clientsethack"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	kubernetesinformers "k8s.io/client-go/informers"
+	"k8s.io/apiserver/pkg/informerfactoryhack"
+	"k8s.io/client-go/informers"
 	kubernetesclient "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clusters"
 
 	kcpinitializers "github.com/kcp-dev/kcp/pkg/admission/initializers"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
-	tenancylisters "github.com/kcp-dev/kcp/pkg/client/listers/tenancy/v1alpha1"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 const (
-	// PluginName indicates the name of admission plug-in
+	// PluginName indicates the name of admission plug-in.
 	PluginName = "WorkspaceNamespaceLifecycle"
 )
 
-// Register registers a plugin
+// Register registers a plugin.
 func Register(plugins *admission.Plugins) {
 	plugins.Register(PluginName, func(config io.Reader) (admission.Interface, error) {
-		return newLifcycle()
+		return newWorkspaceNamespaceLifecycle()
 	})
 }
 
@@ -55,17 +58,18 @@ func Register(plugins *admission.Plugins) {
 // immortal namespaces when the workspaces is deleting. This can ensure we can remove all immortal
 // namespaces when workspaces is deleting.
 type workspaceNamespaceLifecycle struct {
+	*admission.Handler
+
 	// legacyNamespaceLifecycle is the kube legacy namespace lifecycle
 	legacyNamespaceLifecycle *lifecycle.Lifecycle
 
 	// namespaceLifecycle is used only when workspace is deleting
 	namespaceLifecycle *lifecycle.Lifecycle
 
-	*admission.Handler
-	workspaceLister tenancylisters.ClusterWorkspaceLister
+	getLogicalCluster func(clusterName logicalcluster.Name) (*corev1alpha1.LogicalCluster, error)
 }
 
-func newLifcycle() (*workspaceNamespaceLifecycle, error) {
+func newWorkspaceNamespaceLifecycle() (*workspaceNamespaceLifecycle, error) {
 	legacyLifecycle, err := lifecycle.NewLifecycle(sets.NewString(metav1.NamespaceDefault, metav1.NamespaceSystem, metav1.NamespacePublic))
 	if err != nil {
 		return nil, err
@@ -87,9 +91,8 @@ var _ = kcpinitializers.WantsKcpInformers(&workspaceNamespaceLifecycle{})
 var _ = initializer.WantsExternalKubeInformerFactory(&workspaceNamespaceLifecycle{})
 var _ = initializer.WantsExternalKubeClientSet(&workspaceNamespaceLifecycle{})
 
-// Admit makes an admission decision based on the request attributes
+// Admit makes an admission decision based on the request attributes.
 func (l *workspaceNamespaceLifecycle) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
-
 	// call legacy namespace lifecycle at first
 	admissionErr := l.legacyNamespaceLifecycle.Admit(ctx, a, o)
 
@@ -109,21 +112,14 @@ func (l *workspaceNamespaceLifecycle) Admit(ctx context.Context, a admission.Att
 		return apierrors.NewInternalError(err)
 	}
 
-	org, hasParent := clusterName.Parent()
-	if !hasParent {
-		return admissionErr
-	}
-
-	workspaceKey := clusters.ToClusterAwareKey(org, clusterName.Base())
-
-	workspace, err := l.workspaceLister.Get(workspaceKey)
+	logicalCluster, err := l.getLogicalCluster(clusterName)
 	// The shard hosting the workspace could be down,
 	// just return error from legacy namespace lifecycle admission in this case
 	if err != nil && !apierrors.IsNotFound(err) {
 		return admissionErr
 	}
 
-	if workspace.DeletionTimestamp.IsZero() {
+	if logicalCluster.DeletionTimestamp.IsZero() {
 		return admissionErr
 	}
 
@@ -131,20 +127,23 @@ func (l *workspaceNamespaceLifecycle) Admit(ctx context.Context, a admission.Att
 }
 
 // SetExternalKubeInformerFactory implements the WantsExternalKubeInformerFactory interface.
-func (l *workspaceNamespaceLifecycle) SetExternalKubeInformerFactory(f kubernetesinformers.SharedInformerFactory) {
-	l.legacyNamespaceLifecycle.SetExternalKubeInformerFactory(f)
-	l.namespaceLifecycle.SetExternalKubeInformerFactory(f)
+func (l *workspaceNamespaceLifecycle) SetExternalKubeInformerFactory(f informers.SharedInformerFactory) {
+	l.legacyNamespaceLifecycle.SetExternalKubeInformerFactory(informerfactoryhack.Unwrap(f))
+	l.namespaceLifecycle.SetExternalKubeInformerFactory(informerfactoryhack.Unwrap(f))
 }
 
 // SetExternalKubeClientSet implements the WantsExternalKubeClientSet interface.
 func (l *workspaceNamespaceLifecycle) SetExternalKubeClientSet(client kubernetesclient.Interface) {
-	l.legacyNamespaceLifecycle.SetExternalKubeClientSet(client)
-	l.namespaceLifecycle.SetExternalKubeClientSet(client)
+	l.legacyNamespaceLifecycle.SetExternalKubeClientSet(clientsethack.Unwrap(client))
+	l.namespaceLifecycle.SetExternalKubeClientSet(clientsethack.Unwrap(client))
 }
 
-func (l *workspaceNamespaceLifecycle) SetKcpInformers(informers kcpinformers.SharedInformerFactory) {
-	l.SetReadyFunc(informers.Tenancy().V1alpha1().ClusterWorkspaces().Informer().HasSynced)
-	l.workspaceLister = informers.Tenancy().V1alpha1().ClusterWorkspaces().Lister()
+func (l *workspaceNamespaceLifecycle) SetKcpInformers(local, global kcpinformers.SharedInformerFactory) {
+	l.SetReadyFunc(local.Tenancy().V1alpha1().Workspaces().Informer().HasSynced)
+
+	l.getLogicalCluster = func(clusterName logicalcluster.Name) (*corev1alpha1.LogicalCluster, error) {
+		return local.Core().V1alpha1().LogicalClusters().Lister().Cluster(clusterName).Get(corev1alpha1.LogicalClusterName)
+	}
 }
 
 // ValidateInitialization implements the InitializationValidator interface.
@@ -157,8 +156,8 @@ func (l *workspaceNamespaceLifecycle) ValidateInitialization() error {
 		return err
 	}
 
-	if l.workspaceLister == nil {
-		return fmt.Errorf("missing workspaceLister")
+	if l.getLogicalCluster == nil {
+		return fmt.Errorf("missing getLogicalCluster")
 	}
 	return nil
 }

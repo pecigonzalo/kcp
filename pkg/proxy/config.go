@@ -19,13 +19,15 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	proxyoptions "github.com/kcp-dev/kcp/pkg/proxy/options"
-	bootstrap "github.com/kcp-dev/kcp/pkg/server/bootstrap"
+	"github.com/kcp-dev/kcp/pkg/server/bootstrap"
 )
 
 type Config struct {
@@ -41,14 +43,16 @@ type completedConfig struct {
 }
 
 type ExtraConfig struct {
-	// resolveIdenties is to be called on server start until it succeeds. It injects the kcp
+	// resolveIdentities is to be called on server start until it succeeds. It injects the kcp
 	// resource identities into the rest.Config used by the client. Only after it succeeds,
 	// the clients can wildcard-list/watch most kcp resources.
 	ResolveIdentities func(ctx context.Context) error
 	RootShardConfig   *rest.Config
+	ShardsConfig      *rest.Config
 
-	AuthenticationInfo genericapiserver.AuthenticationInfo
-	ServingInfo        *genericapiserver.SecureServingInfo
+	AuthenticationInfo    genericapiserver.AuthenticationInfo
+	ServingInfo           *genericapiserver.SecureServingInfo
+	AdditionalAuthEnabled bool
 }
 
 type CompletedConfig struct {
@@ -64,18 +68,10 @@ func (c *Config) Complete() (CompletedConfig, error) {
 	}}, nil
 }
 
-// NewConfig returns a new Config for the given options
-func NewConfig(opts *proxyoptions.Options) (*Config, error) {
+// NewConfig returns a new Config for the given options.
+func NewConfig(ctx context.Context, opts *proxyoptions.Options) (*Config, error) {
 	c := &Config{
 		Options: opts,
-	}
-
-	var loopbackClientConfig *rest.Config
-	if err := c.Options.SecureServing.ApplyTo(&c.ServingInfo, &loopbackClientConfig); err != nil {
-		return nil, err
-	}
-	if err := c.Options.Authentication.ApplyTo(&c.AuthenticationInfo, c.ServingInfo); err != nil {
-		return nil, err
 	}
 
 	// get root API identities
@@ -84,7 +80,30 @@ func NewConfig(opts *proxyoptions.Options) (*Config, error) {
 		return nil, fmt.Errorf("failed to load root kubeconfig: %w", err)
 	}
 
-	c.RootShardConfig, c.ResolveIdentities = bootstrap.NewConfigWithWildcardIdentities(nonIdentityRootConfig, bootstrap.KcpRootGroupExportNames, bootstrap.KcpRootGroupResourceExportNames, nil)
+	var kcpShardIdentityRoundTripper func(rt http.RoundTripper) http.RoundTripper
+	kcpShardIdentityRoundTripper, c.ResolveIdentities = bootstrap.NewWildcardIdentitiesWrappingRoundTripper(bootstrap.KcpRootGroupExportNames, bootstrap.KcpRootGroupResourceExportNames, nonIdentityRootConfig, nil)
+	c.RootShardConfig = rest.CopyConfig(nonIdentityRootConfig)
+	c.RootShardConfig.Wrap(kcpShardIdentityRoundTripper)
+
+	var loopbackClientConfig *rest.Config
+	if err := c.Options.SecureServing.ApplyTo(&c.ServingInfo, &loopbackClientConfig); err != nil {
+		return nil, err
+	}
+	if err := c.Options.Authentication.ApplyTo(ctx, &c.AuthenticationInfo, c.ServingInfo, c.RootShardConfig); err != nil {
+		return nil, err
+	}
+
+	c.ShardsConfig, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		&clientcmd.ClientConfigLoadingRules{ExplicitPath: c.Options.ShardsKubeconfig},
+		// We override the Server here so that the user doesn't have to specify unused server value
+		// The Server must have HTTPS scheme otherwise CA won't be loaded (see IsConfigTransportTLS method)
+		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{Server: "https://kcp.io/fake"}}).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load shard kubeconfig: %w", err)
+	}
+	c.ShardsConfig.Wrap(kcpShardIdentityRoundTripper)
+
+	c.AdditionalAuthEnabled = c.Options.Authentication.AdditionalAuthEnabled()
 
 	return c, nil
 }

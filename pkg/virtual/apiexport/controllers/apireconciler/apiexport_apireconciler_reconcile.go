@@ -21,41 +21,29 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
-	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
-	certificatesv1 "k8s.io/api/certificates/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
-	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
-	flowcontrolv1beta1 "k8s.io/api/flowcontrol/v1beta1"
-	flowcontrolv1beta2 "k8s.io/api/flowcontrol/v1beta2"
-	rbacv1 "k8s.io/api/rbac/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/clusters"
 	"k8s.io/klog/v2"
-	"k8s.io/kube-openapi/pkg/common"
-	"k8s.io/kubernetes/pkg/api/genericcontrolplanescheme"
-	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
 
-	"github.com/kcp-dev/kcp/pkg/apis/apis"
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1/permissionclaims"
 	"github.com/kcp-dev/kcp/pkg/indexers"
+	"github.com/kcp-dev/kcp/pkg/logging"
 	"github.com/kcp-dev/kcp/pkg/virtual/apiexport/schemas"
+	apiexportbuiltin "github.com/kcp-dev/kcp/pkg/virtual/apiexport/schemas/builtin"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/apidefinition"
 	dynamiccontext "github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/context"
-	"github.com/kcp-dev/kcp/pkg/virtual/framework/internalapis"
+	"github.com/kcp-dev/kcp/sdk/apis/apis"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1/permissionclaims"
 )
 
 func (c *APIReconciler) reconcile(ctx context.Context, apiExport *apisv1alpha1.APIExport, apiDomainKey dynamiccontext.APIDomainKey) error {
 	logger := klog.FromContext(ctx)
+	ctx = klog.NewContext(ctx, logger)
 
 	if apiExport == nil || apiExport.Status.IdentityHash == "" {
 		c.mutex.RLock()
@@ -80,7 +68,7 @@ func (c *APIReconciler) reconcile(ctx context.Context, apiExport *apisv1alpha1.A
 	c.mutex.RUnlock()
 
 	// Get schemas and identities for base api export.
-	apiResourceSchemas, err := c.getSchemasFromAPIExport(apiExport)
+	apiResourceSchemas, err := c.getSchemasFromAPIExport(ctx, apiExport)
 	if err != nil {
 		return err
 	}
@@ -92,23 +80,30 @@ func (c *APIReconciler) reconcile(ctx context.Context, apiExport *apisv1alpha1.A
 	clusterName := logicalcluster.From(apiExport)
 
 	// Find schemas for claimed resources
-	claims := map[schema.GroupResource]*apisv1alpha1.PermissionClaim{}
-	for i := range apiExport.Spec.PermissionClaims {
-		pc := &apiExport.Spec.PermissionClaims[i]
+	claims := map[schema.GroupResource]apisv1alpha1.PermissionClaim{}
+	claimsAPIBindings := false
+	for _, pc := range apiExport.Spec.PermissionClaims {
+		logger := logger.WithValues("claim", pc.String())
+		logger.V(4).Info("evaluating claim")
 
 		// APIExport resources have priority over claimed resources
 		gr := schema.GroupResource{Group: pc.Group, Resource: pc.Resource}
 		if _, found := apiResourceSchemas[gr]; found {
 			if otherClaim, found := claims[gr]; found {
 				logger.Info("permission claim is shadowed by another claim", "claim", pc, "otherClaim", otherClaim)
-			} else {
-				logger.Info("permission claim is shadowed by exported resource", "claim", pc)
+				continue
 			}
+
+			logger.Info("permission claim is shadowed by exported resource", "claim", pc)
 			continue
 		}
 
 		// internal APIs have no identity and a fixed schema.
-		if internal, internalSchema := isPermissionClaimForInternalAPI(pc); internal {
+		if apiexportbuiltin.IsBuiltInAPI(pc.GroupResource) {
+			internalSchema, err := apiexportbuiltin.GetBuiltInAPISchema(pc.GroupResource)
+			if err != nil {
+				return err
+			}
 			shallow := *internalSchema
 			if shallow.Annotations == nil {
 				shallow.Annotations = make(map[string]string)
@@ -117,25 +112,38 @@ func (c *APIReconciler) reconcile(ctx context.Context, apiExport *apisv1alpha1.A
 			apiResourceSchemas[gr] = &shallow
 			claims[gr] = pc
 			continue
-		} else if pc.GroupResource.Group == apis.GroupName {
-			apisSchema, found := schemas.ApisKcpDevSchemas[pc.GroupResource.Resource]
+		}
+		if pc.Group == apis.GroupName {
+			apisSchema, found := schemas.ApisKcpDevSchemas[pc.Resource]
 			if !found {
 				logger.Info("permission claim is for an unknown resource", "claim", pc)
 				continue
 			}
+
+			if pc.Resource == "apibindings" {
+				claimsAPIBindings = true
+			}
+
 			apiResourceSchemas[gr] = apisSchema
 			claims[gr] = pc
 			continue
-		} else if pc.IdentityHash == "" {
-			// TODO: add validation through admission to avoid this case
+		}
+		if pc.IdentityHash == "" {
+			// NOTE(hasheddan): this is checked by admission so we should never
+			// hit this case.
 			logger.Info("permission claim is not internal and does not have an identity hash", "claim", pc)
 			continue
 		}
 
+		logger = logger.WithValues("identity", pc.IdentityHash)
+
+		logger.V(4).Info("getting APIExports by identity")
 		exports, err := c.apiExportIndexer.ByIndex(indexers.APIExportByIdentity, pc.IdentityHash)
 		if err != nil {
 			return err
 		}
+
+		logger.V(4).Info("got APIExports", "count", len(exports))
 
 		// there might be multiple exports with the same identity hash all exporting the same GR.
 		// This is fine. Same identity means same owner. They have to ensure the schemas are compatible.
@@ -149,14 +157,22 @@ func (c *APIReconciler) reconcile(ctx context.Context, apiExport *apisv1alpha1.A
 
 		for _, obj := range exports {
 			export := obj.(*apisv1alpha1.APIExport)
-			candidates, err := c.getSchemasFromAPIExport(export)
+			logger := logger.WithValues(logging.FromPrefix("candidateAPIExport", export)...)
+			logger.V(4).Info("getting APIResourceSchemas for candidate APIExport")
+			candidates, err := c.getSchemasFromAPIExport(ctx, export)
 			if err != nil {
 				return err
 			}
+			logger.V(4).Info("got APIResourceSchemas for candidate APIExport", "count", len(candidates))
 			for _, apiResourceSchema := range candidates {
+				logger := logger.WithValues(logging.FromPrefix("candidateAPIResourceSchema", apiResourceSchema)...)
+				logger = logger.WithValues("candidateGroup", apiResourceSchema.Spec.Group, "candidateResource", apiResourceSchema.Spec.Names.Plural)
+				logger.V(4).Info("evaluating candidate APIResourceSchema")
 				if apiResourceSchema.Spec.Group != pc.Group || apiResourceSchema.Spec.Names.Plural != pc.Resource {
+					logger.V(4).Info("not a match")
 					continue
 				}
+				logger.V(4).Info("got a match!")
 				apiResourceSchemas[gr] = apiResourceSchema
 				identities[gr] = pc.IdentityHash
 				claims[gr] = pc
@@ -192,10 +208,10 @@ func (c *APIReconciler) reconcile(ctx context.Context, apiExport *apisv1alpha1.A
 			}
 
 			var labelReqs labels.Requirements
-			if c := claims[gvr.GroupResource()]; c != nil {
-				key, label, err := permissionclaims.ToLabelKeyAndValue(clusterName, apiExport.Name, *c)
+			if c, ok := claims[gvr.GroupResource()]; ok {
+				key, label, err := permissionclaims.ToLabelKeyAndValue(clusterName, apiExport.Name, c)
 				if err != nil {
-					return fmt.Errorf(fmt.Sprintf("failed to convert permission claim %v to label key and value: %v", c, err))
+					return fmt.Errorf("failed to convert permission claim %v to label key and value: %w", c, err)
 				}
 				claimLabels := []string{label}
 				if gvr.GroupResource() == apisv1alpha1.Resource("apibindings") {
@@ -204,7 +220,7 @@ func (c *APIReconciler) reconcile(ctx context.Context, apiExport *apisv1alpha1.A
 				}
 				req, err := labels.NewRequirement(key, selection.In, claimLabels)
 				if err != nil {
-					return fmt.Errorf(fmt.Sprintf("failed to create label requirement for permission claim %v: %v", c, err))
+					return fmt.Errorf("failed to create label requirement for permission claim %v: %w", c, err)
 				}
 				labelReqs = labels.Requirements{*req}
 			}
@@ -223,6 +239,24 @@ func (c *APIReconciler) reconcile(ctx context.Context, apiExport *apisv1alpha1.A
 				IdentityHash:  apiExport.Status.IdentityHash,
 			}
 			newGVRs = append(newGVRs, gvrString(gvr))
+		}
+	}
+
+	// always serve apibindings, either through a claim, or with this fallback
+	if !claimsAPIBindings {
+		d, err := c.createAPIBindingAPIDefinition(ctx, clusterName, apiExport.Name)
+		if err != nil {
+			// TODO(ncdc): would be nice to expose some sort of user-visible error
+			logger.Error(err, "error creating api definition for apibindings")
+		}
+
+		gvr := apisv1alpha1.SchemeGroupVersion.WithResource("apibindings")
+		newSet[gvr] = apiResourceSchemaApiDefinition{
+			APIDefinition: d,
+		}
+		newGVRs = append(newGVRs, gvrString(gvr))
+		if _, ok := oldSet[gvr]; ok {
+			preservedGVR = append(preservedGVR, gvrString(gvr))
 		}
 	}
 
@@ -259,254 +293,25 @@ func gvrString(gvr schema.GroupVersionResource) string {
 	return fmt.Sprintf("%s.%s.%s", gvr.Resource, gvr.Version, group)
 }
 
-func (c *APIReconciler) getSchemasFromAPIExport(apiExport *apisv1alpha1.APIExport) (map[schema.GroupResource]*apisv1alpha1.APIResourceSchema, error) {
+func (c *APIReconciler) getSchemasFromAPIExport(ctx context.Context, apiExport *apisv1alpha1.APIExport) (map[schema.GroupResource]*apisv1alpha1.APIResourceSchema, error) {
+	logger := klog.FromContext(ctx)
 	apiResourceSchemas := map[schema.GroupResource]*apisv1alpha1.APIResourceSchema{}
 	for _, schemaName := range apiExport.Spec.LatestResourceSchemas {
-		apiResourceSchema, err := c.apiResourceSchemaLister.Get(clusters.ToClusterAwareKey(logicalcluster.From(apiExport), schemaName))
+		apiExportClusterName := logicalcluster.From(apiExport)
+		apiResourceSchema, err := c.apiResourceSchemaLister.Cluster(apiExportClusterName).Get(schemaName)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return nil, err
 		}
 		if apierrors.IsNotFound(err) {
-			klog.V(3).Infof("APIResourceSchema %s in APIExport %s|% not found", schemaName, apiExport.Namespace, apiExport.Name)
+			logger.WithValues(
+				"schema", schemaName,
+				"exportClusterName", apiExportClusterName,
+				"exportName", apiExport.Name,
+			).V(3).Info("APIResourceSchema for APIExport not found")
 			continue
 		}
 		apiResourceSchemas[schema.GroupResource{Group: apiResourceSchema.Spec.Group, Resource: apiResourceSchema.Spec.Names.Plural}] = apiResourceSchema
 	}
 
 	return apiResourceSchemas, nil
-}
-
-func isPermissionClaimForInternalAPI(claim *apisv1alpha1.PermissionClaim) (bool, *apisv1alpha1.APIResourceSchema) {
-	for _, schema := range internalAPIResourceSchemas {
-		if claim.GroupResource.Group == schema.Spec.Group && claim.GroupResource.Resource == schema.Spec.Names.Plural {
-			return true, schema
-		}
-	}
-	return false, nil
-}
-
-// Create APIResourceSchemas for built-in APIs available as permission claims for APIExport virtual workspace.
-func init() {
-	schemes := []*runtime.Scheme{genericcontrolplanescheme.Scheme}
-	openAPIDefinitionsGetters := []common.GetOpenAPIDefinitions{generatedopenapi.GetOpenAPIDefinitions}
-
-	if apis, err := internalapis.CreateAPIResourceSchemas(schemes, openAPIDefinitionsGetters, InternalAPIs...); err != nil {
-		panic(err)
-	} else {
-		internalAPIResourceSchemas = apis
-	}
-}
-
-// internalAPIResourceSchemas contains a list of APIResourceSchema for built-in APIs that are
-// available to be permission-claimed for APIExport virtual workspace
-var internalAPIResourceSchemas []*apisv1alpha1.APIResourceSchema
-
-var InternalAPIs = []internalapis.InternalAPI{
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "namespaces",
-			Singular: "namespace",
-			Kind:     "Namespace",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "", Version: "v1"},
-		Instance:      &corev1.Namespace{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-		HasStatus:     true,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "configmaps",
-			Singular: "configmap",
-			Kind:     "ConfigMap",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "", Version: "v1"},
-		Instance:      &corev1.ConfigMap{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "events",
-			Singular: "event",
-			Kind:     "Event",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "", Version: "v1"},
-		Instance:      &corev1.Event{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "limitranges",
-			Singular: "limitrange",
-			Kind:     "LimitRange",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "", Version: "v1"},
-		Instance:      &corev1.LimitRange{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "resourcequotas",
-			Singular: "resourcequota",
-			Kind:     "ResourceQuota",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "", Version: "v1"},
-		Instance:      &corev1.ResourceQuota{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-		HasStatus:     true,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "secrets",
-			Singular: "secret",
-			Kind:     "Secret",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "", Version: "v1"},
-		Instance:      &corev1.Secret{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "serviceaccounts",
-			Singular: "serviceaccount",
-			Kind:     "ServiceAccount",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "", Version: "v1"},
-		Instance:      &corev1.ServiceAccount{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "clusterroles",
-			Singular: "clusterrole",
-			Kind:     "ClusterRole",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "rbac.authorization.k8s.io", Version: "v1"},
-		Instance:      &rbacv1.ClusterRole{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "clusterrolebindings",
-			Singular: "clusterrolebinding",
-			Kind:     "ClusterRoleBinding",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "rbac.authorization.k8s.io", Version: "v1"},
-		Instance:      &rbacv1.ClusterRoleBinding{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "roles",
-			Singular: "role",
-			Kind:     "Role",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "rbac.authorization.k8s.io", Version: "v1"},
-		Instance:      &rbacv1.Role{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "rolebindings",
-			Singular: "rolebinding",
-			Kind:     "RoleBinding",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "rbac.authorization.k8s.io", Version: "v1"},
-		Instance:      &rbacv1.RoleBinding{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "certificatesigningrequests",
-			Singular: "certificatesigningrequest",
-			Kind:     "CertificateSigningRequest",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "certificates.k8s.io", Version: "v1"},
-		Instance:      &certificatesv1.CertificateSigningRequest{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-		HasStatus:     true,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "leases",
-			Singular: "lease",
-			Kind:     "Lease",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "coordination.k8s.io", Version: "v1"},
-		Instance:      &coordinationv1.Lease{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "flowschemas",
-			Singular: "flowschema",
-			Kind:     "FlowSchema",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta1"},
-		Instance:      &flowcontrolv1beta1.FlowSchema{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-		HasStatus:     true,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "prioritylevelconfigurations",
-			Singular: "prioritylevelconfiguration",
-			Kind:     "PriorityLevelConfiguration",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta1"},
-		Instance:      &flowcontrolv1beta1.PriorityLevelConfiguration{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-		HasStatus:     true,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "flowschemas",
-			Singular: "flowschema",
-			Kind:     "FlowSchema",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta2"},
-		Instance:      &flowcontrolv1beta2.FlowSchema{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-		HasStatus:     true,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "prioritylevelconfigurations",
-			Singular: "prioritylevelconfiguration",
-			Kind:     "PriorityLevelConfiguration",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta2"},
-		Instance:      &flowcontrolv1beta2.PriorityLevelConfiguration{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-		HasStatus:     true,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "mutatingwebhookconfigurations",
-			Singular: "mutatingwebhookconfiguration",
-			Kind:     "MutatingWebhookConfiguration",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "admissionregistration.k8s.io", Version: "v1"},
-		Instance:      &admissionregistrationv1.MutatingWebhookConfiguration{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "validatingwebhookconfigurations",
-			Singular: "validatingwebhookconfiguration",
-			Kind:     "ValidatingWebhookConfiguration",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "admissionregistration.k8s.io", Version: "v1"},
-		Instance:      &admissionregistrationv1.ValidatingWebhookConfiguration{},
-		ResourceScope: apiextensionsv1.ClusterScoped,
-	},
-	{
-		Names: apiextensionsv1.CustomResourceDefinitionNames{
-			Plural:   "events",
-			Singular: "event",
-			Kind:     "Event",
-		},
-		GroupVersion:  schema.GroupVersion{Group: "events.k8s.io", Version: "v1"},
-		Instance:      &eventsv1.Event{},
-		ResourceScope: apiextensionsv1.NamespaceScoped,
-	},
 }

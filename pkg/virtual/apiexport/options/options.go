@@ -19,17 +19,16 @@ package options
 import (
 	"path"
 
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
 	"github.com/spf13/pflag"
 
-	kubernetesclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
 	"github.com/kcp-dev/kcp/pkg/authorization"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
 	"github.com/kcp-dev/kcp/pkg/virtual/apiexport/builder"
-	"github.com/kcp-dev/kcp/pkg/virtual/framework/client/dynamic"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/rootapiserver"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 type APIExport struct{}
@@ -56,25 +55,21 @@ func (o *APIExport) Validate(flagPrefix string) []error {
 func (o *APIExport) NewVirtualWorkspaces(
 	rootPathPrefix string,
 	config *rest.Config,
-	wildcardKcpInformers kcpinformers.SharedInformerFactory,
+	cachedKcpInformers kcpinformers.SharedInformerFactory,
 ) (workspaces []rootapiserver.NamedVirtualWorkspace, err error) {
 	config = rest.AddUserAgent(rest.CopyConfig(config), "apiexport-virtual-workspace")
-	kcpClusterClient, err := kcpclient.NewClusterForConfig(config)
+	kcpClusterClient, err := kcpclientset.NewForConfig(config)
 	if err != nil {
 		return nil, err
 	}
-	kubeClusterClient, err := kubernetesclient.NewClusterForConfig(config)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(config)
 	if err != nil {
 		return nil, err
 	}
-	dynamicClusterClient, err := dynamic.NewClusterForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	deepSARClient, err := kubernetesclient.NewClusterForConfig(authorization.WithDeepSARConfig(rest.CopyConfig(config)))
+	deepSARClient, err := kcpkubernetesclientset.NewForConfig(authorization.WithDeepSARConfig(rest.CopyConfig(config)))
 	if err != nil {
 		return nil, err
 	}
 
-	return builder.BuildVirtualWorkspace(path.Join(rootPathPrefix, builder.VirtualWorkspaceName), kubeClusterClient, deepSARClient, dynamicClusterClient, kcpClusterClient, wildcardKcpInformers)
+	return builder.BuildVirtualWorkspace(path.Join(rootPathPrefix, builder.VirtualWorkspaceName), config, kubeClusterClient, deepSARClient, kcpClusterClient, cachedKcpInformers)
 }
