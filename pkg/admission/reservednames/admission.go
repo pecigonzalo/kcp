@@ -24,11 +24,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/admission"
 
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
 )
 
 // PluginName is the name used to identify this admission webhook.
-const PluginName = "apis.kcp.dev/ReservedNames"
+const PluginName = "apis.kcp.io/ReservedNames"
 
 // Register registers the reserved name admission webhook.
 func Register(plugins *admission.Plugins) {
@@ -76,14 +76,9 @@ func NewReservedNames() *ReservedNames {
 		Handler: admission.NewHandler(admission.Create),
 		reservedNameFns: []reservedNameFn{
 			newReservedNameFn(
-				tenancyv1alpha1.Resource("clusterworkspaces"),
-				tenancyv1alpha1.Kind("ClusterWorkspace"),
-				tenancyv1alpha1.ClusterWorkspaceReservedNames()...,
-			),
-			newReservedNameFn(
-				tenancyv1alpha1.Resource("clusterworkspacetypes"),
-				tenancyv1alpha1.Kind("ClusterWorkspaceType"),
-				tenancyv1alpha1.ClusterWorkspaceTypeReservedNames()...,
+				tenancyv1alpha1.Resource("workspacetypes"),
+				tenancyv1alpha1.Kind("WorkspaceType"),
+				tenancyv1alpha1.WorkspaceTypeReservedNames()...,
 			),
 		},
 	}

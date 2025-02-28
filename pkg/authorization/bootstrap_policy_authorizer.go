@@ -20,51 +20,37 @@ import (
 	"context"
 	"fmt"
 
-	kaudit "k8s.io/apiserver/pkg/audit"
+	kcpkubernetesinformers "github.com/kcp-dev/client-go/informers"
+
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
-	kubernetesinformers "k8s.io/client-go/informers"
-	"k8s.io/kubernetes/pkg/genericcontrolplane"
+	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac"
-
-	rbacwrapper "github.com/kcp-dev/kcp/pkg/virtual/framework/wrappers/rbac"
-)
-
-const (
-	BootstrapPolicyAuditPrefix   = "bootstrap.authorization.kcp.dev/"
-	BootstrapPolicyAuditDecision = BootstrapPolicyAuditPrefix + "decision"
-	BootstrapPolicyAuditReason   = BootstrapPolicyAuditPrefix + "reason"
 )
 
 type BootstrapPolicyAuthorizer struct {
-	delegate *rbac.RBACAuthorizer
+	bootstrapPolicy *rbac.RBACAuthorizer
 }
 
-func NewBootstrapPolicyAuthorizer(informers kubernetesinformers.SharedInformerFactory) (authorizer.Authorizer, authorizer.RuleResolver) {
-	filteredInformer := rbacwrapper.FilterInformers(genericcontrolplane.LocalAdminCluster, informers.Rbac().V1())
-
-	a := &BootstrapPolicyAuthorizer{delegate: rbac.New(
-		&rbac.RoleGetter{Lister: filteredInformer.Roles().Lister()},
-		&rbac.RoleBindingLister{Lister: filteredInformer.RoleBindings().Lister()},
-		&rbac.ClusterRoleGetter{Lister: filteredInformer.ClusterRoles().Lister()},
-		&rbac.ClusterRoleBindingLister{Lister: filteredInformer.ClusterRoleBindings().Lister()},
+func NewBootstrapPolicyAuthorizer(informers kcpkubernetesinformers.SharedInformerFactory) (authorizer.Authorizer, authorizer.RuleResolver) {
+	a := &BootstrapPolicyAuthorizer{bootstrapPolicy: rbac.New(
+		&rbac.RoleGetter{Lister: informers.Rbac().V1().Roles().Lister().Cluster(controlplaneapiserver.LocalAdminCluster)},
+		&rbac.RoleBindingLister{Lister: informers.Rbac().V1().RoleBindings().Lister().Cluster(controlplaneapiserver.LocalAdminCluster)},
+		&rbac.ClusterRoleGetter{Lister: informers.Rbac().V1().ClusterRoles().Lister().Cluster(controlplaneapiserver.LocalAdminCluster)},
+		&rbac.ClusterRoleBindingLister{Lister: informers.Rbac().V1().ClusterRoleBindings().Lister().Cluster(controlplaneapiserver.LocalAdminCluster)},
 	)}
 
 	return a, a
 }
 
 func (a *BootstrapPolicyAuthorizer) Authorize(ctx context.Context, attr authorizer.Attributes) (authorized authorizer.Decision, reason string, err error) {
-	dec, reason, err := a.delegate.Authorize(ctx, attr)
-
-	kaudit.AddAuditAnnotations(
-		ctx,
-		BootstrapPolicyAuditDecision, DecisionString(dec),
-		BootstrapPolicyAuditReason, fmt.Sprintf("bootstrap policy reason: %v", reason),
-	)
-
-	return dec, reason, err
+	dec, reason, err := a.bootstrapPolicy.Authorize(ctx, attr)
+	if err != nil {
+		err = fmt.Errorf("error authorizing bootstrap policy: %w", err)
+	}
+	return dec, fmt.Sprintf("bootstrap policy: %v", reason), err
 }
 
-func (a *BootstrapPolicyAuthorizer) RulesFor(user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
-	return a.delegate.RulesFor(user, namespace)
+func (a *BootstrapPolicyAuthorizer) RulesFor(ctx context.Context, user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
+	return a.bootstrapPolicy.RulesFor(ctx, user, namespace)
 }

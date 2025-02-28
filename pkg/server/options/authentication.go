@@ -21,7 +21,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -41,10 +40,10 @@ import (
 )
 
 const (
-	// A shard admin being member of the privileged system:masters group.
+	// A shard admin being member of the privileged system group.
 	// This will bypass most kcp authorization checks.
 	shardAdminUserName = "shard-admin"
-	// A kcp admin being member of system:kcp:clusterworkspace:admin and system:kcp:clusterworkspace:access.
+	// A kcp admin being member of system:kcp:workspace:admin and system:kcp:workspace:access.
 	// This user will be subject of kcp authorization checks.
 	kcpAdminUserName = "kcp-admin"
 	// A non-admin user part of the "user" battery.
@@ -95,12 +94,12 @@ func (s *AdminAuthentication) AddFlags(fs *pflag.FlagSet) {
 // If the shard admin hash file is present only the shard admin hash is returned and the returned shard admin token is empty.
 func (s *AdminAuthentication) ApplyTo(config *genericapiserver.Config) (volatileKcpAdminToken, shardAdminToken, volatileUserToken string, shardAdminTokenHash []byte, err error) {
 	// try to load existing token to reuse
-	shardAdminTokenHash, err = ioutil.ReadFile(s.ShardAdminTokenHashFilePath)
+	shardAdminTokenHash, err = os.ReadFile(s.ShardAdminTokenHashFilePath)
 	if os.IsNotExist(err) {
 		shardAdminToken = uuid.New().String()
 		sum := sha256.Sum256([]byte(shardAdminToken))
 		shardAdminTokenHash = sum[:]
-		if err := ioutil.WriteFile(s.ShardAdminTokenHashFilePath, shardAdminTokenHash, 0600); err != nil {
+		if err := os.WriteFile(s.ShardAdminTokenHashFilePath, shardAdminTokenHash, 0600); err != nil {
 			return "", "", "", nil, err
 		}
 	}
@@ -119,8 +118,6 @@ func (s *AdminAuthentication) ApplyTo(config *genericapiserver.Config) (volatile
 		UID:  uuid.New().String(),
 		Groups: []string{
 			bootstrap.SystemKcpAdminGroup,
-			bootstrap.SystemKcpClusterWorkspaceAdminGroup,
-			bootstrap.SystemKcpClusterWorkspaceAccessGroup,
 		},
 	}
 
@@ -176,7 +173,7 @@ func (s *AdminAuthentication) WriteKubeConfig(config genericapiserver.CompletedC
 
 	// give up: either there is no new generated shard admin token or the kubeconfig file is malicious.
 	if shardAdminToken == "" {
-		return fmt.Errorf("cannot create the 'admin.kubeconfig` file with an empty token for the %s user", shardAdminUserName)
+		return fmt.Errorf("cannot create the 'admin.kubeconfig' file with an empty token for the %s user", shardAdminUserName)
 	}
 
 	externalKubeConfig := createKubeConfig(kcpAdminToken, shardAdminToken, userToken, externalKubeConfigHost, "", externalCACert)
@@ -201,11 +198,17 @@ func createKubeConfig(kcpAdminToken, shardAdminToken, userToken, baseHost, tlsSe
 			CertificateAuthorityData: caData,
 			TLSServerName:            tlsServerName,
 		},
+		"system:admin": {
+			Server:                   baseHost + "/clusters/system:admin",
+			CertificateAuthorityData: caData,
+			TLSServerName:            tlsServerName,
+		},
 	}
 	kubeConfig.Contexts = map[string]*clientcmdapi.Context{
 		"root":         {Cluster: "root", AuthInfo: kcpAdminUserName},
 		"base":         {Cluster: "base", AuthInfo: kcpAdminUserName},
-		"system:admin": {Cluster: "base", AuthInfo: shardAdminUserName},
+		"system:admin": {Cluster: "system:admin", AuthInfo: shardAdminUserName},
+		"shard-base":   {Cluster: "base", AuthInfo: shardAdminUserName},
 	}
 	kubeConfig.CurrentContext = "root"
 

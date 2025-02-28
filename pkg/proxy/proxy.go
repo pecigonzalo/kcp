@@ -21,18 +21,18 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 
-	"k8s.io/apimachinery/pkg/util/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	userinfo "k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
 func newTransport(clientCert, clientKeyFile, caFile string) (*http.Transport, error) {
-	caCert, err := ioutil.ReadFile(caFile)
+	caCert, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read CA file %q: %w", caFile, err)
 	}
@@ -56,21 +56,30 @@ func newTransport(clientCert, clientKeyFile, caFile string) (*http.Transport, er
 
 // WithProxyAuthHeaders does client cert termination by extracting the user and groups and
 // passing them through access headers to the shard.
-func WithProxyAuthHeaders(delegate http.HandlerFunc, userHeader, groupHeader string) http.HandlerFunc {
+func WithProxyAuthHeaders(delegate http.Handler, userHeader, groupHeader string, extraHeaderPrefix string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if u, ok := request.UserFrom(r.Context()); ok {
-			appendClientCertAuthHeaders(r.Header, u, userHeader, groupHeader)
+			appendClientCertAuthHeaders(r.Header, u, userHeader, groupHeader, extraHeaderPrefix)
 		}
 
 		delegate.ServeHTTP(w, r)
 	}
 }
 
-func appendClientCertAuthHeaders(header http.Header, user userinfo.Info, userHeader, groupHeader string) {
+func appendClientCertAuthHeaders(header http.Header, user userinfo.Info, userHeader, groupHeader, extraHeaderPrefix string) {
 	header.Set(userHeader, user.GetName())
 
 	for _, group := range user.GetGroups() {
 		header.Add(groupHeader, group)
+	}
+
+	for k, values := range user.GetExtra() {
+		// Key must be encoded to enable e.g authentication.kubernetes.io/cluster-name
+		// This is decoded in the RequestHeader auth handler
+		encodedKey := url.PathEscape(k)
+		for _, v := range values {
+			header.Add(extraHeaderPrefix+encodedKey, v)
+		}
 	}
 }
 
@@ -79,7 +88,7 @@ func newShardReverseProxy() *httputil.ReverseProxy {
 		shardURL := ShardURLFrom(req.Context())
 		if shardURL == nil {
 			// should not happen if wiring is correct
-			runtime.HandleError(fmt.Errorf("no shard URL found in request context"))
+			utilruntime.HandleError(fmt.Errorf("no shard URL found in request context"))
 			req.URL.Scheme = "https"
 			req.URL.Host = "notfound"
 			return
@@ -87,6 +96,7 @@ func newShardReverseProxy() *httputil.ReverseProxy {
 
 		req.URL.Scheme = shardURL.Scheme
 		req.URL.Host = shardURL.Host
+		req.URL.Path = shardURL.Path
 	}
 	return &httputil.ReverseProxy{Director: director}
 }

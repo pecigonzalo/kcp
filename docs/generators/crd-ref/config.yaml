@@ -1,0 +1,88 @@
+# Copyright 2021 The KCP Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+template_path: ./crd.template.md
+
+source_repositories:
+  - url: https://github.com/kcp-dev/kcp
+    organization: kcp-dev
+    short_name: kcp
+    commit_reference: main
+    crd_paths:
+      - config/crds
+    cr_paths:
+      - docs/cr
+    metadata:
+      apibindings.apis.kcp.io:
+        owner:
+          - https://github.com/kcp-dev/kcp
+        topics:
+          - apis
+      apiconversions.apis.kcp.io:
+        owner:
+        - https://github.com/kcp-dev/kcp
+        topics:
+        - apis
+      apiexports.apis.kcp.io:
+        owner:
+          - https://github.com/kcp-dev/kcp
+        topics:
+          - apis
+      apiresourceschemas.apis.kcp.io:
+        owner:
+          - https://github.com/kcp-dev/kcp
+        topics:
+          - apis
+      apiexportendpointslices.apis.kcp.io:
+        owner:
+          - https://github.com/kcp-dev/kcp
+        topics:
+          - apis
+      shards.core.kcp.io:
+        owner:
+        - https://github.com/kcp-dev/kcp
+        topics:
+        - core
+        - logicalclusters
+        - shards
+      logicalclusters.core.kcp.io:
+        owner:
+        - https://github.com/kcp-dev/kcp
+        topics:
+        - core
+        - logicalclusters
+        - shards
+      workspacetypes.tenancy.kcp.io:
+        owner:
+          - https://github.com/kcp-dev/kcp
+        topics:
+          - tenancy
+          - workspaces
+          - types
+      workspaces.tenancy.kcp.io:
+        owner:
+          - https://github.com/kcp-dev/kcp
+        topics:
+          - tenancy
+          - workspaces
+      partitions.topology.kcp.io:
+        owner:
+          - https://github.com/kcp-dev/kcp
+        topics:
+          - topology
+      partitionsets.topology.kcp.io:
+        owner:
+          - https://github.com/kcp-dev/kcp
+        topics:
+          - topology

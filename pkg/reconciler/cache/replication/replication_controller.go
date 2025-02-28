@@ -19,83 +19,107 @@ package replication
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
+	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	kcpkubernetesinformers "github.com/kcp-dev/client-go/informers"
 
-	"k8s.io/apimachinery/pkg/util/runtime"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
 	cacheclient "github.com/kcp-dev/kcp/pkg/cache/client"
 	"github.com/kcp-dev/kcp/pkg/cache/client/shard"
-	apisinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/apis/v1alpha1"
-	apislisters "github.com/kcp-dev/kcp/pkg/client/listers/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/pkg/indexers"
 	"github.com/kcp-dev/kcp/pkg/logging"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/core"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 const (
 	// ControllerName hold this controller name.
 	ControllerName = "kcp-replication-controller"
-
-	// AnnotationKey is the name of the annotation key used to mark an object for replication.
-	AnnotationKey = "internal.sharding.kcp.dev/replicate"
 )
 
 // NewController returns a new replication controller.
 //
-// The replication controller copies objects of defined resources that have the "internal.sharding.kcp.dev/replicate" annotation to the cache server.
-//
 // The replicated object will be placed under the same cluster as the original object.
 // In addition to that, all replicated objects will be placed under the shard taken from the shardName argument.
-// For example: shards/{shardName}/clusters/{clusterName}/apis/apis.kcp.dev/v1alpha1/apiexports
+// For example: shards/{shardName}/clusters/{clusterName}/apis/apis.kcp.io/v1alpha1/apiexports.
 func NewController(
 	shardName string,
-	dynamicCacheClient dynamic.ClusterInterface,
-	dynamicLocalClient dynamic.ClusterInterface,
-	localApiExportInformer apisinformers.APIExportInformer,
-	cacheApiExportInformer apisinformers.APIExportInformer,
+	dynamicCacheClient kcpdynamic.ClusterInterface,
+	gvrs map[schema.GroupVersionResource]ReplicatedGVR,
 ) (*controller, error) {
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), ControllerName)
 	c := &controller{
-		shardName:              shardName,
-		queue:                  queue,
-		dynamicCacheClient:     dynamicCacheClient,
-		dynamicLocalClient:     dynamicLocalClient,
-		localApiExportLister:   localApiExportInformer.Lister(),
-		cacheApiExportsIndexer: cacheApiExportInformer.Informer().GetIndexer(),
+		shardName: shardName,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name: ControllerName,
+			},
+		),
+		dynamicCacheClient: dynamicCacheClient,
+		Gvrs:               gvrs,
 	}
 
-	if err := cacheApiExportInformer.Informer().AddIndexers(cache.Indexers{
-		ByShardAndLogicalClusterAndNamespaceAndName: IndexByShardAndLogicalClusterAndNamespace,
-	}); err != nil {
-		return nil, err
-	}
-	c.cacheApiExportsIndexer = cacheApiExportInformer.Informer().GetIndexer()
+	for gvr, info := range c.Gvrs {
+		_, _ = info.Local.AddEventHandler(cache.FilteringResourceEventHandler{
+			FilterFunc: IsNoSystemClusterName,
+			Handler: cache.ResourceEventHandlerFuncs{
+				AddFunc:    func(obj interface{}) { c.enqueueObject(obj, gvr) },
+				UpdateFunc: func(_, obj interface{}) { c.enqueueObject(obj, gvr) },
+				DeleteFunc: func(obj interface{}) { c.enqueueObject(obj, gvr) },
+			},
+		})
 
-	localApiExportInformer.Informer().AddEventHandler(c.apiExportInformerEventHandler())
-	cacheApiExportInformer.Informer().AddEventHandler(c.apiExportInformerEventHandler())
+		_, _ = info.Global.AddEventHandler(cache.FilteringResourceEventHandler{
+			FilterFunc: IsNoSystemClusterName, // not really needed, but cannot harm
+			Handler: cache.ResourceEventHandlerFuncs{
+				AddFunc:    func(obj interface{}) { c.enqueueCacheObject(obj, gvr) },
+				UpdateFunc: func(_, obj interface{}) { c.enqueueCacheObject(obj, gvr) },
+				DeleteFunc: func(obj interface{}) { c.enqueueCacheObject(obj, gvr) },
+			},
+		})
+	}
+
 	return c, nil
 }
 
-func (c *controller) enqueueAPIExport(obj interface{}) {
+func (c *controller) enqueueObject(obj interface{}, gvr schema.GroupVersionResource) {
 	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
-	gvr := apisv1alpha1.SchemeGroupVersion.WithResource("apiexports")
-	gvrKey := fmt.Sprintf("%v::%v", gvr.String(), key)
+	gvrKey := fmt.Sprintf("%s.%s.%s::%s", gvr.Version, gvr.Resource, gvr.Group, key)
+	c.queue.Add(gvrKey)
+}
+
+func (c *controller) enqueueCacheObject(obj interface{}, gvr schema.GroupVersionResource) {
+	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	gvrKey := fmt.Sprintf("%s.%s.%s::%s", gvr.Version, gvr.Resource, gvr.Group, key)
 	c.queue.Add(gvrKey)
 }
 
 // Start starts the controller, which stops when ctx.Done() is closed.
 func (c *controller) Start(ctx context.Context, workers int) {
-	defer runtime.HandleCrash()
+	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
 	logger := logging.WithReconciler(klog.FromContext(ctx), ControllerName)
@@ -121,46 +145,142 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 	}
 	defer c.queue.Done(grKey)
 
-	logger := logging.WithQueueKey(klog.FromContext(ctx), grKey.(string))
+	logger := logging.WithQueueKey(klog.FromContext(ctx), grKey)
 	ctx = klog.NewContext(ctx, logger)
-	err := c.reconcile(ctx, grKey.(string))
+	err := c.reconcile(ctx, grKey)
 	if err == nil {
 		c.queue.Forget(grKey)
 		return true
 	}
 
-	runtime.HandleError(fmt.Errorf("%v failed with: %w", grKey, err))
+	utilruntime.HandleError(fmt.Errorf("%v failed with: %w", grKey, err))
 	c.queue.AddRateLimited(grKey)
 
 	return true
 }
 
-func (c *controller) apiExportInformerEventHandler() cache.FilteringResourceEventHandler {
-	return cache.FilteringResourceEventHandler{
-		FilterFunc: func(obj interface{}) bool {
-			apiExport, ok := obj.(*apisv1alpha1.APIExport)
-			if !ok {
-				return false
-			}
-			_, hasReplicationLabel := apiExport.Annotations[AnnotationKey]
-			return hasReplicationLabel
-		},
-		Handler: cache.ResourceEventHandlerFuncs{
-			AddFunc:    func(obj interface{}) { c.enqueueAPIExport(obj) },
-			UpdateFunc: func(_, obj interface{}) { c.enqueueAPIExport(obj) },
-			DeleteFunc: func(obj interface{}) { c.enqueueAPIExport(obj) },
-		},
+func IsNoSystemClusterName(obj interface{}) bool {
+	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return false
 	}
+
+	clusterName, _, _, err := kcpcache.SplitMetaClusterNamespaceKey(key)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return false
+	}
+	if strings.HasPrefix(clusterName.String(), "system:") {
+		return false
+	}
+	return true
 }
 
 type controller struct {
 	shardName string
-	queue     workqueue.RateLimitingInterface
+	queue     workqueue.TypedRateLimitingInterface[string]
 
-	dynamicCacheClient dynamic.ClusterInterface
-	dynamicLocalClient dynamic.ClusterInterface
+	dynamicCacheClient kcpdynamic.ClusterInterface
 
-	localApiExportLister apislisters.APIExportLister
+	Gvrs map[schema.GroupVersionResource]ReplicatedGVR
+}
 
-	cacheApiExportsIndexer cache.Indexer
+type ReplicatedGVR struct {
+	Kind          string
+	Filter        func(u *unstructured.Unstructured) bool
+	Global, Local cache.SharedIndexInformer
+}
+
+// InstallIndexers adds the additional indexers that this controller requires to the informers.
+func InstallIndexers(
+	localKcpInformers kcpinformers.SharedInformerFactory,
+	globalKcpInformers kcpinformers.SharedInformerFactory,
+	localKubeInformers kcpkubernetesinformers.SharedInformerFactory,
+	globalKubeInformers kcpkubernetesinformers.SharedInformerFactory) map[schema.GroupVersionResource]ReplicatedGVR {
+	gvrs := map[schema.GroupVersionResource]ReplicatedGVR{
+		apisv1alpha1.SchemeGroupVersion.WithResource("apiexports"): {
+			Kind:   "APIExport",
+			Local:  localKcpInformers.Apis().V1alpha1().APIExports().Informer(),
+			Global: globalKcpInformers.Apis().V1alpha1().APIExports().Informer(),
+		},
+		apisv1alpha1.SchemeGroupVersion.WithResource("apiexportendpointslices"): {
+			Kind:   "APIExportEndpointSlice",
+			Local:  localKcpInformers.Apis().V1alpha1().APIExportEndpointSlices().Informer(),
+			Global: globalKcpInformers.Apis().V1alpha1().APIExportEndpointSlices().Informer(),
+		},
+		apisv1alpha1.SchemeGroupVersion.WithResource("apiresourceschemas"): {
+			Kind:   "APIResourceSchema",
+			Local:  localKcpInformers.Apis().V1alpha1().APIResourceSchemas().Informer(),
+			Global: globalKcpInformers.Apis().V1alpha1().APIResourceSchemas().Informer(),
+		},
+		apisv1alpha1.SchemeGroupVersion.WithResource("apiconversions"): {
+			Kind:   "APIConversion",
+			Local:  localKcpInformers.Apis().V1alpha1().APIConversions().Informer(),
+			Global: globalKcpInformers.Apis().V1alpha1().APIConversions().Informer(),
+		},
+		admissionregistrationv1.SchemeGroupVersion.WithResource("mutatingwebhookconfigurations"): {
+			Kind:   "MutatingWebhookConfiguration",
+			Local:  localKubeInformers.Admissionregistration().V1().MutatingWebhookConfigurations().Informer(),
+			Global: globalKubeInformers.Admissionregistration().V1().MutatingWebhookConfigurations().Informer(),
+		},
+		admissionregistrationv1.SchemeGroupVersion.WithResource("validatingwebhookconfigurations"): {
+			Kind:   "ValidatingWebhookConfiguration",
+			Local:  localKubeInformers.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer(),
+			Global: globalKubeInformers.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer(),
+		},
+		admissionregistrationv1.SchemeGroupVersion.WithResource("validatingadmissionpolicies"): {
+			Kind:   "ValidatingAdmissionPolicy",
+			Local:  localKubeInformers.Admissionregistration().V1().ValidatingAdmissionPolicies().Informer(),
+			Global: globalKubeInformers.Admissionregistration().V1().ValidatingAdmissionPolicies().Informer(),
+		},
+		admissionregistrationv1.SchemeGroupVersion.WithResource("validatingadmissionpolicybindings"): {
+			Kind:   "ValidatingAdmissionPolicyBinding",
+			Local:  localKubeInformers.Admissionregistration().V1().ValidatingAdmissionPolicyBindings().Informer(),
+			Global: globalKubeInformers.Admissionregistration().V1().ValidatingAdmissionPolicyBindings().Informer(),
+		},
+		corev1alpha1.SchemeGroupVersion.WithResource("shards"): {
+			Kind:   "Shard",
+			Local:  localKcpInformers.Core().V1alpha1().Shards().Informer(),
+			Global: globalKcpInformers.Core().V1alpha1().Shards().Informer(),
+		},
+		corev1alpha1.SchemeGroupVersion.WithResource("logicalclusters"): {
+			Kind: "LogicalCluster",
+			Filter: func(u *unstructured.Unstructured) bool {
+				return u.GetAnnotations()[core.ReplicateAnnotationKey] != ""
+			},
+			Local:  localKcpInformers.Core().V1alpha1().LogicalClusters().Informer(),
+			Global: globalKcpInformers.Core().V1alpha1().LogicalClusters().Informer(),
+		},
+		tenancyv1alpha1.SchemeGroupVersion.WithResource("workspacetypes"): {
+			Kind:   "WorkspaceType",
+			Local:  localKcpInformers.Tenancy().V1alpha1().WorkspaceTypes().Informer(),
+			Global: globalKcpInformers.Tenancy().V1alpha1().WorkspaceTypes().Informer(),
+		},
+		rbacv1.SchemeGroupVersion.WithResource("clusterroles"): {
+			Kind: "ClusterRole",
+			Filter: func(u *unstructured.Unstructured) bool {
+				return u.GetAnnotations()[core.ReplicateAnnotationKey] != ""
+			},
+			Local:  localKubeInformers.Rbac().V1().ClusterRoles().Informer(),
+			Global: globalKubeInformers.Rbac().V1().ClusterRoles().Informer(),
+		},
+		rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"): {
+			Kind: "ClusterRoleBinding",
+			Filter: func(u *unstructured.Unstructured) bool {
+				return u.GetAnnotations()[core.ReplicateAnnotationKey] != ""
+			},
+			Local:  localKubeInformers.Rbac().V1().ClusterRoleBindings().Informer(),
+			Global: globalKubeInformers.Rbac().V1().ClusterRoleBindings().Informer(),
+		},
+	}
+	for _, info := range gvrs {
+		indexers.AddIfNotPresentOrDie(
+			info.Global.GetIndexer(),
+			cache.Indexers{
+				ByShardAndLogicalClusterAndNamespaceAndName: IndexByShardAndLogicalClusterAndNamespace,
+			},
+		)
+	}
+	return gvrs
 }

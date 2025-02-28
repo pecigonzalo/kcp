@@ -17,39 +17,64 @@ limitations under the License.
 package initializers
 
 import (
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	kcpkubernetesinformers "github.com/kcp-dev/client-go/informers"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/initializer"
 	quota "k8s.io/apiserver/pkg/quota/v1"
-	kubernetesclient "k8s.io/client-go/kubernetes"
 
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 // NewKcpInformersInitializer returns an admission plugin initializer that injects
-// kcp shared informer factories into admission plugins.
+// both local and global kcp shared informer factories into admission plugins.
 func NewKcpInformersInitializer(
-	kcpInformers kcpinformers.SharedInformerFactory,
+	local, global kcpinformers.SharedInformerFactory,
 ) *kcpInformersInitializer {
 	return &kcpInformersInitializer{
-		kcpInformers: kcpInformers,
+		localKcpInformers:  local,
+		globalKcpInformers: global,
+	}
+}
+
+type kubeInformersInitializer struct {
+	localKcpInformers, globalKcpInformers kcpkubernetesinformers.SharedInformerFactory
+}
+
+func (i *kubeInformersInitializer) Initialize(plugin admission.Interface) {
+	if wants, ok := plugin.(WantsKubeInformers); ok {
+		wants.SetKubeInformers(i.localKcpInformers, i.globalKcpInformers)
+	}
+}
+
+// NewKubeInformersInitializer returns an admission plugin initializer that injects
+// both local and global kube shared informer factories into admission plugins.
+func NewKubeInformersInitializer(
+	local, global kcpkubernetesinformers.SharedInformerFactory,
+) *kubeInformersInitializer {
+	return &kubeInformersInitializer{
+		localKcpInformers:  local,
+		globalKcpInformers: global,
 	}
 }
 
 type kcpInformersInitializer struct {
-	kcpInformers kcpinformers.SharedInformerFactory
+	localKcpInformers, globalKcpInformers kcpinformers.SharedInformerFactory
 }
 
 func (i *kcpInformersInitializer) Initialize(plugin admission.Interface) {
 	if wants, ok := plugin.(WantsKcpInformers); ok {
-		wants.SetKcpInformers(i.kcpInformers)
+		wants.SetKcpInformers(i.localKcpInformers, i.globalKcpInformers)
 	}
 }
 
 // NewKubeClusterClientInitializer returns an admission plugin initializer that injects
 // a kube cluster client into admission plugins.
 func NewKubeClusterClientInitializer(
-	kubeClusterClient kubernetesclient.ClusterInterface,
+	kubeClusterClient kcpkubernetesclientset.ClusterInterface,
 ) *kubeClusterClientInitializer {
 	return &kubeClusterClientInitializer{
 		kubeClusterClient: kubeClusterClient,
@@ -57,7 +82,7 @@ func NewKubeClusterClientInitializer(
 }
 
 type kubeClusterClientInitializer struct {
-	kubeClusterClient kubernetesclient.ClusterInterface
+	kubeClusterClient kcpkubernetesclientset.ClusterInterface
 }
 
 func (i *kubeClusterClientInitializer) Initialize(plugin admission.Interface) {
@@ -69,7 +94,7 @@ func (i *kubeClusterClientInitializer) Initialize(plugin admission.Interface) {
 // NewKcpClusterClientInitializer returns an admission plugin initializer that injects
 // a kcp cluster client into admission plugins.
 func NewKcpClusterClientInitializer(
-	kcpClusterClient kcpclient.ClusterInterface,
+	kcpClusterClient kcpclientset.ClusterInterface,
 ) *kcpClusterClientInitializer {
 	return &kcpClusterClientInitializer{
 		kcpClusterClient: kcpClusterClient,
@@ -77,7 +102,7 @@ func NewKcpClusterClientInitializer(
 }
 
 type kcpClusterClientInitializer struct {
-	kcpClusterClient kcpclient.ClusterInterface
+	kcpClusterClient kcpclientset.ClusterInterface
 }
 
 func (i *kcpClusterClientInitializer) Initialize(plugin admission.Interface) {
@@ -89,7 +114,7 @@ func (i *kcpClusterClientInitializer) Initialize(plugin admission.Interface) {
 // NewDeepSARClientInitializer returns an admission plugin initializer that injects
 // a deep SAR client into admission plugins.
 func NewDeepSARClientInitializer(
-	deepSARClient kubernetesclient.ClusterInterface,
+	deepSARClient kcpkubernetesclientset.ClusterInterface,
 ) *clientConfigInitializer {
 	return &clientConfigInitializer{
 		deepSARClient: deepSARClient,
@@ -97,68 +122,12 @@ func NewDeepSARClientInitializer(
 }
 
 type clientConfigInitializer struct {
-	deepSARClient kubernetesclient.ClusterInterface
+	deepSARClient kcpkubernetesclientset.ClusterInterface
 }
 
 func (i *clientConfigInitializer) Initialize(plugin admission.Interface) {
 	if wants, ok := plugin.(WantsDeepSARClient); ok {
 		wants.SetDeepSARClient(i.deepSARClient)
-	}
-}
-
-// NewExternalAddressInitializer returns an admission plugin initializer that injects
-// an external address provider into the admission plugin.
-func NewExternalAddressInitializer(
-	externalAddressProvider func() string,
-) *externalAddressInitializer {
-	return &externalAddressInitializer{
-		externalAddressProvider: externalAddressProvider,
-	}
-}
-
-type externalAddressInitializer struct {
-	externalAddressProvider func() string
-}
-
-func (i *externalAddressInitializer) Initialize(plugin admission.Interface) {
-	if wants, ok := plugin.(WantsExternalAddressProvider); ok {
-		wants.SetExternalAddressProvider(i.externalAddressProvider)
-	}
-}
-
-// NewShardBaseURLInitializer returns an admission plugin initializer that injects
-// the default shard base URL provider into the admission plugin.
-func NewShardBaseURLInitializer(shardBaseURL string) *shardBaseURLInitializer {
-	return &shardBaseURLInitializer{
-		shardBaseURL: shardBaseURL,
-	}
-}
-
-type shardBaseURLInitializer struct {
-	shardBaseURL string
-}
-
-func (i *shardBaseURLInitializer) Initialize(plugin admission.Interface) {
-	if wants, ok := plugin.(WantsShardBaseURL); ok {
-		wants.SetShardBaseURL(i.shardBaseURL)
-	}
-}
-
-// NewShardExternalURLInitializer returns an admission plugin initializer that injects
-// the default shard external URL provider into the admission plugin.
-func NewShardExternalURLInitializer(shardExternalURL string) *shardExternalURLInitializer {
-	return &shardExternalURLInitializer{
-		shardExternalURL: shardExternalURL,
-	}
-}
-
-type shardExternalURLInitializer struct {
-	shardExternalURL string
-}
-
-func (i *shardExternalURLInitializer) Initialize(plugin admission.Interface) {
-	if wants, ok := plugin.(WantsShardExternalURL); ok {
-		wants.SetShardExternalURL(i.shardExternalURL)
 	}
 }
 
@@ -195,5 +164,21 @@ type serverShutdownChannelInitializer struct {
 func (i *serverShutdownChannelInitializer) Initialize(plugin admission.Interface) {
 	if wants, ok := plugin.(WantsServerShutdownChannel); ok {
 		wants.SetServerShutdownChannel(i.ch)
+	}
+}
+
+type dynamicClusterClientInitializer struct {
+	dynamicClusterClient kcpdynamic.ClusterInterface
+}
+
+func NewDynamicClusterClientInitializer(dynamicClusterClient kcpdynamic.ClusterInterface) *dynamicClusterClientInitializer {
+	return &dynamicClusterClientInitializer{
+		dynamicClusterClient: dynamicClusterClient,
+	}
+}
+
+func (i *dynamicClusterClientInitializer) Initialize(plugin admission.Interface) {
+	if wants, ok := plugin.(WantsDynamicClusterClient); ok {
+		wants.SetDynamicClusterClient(i.dynamicClusterClient)
 	}
 }

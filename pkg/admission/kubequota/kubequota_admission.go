@@ -22,24 +22,28 @@ import (
 	"io"
 	"sync"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpcorev1informers "github.com/kcp-dev/client-go/informers/core/v1"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/initializer"
 	"k8s.io/apiserver/pkg/admission/plugin/resourcequota"
 	resourcequotaapi "k8s.io/apiserver/pkg/admission/plugin/resourcequota/apis/resourcequota"
 	"k8s.io/apiserver/pkg/admission/plugin/resourcequota/apis/resourcequota/validation"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/informerfactoryhack"
 	quota "k8s.io/apiserver/pkg/quota/v1"
-	kubernetesinformers "k8s.io/client-go/informers"
-	kubernetesclient "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/informers"
 	"k8s.io/klog/v2"
 
 	"github.com/kcp-dev/kcp/pkg/admission/initializers"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
-	tenancyinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/tenancy/v1alpha1"
-	tenancylisters "github.com/kcp-dev/kcp/pkg/client/listers/tenancy/v1alpha1"
-	kubequotacontroller "github.com/kcp-dev/kcp/pkg/reconciler/kubequota"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
+	corev1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/core/v1alpha1"
+	corev1alpha1listers "github.com/kcp-dev/kcp/sdk/client/listers/core/v1alpha1"
 )
 
 // PluginName is the name of this admission plugin.
@@ -81,10 +85,10 @@ type KubeResourceQuota struct {
 	*admission.Handler
 
 	// Injected/set via initializers
-	clusterWorkspaceInformer     tenancyinformers.ClusterWorkspaceInformer
-	clusterWorkspaceLister       tenancylisters.ClusterWorkspaceLister
-	kubeClusterClient            kubernetesclient.ClusterInterface
-	scopingResourceQuotaInformer *kubequotacontroller.ScopingResourceQuotaInformer
+	logicalClusterInformer       corev1alpha1informers.LogicalClusterClusterInformer
+	logicalClusterLister         corev1alpha1listers.LogicalClusterClusterLister
+	kubeClusterClient            kcpkubernetesclientset.ClusterInterface
+	scopingResourceQuotaInformer kcpcorev1informers.ResourceQuotaClusterInformer
 	quotaConfiguration           quota.Configuration
 	serverDone                   <-chan struct{}
 
@@ -94,13 +98,13 @@ type KubeResourceQuota struct {
 	lock      sync.RWMutex
 	delegates map[logicalcluster.Name]*stoppableQuotaAdmission
 
-	clusterWorkspaceDeletionMonitorStarter sync.Once
+	logicalClusterDeletionMonitorStarter sync.Once
 }
 
 // ValidateInitialization validates all the expected fields are set.
 func (k *KubeResourceQuota) ValidateInitialization() error {
-	if k.clusterWorkspaceLister == nil {
-		return fmt.Errorf("missing clusterWorkspaceLister")
+	if k.logicalClusterLister == nil {
+		return fmt.Errorf("missing logicalClusterLister")
 	}
 	if k.kubeClusterClient == nil {
 		return fmt.Errorf("missing kubeClusterClient")
@@ -128,8 +132,19 @@ var _ = initializers.WantsServerShutdownChannel(&KubeResourceQuota{})
 // Validate gets or creates a resourcequota.QuotaAdmission plugin for the logical cluster in the request and then
 // delegates validation to it.
 func (k *KubeResourceQuota) Validate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
-	k.clusterWorkspaceDeletionMonitorStarter.Do(func() {
-		m := newClusterWorkspaceDeletionMonitor(k.clusterWorkspaceInformer, k.stopQuotaAdmissionForCluster)
+	// skip workspace bootstrapping resources because quota does not work before these are created.
+	if a.GetResource() == corev1alpha1.SchemeGroupVersion.WithResource("logicalclusters") {
+		return nil
+	}
+	if a.GetResource() == rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings") {
+		allowedNames := sets.New[string]("workspace-admin")
+		if allowedNames.Has(a.GetName()) {
+			return nil
+		}
+	}
+
+	k.logicalClusterDeletionMonitorStarter.Do(func() {
+		m := NewLogicalClusterDeletionMonitor("kubequota-logicalcluster-deletion-monitor", k.logicalClusterInformer, k.stopQuotaAdmissionForCluster)
 		go m.Start(k.serverDone)
 	})
 
@@ -176,7 +191,7 @@ func (k *KubeResourceQuota) getOrCreateDelegate(clusterName logicalcluster.Name)
 	}()
 
 	const evaluatorWorkersPerWorkspace = 5
-	quotaAdmission, err := resourcequota.NewResourceQuota(k.userSuppliedConfiguration, evaluatorWorkersPerWorkspace, ctx.Done())
+	quotaAdmission, err := resourcequota.NewResourceQuota(k.userSuppliedConfiguration, evaluatorWorkersPerWorkspace)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -187,10 +202,10 @@ func (k *KubeResourceQuota) getOrCreateDelegate(clusterName logicalcluster.Name)
 		stop:           cancel,
 	}
 
-	delegate.SetResourceQuotaInformer(k.scopingResourceQuotaInformer.ForCluster(clusterName))
-	delegate.SetExternalKubeClientSet(k.kubeClusterClient.Cluster(clusterName))
+	delegate.SetDrainedNotification(ctx.Done())
+	delegate.SetResourceQuotaLister(k.scopingResourceQuotaInformer.Cluster(clusterName).Lister())
+	delegate.SetExternalKubeClientSet(k.kubeClusterClient.Cluster(clusterName.Path()))
 	delegate.SetQuotaConfiguration(k.quotaConfiguration)
-	delegate.SetClusterName(clusterName)
 
 	if err := delegate.ValidateInitialization(); err != nil {
 		cancel()
@@ -213,31 +228,33 @@ func (k *KubeResourceQuota) stopQuotaAdmissionForCluster(clusterName logicalclus
 
 	delegate := k.delegates[clusterName]
 
+	logger := klog.Background().WithValues("clusterName", clusterName)
+
 	if delegate == nil {
-		klog.V(3).InfoS("Received event to stop quota admission for logical cluster, but it wasn't in the map", "clusterName", clusterName)
+		logger.V(3).Info("received event to stop quota admission for logical cluster, but it wasn't in the map")
 		return
 	}
 
-	klog.V(2).InfoS("Stopping quota admission for logical cluster", "clusterName", clusterName)
+	logger.V(2).Info("stopping quota admission for logical cluster")
 
 	delete(k.delegates, clusterName)
 	delegate.stop()
 }
 
-func (k *KubeResourceQuota) SetKubeClusterClient(kubeClusterClient kubernetesclient.ClusterInterface) {
+func (k *KubeResourceQuota) SetKubeClusterClient(kubeClusterClient kcpkubernetesclientset.ClusterInterface) {
 	k.kubeClusterClient = kubeClusterClient
 }
 
-func (k *KubeResourceQuota) SetKcpInformers(informers kcpinformers.SharedInformerFactory) {
-	k.clusterWorkspaceLister = informers.Tenancy().V1alpha1().ClusterWorkspaces().Lister()
-	k.clusterWorkspaceInformer = informers.Tenancy().V1alpha1().ClusterWorkspaces()
+func (k *KubeResourceQuota) SetKcpInformers(local, global kcpinformers.SharedInformerFactory) {
+	k.logicalClusterLister = local.Core().V1alpha1().LogicalClusters().Lister()
+	k.logicalClusterInformer = local.Core().V1alpha1().LogicalClusters()
 }
 
-func (k *KubeResourceQuota) SetExternalKubeInformerFactory(informers kubernetesinformers.SharedInformerFactory) {
-	k.scopingResourceQuotaInformer = kubequotacontroller.NewScopingResourceQuotaInformer(informers.Core().V1().ResourceQuotas())
+func (k *KubeResourceQuota) SetExternalKubeInformerFactory(informers informers.SharedInformerFactory) {
+	k.scopingResourceQuotaInformer = informerfactoryhack.Unwrap(informers).Core().V1().ResourceQuotas()
 
 	// Make sure the quota informer gets started
-	_ = informers.Core().V1().ResourceQuotas().Informer()
+	_ = informerfactoryhack.Unwrap(informers).Core().V1().ResourceQuotas().Informer()
 }
 
 func (k *KubeResourceQuota) SetQuotaConfiguration(quotaConfiguration quota.Configuration) {

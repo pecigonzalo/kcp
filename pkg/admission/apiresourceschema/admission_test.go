@@ -21,8 +21,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kcp-dev/logicalcluster/v2"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -30,7 +28,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/kcp-dev/kcp/pkg/admission/helpers"
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 func createAttr(s *apisv1alpha1.APIResourceSchema) admission.Attributes {
@@ -107,7 +105,7 @@ spec:
             `)),
 			expectedErrors: []string{
 				"metadata.name: Invalid value: \"may.2022.cowboys.wild.west\": must match ^[a-z]([-a-z0-9]*[a-z0-9])?$ in front of .cowboys.wild.west",
-				"spec.versions[0].schema: Required value: schemas are required",
+				"spec.versions[0].schema: Required value",
 				"spec.versions[1].schema.openAPIV3Schema.type: Unsupported value: \"thing\": supported values: \"array\", \"boolean\", \"integer\", \"number\", \"object\", \"string\"",
 				"spec.versions[1].schema.openAPIV3Schema.type: Invalid value: \"thing\": must be object at the root",
 				"spec.names.singular: Required value",
@@ -169,7 +167,7 @@ spec:
 			o := &apiResourceSchemaValidation{
 				Handler: admission.NewHandler(admission.Create, admission.Update),
 			}
-			ctx := request.WithCluster(context.Background(), request.Cluster{Name: logicalcluster.New("root:org")})
+			ctx := request.WithCluster(context.Background(), request.Cluster{Name: "root:org"})
 			err := o.Validate(ctx, tt.attr, nil)
 			wantErr := len(tt.expectedErrors) > 0
 			if (err != nil) != wantErr {

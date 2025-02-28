@@ -21,23 +21,18 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/egymgmbh/go-prefix-writer/prefixer"
-
-	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 // NewAccessory creates a new accessory process.
 func NewAccessory(t *testing.T, artifactDir string, name string, cmd ...string) *Accessory {
+	t.Helper()
 	return &Accessory{
 		t:           t,
 		artifactDir: artifactDir,
@@ -48,7 +43,7 @@ func NewAccessory(t *testing.T, artifactDir string, name string, cmd ...string) 
 
 // Accessory knows how to run an executable with arguments for the duration of the context.
 type Accessory struct {
-	ctx         context.Context
+	ctx         context.Context //nolint:containedctx
 	t           *testing.T
 	artifactDir string
 	name        string
@@ -56,6 +51,8 @@ type Accessory struct {
 }
 
 func (a *Accessory) Run(t *testing.T, opts ...RunOption) error {
+	t.Helper()
+
 	runOpts := runOptions{}
 	for _, opt := range opts {
 		opt(&runOpts)
@@ -94,52 +91,11 @@ func (a *Accessory) Run(t *testing.T, opts ...RunOption) error {
 		return err
 	}
 	go func() {
-		defer func() { cleanupCancel() }()
+		defer cleanupCancel()
 		err := cmd.Wait()
 		if err != nil && ctx.Err() == nil {
 			a.t.Errorf("`%s` failed: %v output: %s", a.name, err, log.String())
 		}
 	}()
 	return nil
-}
-
-// Ready blocks until the server is healthy and ready.
-func Ready(ctx context.Context, t *testing.T, port string) bool {
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-	for _, endpoint := range []string{"/healthz", "/readyz"} {
-		go func(endpoint string) {
-			defer wg.Done()
-			waitForEndpoint(ctx, t, port, endpoint)
-		}(endpoint)
-	}
-	wg.Wait()
-	return !t.Failed()
-}
-
-func waitForEndpoint(ctx context.Context, t *testing.T, port, endpoint string) {
-	var lastError error
-	if err := wait.PollImmediateWithContext(ctx, 100*time.Millisecond, 30*time.Second, func(ctx context.Context) (bool, error) {
-		url := fmt.Sprintf("http://[::1]:%s%s", port, endpoint)
-		resp, err := http.Get(url)
-		if err != nil {
-			lastError = fmt.Errorf("error contacting %s: %w", url, err)
-			return false, nil
-		}
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			lastError = fmt.Errorf("error reading response from %s: %w", url, err)
-			return false, nil
-		}
-		if resp.StatusCode != 200 {
-			lastError = fmt.Errorf("unready response from %s: %v", url, string(body))
-			return false, nil
-		}
-
-		t.Logf("success contacting %s", url)
-		return true, nil
-	}); err != nil && lastError != nil {
-		t.Error(lastError)
-	}
 }

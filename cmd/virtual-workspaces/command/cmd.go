@@ -24,7 +24,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpkubernetesinformers "github.com/kcp-dev/client-go/informers"
+	kcpkubernetesclient "github.com/kcp-dev/client-go/kubernetes"
 	"github.com/spf13/cobra"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,26 +34,24 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericapiserver "k8s.io/apiserver/pkg/server"
-	kubernetesinformers "k8s.io/client-go/informers"
-	kubernetesclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/pkg/version"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/component-base/config"
+	logsapiv1 "k8s.io/component-base/logs/api/v1"
 	"k8s.io/klog/v2"
 
 	"github.com/kcp-dev/kcp/cmd/virtual-workspaces/options"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
 	kcpfeatures "github.com/kcp-dev/kcp/pkg/features"
-	bootstrap "github.com/kcp-dev/kcp/pkg/server/bootstrap"
+	"github.com/kcp-dev/kcp/pkg/server/bootstrap"
 	virtualrootapiserver "github.com/kcp-dev/kcp/pkg/virtual/framework/rootapiserver"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 func NewCommand(ctx context.Context, errout io.Writer) *cobra.Command {
 	opts := options.NewOptions()
 
 	// Default to -v=2
-	opts.Logs.Config.Verbosity = config.VerbosityLevel(2)
+	opts.Logs.Verbosity = logsapiv1.VerbosityLevel(2)
 
 	cmd := &cobra.Command{
 		Use:   "workspaces",
@@ -60,7 +59,7 @@ func NewCommand(ctx context.Context, errout io.Writer) *cobra.Command {
 		Long:  "Start the root virtual workspace apiserver to enable virtual workspace management.",
 
 		RunE: func(c *cobra.Command, args []string) error {
-			if err := opts.Logs.ValidateAndApply(kcpfeatures.DefaultFeatureGate); err != nil {
+			if err := logsapiv1.ValidateAndApply(opts.Logs, kcpfeatures.DefaultFeatureGate); err != nil {
 				return err
 			}
 			if err := opts.Validate(); err != nil {
@@ -87,6 +86,24 @@ func Run(ctx context.Context, o *options.Options) error {
 	if err != nil {
 		return err
 	}
+
+	// parse cache kubeconfig
+	defaultCacheClientConfig, err := kubeConfig.ClientConfig()
+	if err != nil {
+		return err
+	}
+	cacheConfig, err := o.Cache.RestConfig(defaultCacheClientConfig)
+	if err != nil {
+		return err
+	}
+	cacheKcpClusterClient, err := kcpclientset.NewForConfig(cacheConfig)
+	if err != nil {
+		return err
+	}
+
+	// Don't throttle
+	nonIdentityConfig.QPS = -1
+
 	u, err := url.Parse(nonIdentityConfig.Host)
 	if err != nil {
 		return err
@@ -94,9 +111,14 @@ func Run(ctx context.Context, o *options.Options) error {
 	u.Path = ""
 	nonIdentityConfig.Host = u.String()
 
+	localShardKubeClusterClient, err := kcpkubernetesclient.NewForConfig(nonIdentityConfig)
+	if err != nil {
+		return err
+	}
+
 	// resolve identities for system APIBindings
-	identityConfig, resolveIdentities := bootstrap.NewConfigWithWildcardIdentities(nonIdentityConfig, bootstrap.KcpRootGroupExportNames, bootstrap.KcpRootGroupResourceExportNames, nil)
-	if err := wait.PollImmediateInfiniteWithContext(ctx, time.Millisecond*500, func(ctx context.Context) (bool, error) {
+	identityConfig, resolveIdentities := bootstrap.NewConfigWithWildcardIdentities(nonIdentityConfig, bootstrap.KcpRootGroupExportNames, bootstrap.KcpRootGroupResourceExportNames, localShardKubeClusterClient)
+	if err := wait.PollUntilContextCancel(ctx, time.Millisecond*500, true, func(ctx context.Context) (bool, error) {
 		if err := resolveIdentities(ctx); err != nil {
 			logger.V(3).Info("failed to resolve identities, keeping trying: ", "err", err)
 			return false, nil
@@ -107,31 +129,26 @@ func Run(ctx context.Context, o *options.Options) error {
 	}
 
 	// create clients and informers
-	kubeClusterClient, err := kubernetesclient.NewClusterForConfig(identityConfig)
+	kubeClusterClient, err := kcpkubernetesclient.NewForConfig(identityConfig)
 	if err != nil {
 		return err
 	}
 
-	wildcardKubeClient := kubeClusterClient.Cluster(logicalcluster.Wildcard)
-	wildcardKubeInformers := kubernetesinformers.NewSharedInformerFactory(wildcardKubeClient, 10*time.Minute)
+	wildcardKubeInformers := kcpkubernetesinformers.NewSharedInformerFactory(kubeClusterClient, 10*time.Minute)
 
-	kcpClusterClient, err := kcpclient.NewClusterForConfig(identityConfig)
+	kcpClusterClient, err := kcpclientset.NewForConfig(identityConfig)
 	if err != nil {
 		return err
 	}
-	wildcardKcpClient := kcpClusterClient.Cluster(logicalcluster.Wildcard)
-	wildcardKcpInformers := kcpinformers.NewSharedInformerFactory(wildcardKcpClient, 10*time.Minute)
+	wildcardKcpInformers := kcpinformers.NewSharedInformerFactory(kcpClusterClient, 10*time.Minute)
+	cacheKcpInformers := kcpinformers.NewSharedInformerFactory(cacheKcpClusterClient, 10*time.Minute)
 
 	if o.ProfilerAddress != "" {
-		//nolint:errcheck
+		//nolint:errcheck,gosec
 		go http.ListenAndServe(o.ProfilerAddress, nil)
 	}
 
 	// create apiserver
-	virtualWorkspaces, err := o.VirtualWorkspaces.NewVirtualWorkspaces(identityConfig, o.RootPathPrefix, wildcardKubeInformers, wildcardKcpInformers)
-	if err != nil {
-		return err
-	}
 	scheme := runtime.NewScheme()
 	metav1.AddToGroupVersion(scheme, schema.GroupVersion{Group: "", Version: "v1"})
 	codecs := serializer.NewCodecFactory(scheme)
@@ -142,25 +159,36 @@ func Run(ctx context.Context, o *options.Options) error {
 	if err := o.Authentication.ApplyTo(&recommendedConfig.Authentication, recommendedConfig.SecureServing, recommendedConfig.OpenAPIConfig); err != nil {
 		return err
 	}
-	if err := o.Authorization.ApplyTo(&recommendedConfig.Config, virtualWorkspaces); err != nil {
-		return err
-	}
 	if err := o.Audit.ApplyTo(&recommendedConfig.Config); err != nil {
 		return err
 	}
-	rootAPIServerConfig, err := virtualrootapiserver.NewRootAPIConfig(recommendedConfig, []virtualrootapiserver.InformerStart{
-		wildcardKubeInformers.Start,
-		wildcardKcpInformers.Start,
-	}, virtualWorkspaces)
+
+	rootAPIServerConfig, err := virtualrootapiserver.NewConfig(recommendedConfig)
+	if err != nil {
+		return err
+	}
+
+	if err := o.Authorization.ApplyTo(&recommendedConfig.Config, func() []virtualrootapiserver.NamedVirtualWorkspace {
+		return rootAPIServerConfig.Extra.VirtualWorkspaces
+	}); err != nil {
+		return err
+	}
+
+	sharedExternalURLGetter := func() string {
+		return o.ShardExternalURL
+	}
+
+	rootAPIServerConfig.Extra.VirtualWorkspaces, err = o.CoreVirtualWorkspaces.NewVirtualWorkspaces(identityConfig, o.RootPathPrefix, sharedExternalURLGetter, wildcardKubeInformers, wildcardKcpInformers, cacheKcpInformers)
 	if err != nil {
 		return err
 	}
 
 	completedRootAPIServerConfig := rootAPIServerConfig.Complete()
-	rootAPIServer, err := completedRootAPIServerConfig.New(genericapiserver.NewEmptyDelegate())
+	rootAPIServer, err := virtualrootapiserver.NewServer(completedRootAPIServerConfig, genericapiserver.NewEmptyDelegate())
 	if err != nil {
 		return err
 	}
+
 	preparedRootAPIServer := rootAPIServer.GenericAPIServer.PrepareRun()
 
 	// this **must** be done after PrepareRun() as it sets up the openapi endpoints
@@ -168,9 +196,17 @@ func Run(ctx context.Context, o *options.Options) error {
 		return err
 	}
 
-	logger.Info("Starting virtual workspace apiserver on ", "externalAddress", rootAPIServerConfig.GenericConfig.ExternalAddress, "version", version.Get().String())
+	logger.Info("Starting informers")
+	wildcardKubeInformers.Start(ctx.Done())
+	wildcardKcpInformers.Start(ctx.Done())
+	cacheKcpInformers.Start(ctx.Done())
 
-	return preparedRootAPIServer.Run(ctx.Done())
+	wildcardKubeInformers.WaitForCacheSync(ctx.Done())
+	wildcardKcpInformers.WaitForCacheSync(ctx.Done())
+	cacheKcpInformers.WaitForCacheSync(ctx.Done())
+
+	logger.Info("Starting virtual workspace apiserver on ", "externalAddress", rootAPIServerConfig.Generic.ExternalAddress, "version", version.Get().String())
+	return preparedRootAPIServer.RunWithContext(ctx)
 }
 
 func readKubeConfig(kubeConfigFile, context string) (clientcmd.ClientConfig, error) {

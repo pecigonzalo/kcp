@@ -22,18 +22,15 @@ import (
 	"testing"
 	"time"
 
-	kcpclienthelper "github.com/kcp-dev/apimachinery/pkg/client"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpapiextensionsclientset "github.com/kcp-dev/client-go/apiextensions/client"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
 	"github.com/stretchr/testify/require"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apiextensionclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
 	"github.com/kcp-dev/kcp/test/e2e/fixtures/kube"
 	"github.com/kcp-dev/kcp/test/e2e/framework"
@@ -45,6 +42,7 @@ func TestMetadataMutations(t *testing.T) {
 	// https://github.com/kcp-dev/kcp/issues/1647
 
 	t.Parallel()
+	framework.Suite(t, "control-plane")
 
 	server := framework.SharedKcpServer(t)
 
@@ -53,15 +51,14 @@ func TestMetadataMutations(t *testing.T) {
 
 	cfg := server.BaseConfig(t)
 
-	workspaceName := framework.NewOrganizationFixture(t, server)
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
 
-	workspaceCfg := kcpclienthelper.SetCluster(rest.CopyConfig(cfg), workspaceName)
-	workspaceCRDClient, err := apiextensionclientset.NewForConfig(workspaceCfg)
+	workspaceCRDClient, err := kcpapiextensionsclientset.NewForConfig(cfg)
 	require.NoError(t, err, "error creating crd cluster client")
 
-	kube.Create(t, workspaceCRDClient.ApiextensionsV1().CustomResourceDefinitions(), metav1.GroupResource{Group: "apps.k8s.io", Resource: "deployments"})
+	kube.Create(t, workspaceCRDClient.ApiextensionsV1().CustomResourceDefinitions().Cluster(orgPath), metav1.GroupResource{Group: "apps.k8s.io", Resource: "deployments"})
 
-	kubeClusterClient, err := kubernetes.NewForConfig(kcpclienthelper.SetMultiClusterRoundTripper(rest.CopyConfig(cfg)))
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(cfg)
 	require.NoError(t, err, "error creating kube cluster client")
 
 	d := &appsv1.Deployment{
@@ -81,7 +78,7 @@ func TestMetadataMutations(t *testing.T) {
 	}
 
 	t.Logf("Creating deployment")
-	d, err = kubeClusterClient.AppsV1().Deployments("default").Create(logicalcluster.WithCluster(ctx, workspaceName), d, metav1.CreateOptions{})
+	d, err = kubeClusterClient.Cluster(orgPath).AppsV1().Deployments("default").Create(ctx, d, metav1.CreateOptions{})
 	require.NoError(t, err, "error creating deployment")
 
 	originalCreationTimestamp := d.CreationTimestamp
@@ -93,14 +90,14 @@ func TestMetadataMutations(t *testing.T) {
 	require.NoError(t, err, "error creating patch")
 
 	t.Logf("Patching deployment - trying to change creation timestamp")
-	patched, err := kubeClusterClient.AppsV1().Deployments("default").Patch(logicalcluster.WithCluster(ctx, workspaceName), d.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+	patched, err := kubeClusterClient.Cluster(orgPath).AppsV1().Deployments("default").Patch(ctx, d.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
 	require.NoError(t, err)
 	t.Logf("Verifying creation timestamp was not modified")
 	require.Equal(t, originalCreationTimestamp, patched.GetCreationTimestamp())
-
 }
 
 func encodeJSON(t *testing.T, obj interface{}) []byte {
+	t.Helper()
 	ret, err := json.Marshal(obj)
 	require.NoError(t, err)
 	return ret

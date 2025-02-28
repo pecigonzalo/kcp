@@ -23,17 +23,17 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	conditionsv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/apis/conditions/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/util/conditions"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	conditionsv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/apis/conditions/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/util/conditions"
 )
 
 func TestReconcile(t *testing.T) {
@@ -46,7 +46,9 @@ func TestReconcile(t *testing.T) {
 		apiExportHasExpectedHash             bool
 		apiExportHasSomeOtherHash            bool
 		hasPreexistingVerifyFailure          bool
-		listClusterWorkspaceShardsError      error
+		listShardsError                      error
+
+		apiBindings []interface{}
 
 		wantGenerationFailed          bool
 		wantError                     bool
@@ -85,8 +87,6 @@ func TestReconcile(t *testing.T) {
 
 			wantStatusHashSet: true,
 			wantIdentityValid: true,
-
-			wantVirtualWorkspaceURLsReady: true,
 		},
 		"identity verification fails when reference secret doesn't exist": {
 			secretRefSet: true,
@@ -109,24 +109,35 @@ func TestReconcile(t *testing.T) {
 			hasPreexistingVerifyFailure: true,
 
 			wantIdentityValid: true,
-
-			wantVirtualWorkspaceURLsReady: true,
 		},
-		"error listing clusterworkspaceshards": {
+		"error listing shards": {
 			secretRefSet: true,
 			secretExists: true,
 
 			wantStatusHashSet: true,
 			wantIdentityValid: true,
 
-			listClusterWorkspaceShardsError: errors.New("foo"),
-			wantVirtualWorkspaceURLsError:   true,
+			apiBindings: []interface{}{
+				"something",
+			},
+			listShardsError:               errors.New("foo"),
+			wantVirtualWorkspaceURLsError: true,
+		},
+		"virtualWorkspaceURLs set when APIBindings present": {
+			secretRefSet: true,
+			secretExists: true,
+
+			wantStatusHashSet: true,
+			wantIdentityValid: true,
+
+			apiBindings: []interface{}{
+				"something",
+			},
+			wantVirtualWorkspaceURLsReady: true,
 		},
 	}
 
 	for name, tc := range tests {
-		tc := tc // to avoid t.Parallel() races
-
 		t.Run(name, func(t *testing.T) {
 			createSecretCalled := false
 
@@ -138,7 +149,7 @@ func TestReconcile(t *testing.T) {
 				getNamespace: func(clusterName logicalcluster.Name, name string) (*corev1.Namespace, error) {
 					return &corev1.Namespace{}, nil
 				},
-				createNamespace: func(ctx context.Context, clusterName logicalcluster.Name, ns *corev1.Namespace) error {
+				createNamespace: func(ctx context.Context, clusterName logicalcluster.Path, ns *corev1.Namespace) error {
 					return nil
 				},
 				secretNamespace: "default-ns",
@@ -159,16 +170,16 @@ func TestReconcile(t *testing.T) {
 
 					return nil, apierrors.NewNotFound(corev1.Resource("secrets"), name)
 				},
-				createSecret: func(ctx context.Context, clusterName logicalcluster.Name, secret *corev1.Secret) error {
+				createSecret: func(ctx context.Context, clusterName logicalcluster.Path, secret *corev1.Secret) error {
 					createSecretCalled = true
 					return tc.createSecretError
 				},
-				listClusterWorkspaceShards: func() ([]*tenancyv1alpha1.ClusterWorkspaceShard, error) {
-					if tc.listClusterWorkspaceShardsError != nil {
-						return nil, tc.listClusterWorkspaceShardsError
+				listShards: func() ([]*corev1alpha1.Shard, error) {
+					if tc.listShardsError != nil {
+						return nil, tc.listShardsError
 					}
 
-					return []*tenancyv1alpha1.ClusterWorkspaceShard{
+					return []*corev1alpha1.Shard{
 						{
 							ObjectMeta: metav1.ObjectMeta{
 								Annotations: map[string]string{
@@ -176,8 +187,8 @@ func TestReconcile(t *testing.T) {
 								},
 								Name: "shard1",
 							},
-							Spec: tenancyv1alpha1.ClusterWorkspaceShardSpec{
-								ExternalURL: "https://server-1.kcp.dev/",
+							Spec: corev1alpha1.ShardSpec{
+								ExternalURL: "https://server-1.kcp.io/",
 							},
 						},
 						{
@@ -187,8 +198,8 @@ func TestReconcile(t *testing.T) {
 								},
 								Name: "shard2",
 							},
-							Spec: tenancyv1alpha1.ClusterWorkspaceShardSpec{
-								ExternalURL: "https://server-2.kcp.dev/",
+							Spec: corev1alpha1.ShardSpec{
+								ExternalURL: "https://server-2.kcp.io/",
 							},
 						},
 					}, nil
@@ -296,6 +307,8 @@ func TestReconcile(t *testing.T) {
 // requireConditionMatches looks for a condition matching c in g. Only fields that are set in c are compared (Type is
 // required, though). If c.Message is set, the test performed is contains rather than an exact match.
 func requireConditionMatches(t *testing.T, g conditions.Getter, c *conditionsv1alpha1.Condition) {
+	t.Helper()
+
 	actual := conditions.Get(g, c.Type)
 
 	require.NotNil(t, actual, "missing condition %q", c.Type)

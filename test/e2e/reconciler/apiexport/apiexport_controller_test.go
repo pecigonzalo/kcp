@@ -19,40 +19,38 @@ package apiexport
 import (
 	"context"
 	"testing"
-	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
 	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/util/conditions"
-	clientset "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/util/conditions"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
 	"github.com/kcp-dev/kcp/test/e2e/framework"
 )
 
 func TestRequeueWhenIdentitySecretAdded(t *testing.T) {
 	t.Parallel()
+	framework.Suite(t, "control-plane")
 
 	server := framework.SharedKcpServer(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	orgClusterName := framework.NewOrganizationFixture(t, server)
-	workspaceClusterName := framework.NewWorkspaceFixture(t, server, orgClusterName)
-	t.Logf("Running test in cluster %s", workspaceClusterName)
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
+	workspacePath, _ := framework.NewWorkspaceFixture(t, server, orgPath)
+	t.Logf("Running test in cluster %s", workspacePath)
 
 	cfg := server.BaseConfig(t)
 
-	kcpClusterClient, err := clientset.NewForConfig(cfg)
+	kcpClusterClient, err := kcpclientset.NewForConfig(cfg)
 	require.NoError(t, err, "error creating kcp cluster client")
 
-	kubeClusterClient, err := kubernetes.NewForConfig(cfg)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(cfg)
 	require.NoError(t, err, "error creating kube cluster client")
 
 	apiExport := &apisv1alpha1.APIExport{
@@ -72,22 +70,13 @@ func TestRequeueWhenIdentitySecretAdded(t *testing.T) {
 	t.Logf("Creating APIExport with reference to nonexistent identity secret")
 	apiExportClient := kcpClusterClient.ApisV1alpha1().APIExports()
 
-	_, err = apiExportClient.Create(logicalcluster.WithCluster(ctx, workspaceClusterName), apiExport, metav1.CreateOptions{})
+	_, err = apiExportClient.Cluster(workspacePath).Create(ctx, apiExport, metav1.CreateOptions{})
 	require.NoError(t, err, "error creating APIExport")
 
 	t.Logf("Verifying the APIExport gets IdentityVerificationFailedReason")
-	require.Eventually(t, func() bool {
-		export, err := apiExportClient.Get(logicalcluster.WithCluster(ctx, workspaceClusterName), apiExport.Name, metav1.GetOptions{})
-		if err != nil {
-			return false
-		}
-
-		if c := conditions.Get(export, apisv1alpha1.APIExportIdentityValid); c != nil {
-			return c.Reason == apisv1alpha1.IdentityVerificationFailedReason
-		}
-
-		return false
-	}, wait.ForeverTestTimeout, 100*time.Millisecond, "expected ")
+	framework.EventuallyCondition(t, func() (conditions.Getter, error) {
+		return apiExportClient.Cluster(workspacePath).Get(ctx, apiExport.Name, metav1.GetOptions{})
+	}, framework.IsNot(apisv1alpha1.APIExportIdentityValid).WithReason(apisv1alpha1.IdentityVerificationFailedReason))
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -100,22 +89,15 @@ func TestRequeueWhenIdentitySecretAdded(t *testing.T) {
 	}
 
 	t.Logf("Creating the referenced secret")
-	_, err = kubeClusterClient.CoreV1().Secrets("default").Create(logicalcluster.WithCluster(ctx, workspaceClusterName), secret, metav1.CreateOptions{})
+	_, err = kubeClusterClient.Cluster(workspacePath).CoreV1().Secrets("default").Create(ctx, secret, metav1.CreateOptions{})
 	require.NoError(t, err, "error creating secret")
 
 	t.Logf("Verifying the APIExport verifies and the identity and gets the expected generated identity hash")
-	var gotHash string
-	require.Eventually(t, func() bool {
-		export, err := apiExportClient.Get(logicalcluster.WithCluster(ctx, workspaceClusterName), apiExport.Name, metav1.GetOptions{})
-		if err != nil {
-			return false
-		}
+	framework.EventuallyCondition(t, func() (conditions.Getter, error) {
+		return apiExportClient.Cluster(workspacePath).Get(ctx, apiExport.Name, metav1.GetOptions{})
+	}, framework.Is(apisv1alpha1.APIExportIdentityValid))
 
-		if !conditions.IsTrue(export, apisv1alpha1.APIExportIdentityValid) {
-			return false
-		}
-
-		gotHash = export.Status.IdentityHash
-		return gotHash == "e9cee71ab932fde863338d08be4de9dfe39ea049bdafb342ce659ec5450b69ae"
-	}, wait.ForeverTestTimeout, 100*time.Millisecond, "expected identity valid condition and matching hash, got hash %s", gotHash)
+	export, err := apiExportClient.Cluster(workspacePath).Get(ctx, apiExport.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "e9cee71ab932fde863338d08be4de9dfe39ea049bdafb342ce659ec5450b69ae", export.Status.IdentityHash)
 }

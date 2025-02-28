@@ -19,71 +19,52 @@ package options
 import (
 	"fmt"
 
+	kcpkubernetesinformers "github.com/kcp-dev/client-go/informers"
 	"github.com/spf13/pflag"
 
-	kubernetesinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/rest"
 
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
 	apiexportoptions "github.com/kcp-dev/kcp/pkg/virtual/apiexport/options"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/rootapiserver"
 	initializingworkspacesoptions "github.com/kcp-dev/kcp/pkg/virtual/initializingworkspaces/options"
-	synceroptions "github.com/kcp-dev/kcp/pkg/virtual/syncer/options"
-	workspacesoptions "github.com/kcp-dev/kcp/pkg/virtual/workspaces/options"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 const virtualWorkspacesFlagPrefix = "virtual-workspaces-"
 
 type Options struct {
-	Workspaces             *workspacesoptions.Workspaces
-	Syncer                 *synceroptions.Syncer
 	APIExport              *apiexportoptions.APIExport
 	InitializingWorkspaces *initializingworkspacesoptions.InitializingWorkspaces
 }
 
 func NewOptions() *Options {
 	return &Options{
-		Workspaces:             workspacesoptions.New(),
-		Syncer:                 synceroptions.New(),
 		APIExport:              apiexportoptions.New(),
 		InitializingWorkspaces: initializingworkspacesoptions.New(),
 	}
 }
 
-func (v *Options) Validate() []error {
+func (o *Options) Validate() []error {
 	var errs []error
 
-	errs = append(errs, v.Workspaces.Validate(virtualWorkspacesFlagPrefix)...)
-	errs = append(errs, v.Syncer.Validate(virtualWorkspacesFlagPrefix)...)
-	errs = append(errs, v.APIExport.Validate(virtualWorkspacesFlagPrefix)...)
-	errs = append(errs, v.InitializingWorkspaces.Validate(virtualWorkspacesFlagPrefix)...)
+	errs = append(errs, o.APIExport.Validate(virtualWorkspacesFlagPrefix)...)
+	errs = append(errs, o.InitializingWorkspaces.Validate(virtualWorkspacesFlagPrefix)...)
 
 	return errs
 }
 
-func (v *Options) AddFlags(fs *pflag.FlagSet) {
-	v.Workspaces.AddFlags(fs, virtualWorkspacesFlagPrefix)
-	v.InitializingWorkspaces.AddFlags(fs, virtualWorkspacesFlagPrefix)
+func (o *Options) AddFlags(fs *pflag.FlagSet) {
+	o.InitializingWorkspaces.AddFlags(fs, virtualWorkspacesFlagPrefix)
 }
 
 func (o *Options) NewVirtualWorkspaces(
 	config *rest.Config,
 	rootPathPrefix string,
-	wildcardKubeInformers kubernetesinformers.SharedInformerFactory,
-	wildcardKcpInformers kcpinformers.SharedInformerFactory,
+	shardExternalURL func() string,
+	wildcardKubeInformers kcpkubernetesinformers.SharedInformerFactory,
+	wildcardKcpInformers, cachedKcpInformers kcpinformers.SharedInformerFactory,
 ) ([]rootapiserver.NamedVirtualWorkspace, error) {
-
-	workspaces, err := o.Workspaces.NewVirtualWorkspaces(rootPathPrefix, config, wildcardKubeInformers, wildcardKcpInformers)
-	if err != nil {
-		return nil, err
-	}
-
-	syncer, err := o.Syncer.NewVirtualWorkspaces(rootPathPrefix, config, wildcardKcpInformers)
-	if err != nil {
-		return nil, err
-	}
-
-	apiexports, err := o.APIExport.NewVirtualWorkspaces(rootPathPrefix, config, wildcardKcpInformers)
+	apiexports, err := o.APIExport.NewVirtualWorkspaces(rootPathPrefix, config, cachedKcpInformers)
 	if err != nil {
 		return nil, err
 	}
@@ -93,14 +74,14 @@ func (o *Options) NewVirtualWorkspaces(
 		return nil, err
 	}
 
-	all, err := merge(workspaces, syncer, apiexports, initializingworkspaces)
+	all, err := Merge(apiexports, initializingworkspaces)
 	if err != nil {
 		return nil, err
 	}
 	return all, nil
 }
 
-func merge(sets ...[]rootapiserver.NamedVirtualWorkspace) ([]rootapiserver.NamedVirtualWorkspace, error) {
+func Merge(sets ...[]rootapiserver.NamedVirtualWorkspace) ([]rootapiserver.NamedVirtualWorkspace, error) {
 	var workspaces []rootapiserver.NamedVirtualWorkspace
 	seen := map[string]bool{}
 	for _, set := range sets {

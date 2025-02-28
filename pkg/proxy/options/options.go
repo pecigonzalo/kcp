@@ -27,12 +27,14 @@ import (
 )
 
 type Options struct {
-	SecureServing   apiserveroptions.SecureServingOptionsWithLoopback
-	Authentication  Authentication
-	MappingFile     string
-	RootDirectory   string
-	RootKubeconfig  string
-	ProfilerAddress string
+	SecureServing         apiserveroptions.SecureServingOptionsWithLoopback
+	Authentication        Authentication
+	MappingFile           string
+	RootDirectory         string
+	RootKubeconfig        string
+	ShardsKubeconfig      string
+	ProfilerAddress       string
+	CorsAllowedOriginList []string
 }
 
 func NewOptions() *Options {
@@ -56,7 +58,9 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.MappingFile, "mapping-file", o.MappingFile, "Config file mapping paths to backends")
 	fs.StringVar(&o.RootDirectory, "root-directory", o.RootDirectory, "Root directory.")
 	fs.StringVar(&o.RootKubeconfig, "root-kubeconfig", o.RootKubeconfig, "The path to the kubeconfig of the root shard.")
+	fs.StringVar(&o.ShardsKubeconfig, "shards-kubeconfig", o.ShardsKubeconfig, "The path to the kubeconfig used for communication with all shards. The server name if provided is replaced with a shard's hostname.")
 	fs.StringVar(&o.ProfilerAddress, "profiler-address", "", "[Address]:port to bind the profiler to")
+	fs.StringSliceVar(&o.CorsAllowedOriginList, "cors-allowed-origins", o.CorsAllowedOriginList, "List of allowed origins for CORS, comma separated.  An allowed origin can be a regular expression to support subdomain matching. If this list is empty CORS will not be enabled.")
 }
 
 func (o *Options) Complete() error {
@@ -75,11 +79,7 @@ func (o *Options) Complete() error {
 		o.SecureServing.ServerCert.CertDirectory = filepath.Join(o.RootDirectory, o.SecureServing.ServerCert.CertDirectory)
 	}
 
-	if err := o.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", []string{"kubernetes.default.svc", "kubernetes.default", "kubernetes"}, nil); err != nil {
-		return err
-	}
-
-	return nil
+	return o.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", []string{"kubernetes.default.svc", "kubernetes.default", "kubernetes"}, nil)
 }
 
 func (o *Options) Validate() []error {
@@ -87,6 +87,9 @@ func (o *Options) Validate() []error {
 
 	if o.MappingFile == "" {
 		errs = append(errs, fmt.Errorf("--mapping-file is required"))
+	}
+	if len(o.ShardsKubeconfig) == 0 {
+		errs = append(errs, fmt.Errorf("--shards-kubeconfig is required"))
 	}
 
 	errs = append(errs, o.SecureServing.Validate()...)

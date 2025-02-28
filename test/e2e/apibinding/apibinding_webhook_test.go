@@ -25,12 +25,12 @@ import (
 	"testing"
 	"time"
 
-	kcpclienthelper "github.com/kcp-dev/apimachinery/pkg/client"
-	kcpdynamic "github.com/kcp-dev/apimachinery/pkg/dynamic"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 	"github.com/stretchr/testify/require"
 
-	v1 "k8s.io/api/admission/v1"
+	admissionv1 "k8s.io/api/admission/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,49 +39,47 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery/cached/memory"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 
 	"github.com/kcp-dev/kcp/config/helpers"
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	clientset "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
 	webhookserver "github.com/kcp-dev/kcp/test/e2e/fixtures/webhook"
 	"github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/apis/wildwest/v1alpha1"
-	client "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/client/clientset/versioned"
+	wildwestclientset "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/client/clientset/versioned/cluster"
 	"github.com/kcp-dev/kcp/test/e2e/framework"
 )
 
 func TestAPIBindingMutatingWebhook(t *testing.T) {
 	t.Parallel()
+	framework.Suite(t, "control-plane")
 
 	server := framework.SharedKcpServer(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	orgClusterName := framework.NewOrganizationFixture(t, server)
-	sourceWorkspace := framework.NewWorkspaceFixture(t, server, orgClusterName)
-	targetWorkspace := framework.NewWorkspaceFixture(t, server, orgClusterName)
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
+	sourcePath, _ := framework.NewWorkspaceFixture(t, server, orgPath)
+	targetPath, _ := framework.NewWorkspaceFixture(t, server, orgPath)
 
 	cfg := server.BaseConfig(t)
 
-	kcpClusterClient, err := clientset.NewForConfig(cfg)
+	kcpClusterClient, err := kcpclientset.NewForConfig(cfg)
 	require.NoError(t, err, "failed to construct kcp cluster client for server")
 
-	dynamicClusterClient, err := kcpdynamic.NewClusterDynamicClientForConfig(cfg)
+	dynamicClusterClient, err := kcpdynamic.NewForConfig(cfg)
 	require.NoError(t, err, "failed to construct dynamic cluster client for server")
 
-	kubeClusterClient, err := kubernetes.NewForConfig(cfg)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(cfg)
 	require.NoError(t, err, "failed to construct client for server")
 
-	sourceWorkspaceConfig := kcpclienthelper.SetCluster(rest.CopyConfig(cfg), sourceWorkspace)
-	sourceWorkspaceClient, err := clientset.NewForConfig(sourceWorkspaceConfig)
+	sourceWorkspaceClient, err := kcpclientset.NewForConfig(cfg)
 	require.NoError(t, err)
 
-	t.Logf("Install a cowboys APIResourceSchema into workspace %q", sourceWorkspace)
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(sourceWorkspaceClient.Discovery()))
-	err = helpers.CreateResourceFromFS(ctx, dynamicClusterClient.Cluster(sourceWorkspace), mapper, nil, "apiresourceschema_cowboys.yaml", testFiles)
+	t.Logf("Install a cowboys APIResourceSchema into workspace %q", sourcePath)
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(sourceWorkspaceClient.Cluster(sourcePath).Discovery()))
+	err = helpers.CreateResourceFromFS(ctx, dynamicClusterClient.Cluster(sourcePath), mapper, nil, "apiresourceschema_cowboys.yaml", testFiles)
 	require.NoError(t, err)
 
 	t.Logf("Create an APIExport for it")
@@ -93,46 +91,48 @@ func TestAPIBindingMutatingWebhook(t *testing.T) {
 			LatestResourceSchemas: []string{"today.cowboys.wildwest.dev"},
 		},
 	}
-	_, err = kcpClusterClient.ApisV1alpha1().APIExports().Create(logicalcluster.WithCluster(ctx, sourceWorkspace), cowboysAPIExport, metav1.CreateOptions{})
+	_, err = kcpClusterClient.Cluster(sourcePath).ApisV1alpha1().APIExports().Create(ctx, cowboysAPIExport, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	t.Logf("Create an APIBinding in workspace %q that points to the today-cowboys export", targetWorkspace)
+	t.Logf("Create an APIBinding in workspace %q that points to the today-cowboys export", targetPath)
 	require.NoError(t, err)
 	apiBinding := &apisv1alpha1.APIBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "cowboys",
 		},
 		Spec: apisv1alpha1.APIBindingSpec{
-			Reference: apisv1alpha1.ExportReference{
-				Workspace: &apisv1alpha1.WorkspaceExportReference{
-					Path:       sourceWorkspace.String(),
-					ExportName: cowboysAPIExport.Name,
+			Reference: apisv1alpha1.BindingReference{
+				Export: &apisv1alpha1.ExportBindingReference{
+					Path: sourcePath.String(),
+					Name: cowboysAPIExport.Name,
 				},
 			},
 		},
 	}
 
-	_, err = kcpClusterClient.ApisV1alpha1().APIBindings().Create(logicalcluster.WithCluster(ctx, targetWorkspace), apiBinding, metav1.CreateOptions{})
-	require.NoError(t, err)
+	framework.Eventually(t, func() (bool, string) {
+		_, err := kcpClusterClient.Cluster(targetPath).ApisV1alpha1().APIBindings().Create(ctx, apiBinding, metav1.CreateOptions{})
+		return err == nil, fmt.Sprintf("Error creating APIBinding: %v", err)
+	}, wait.ForeverTestTimeout, time.Millisecond*100)
 
 	scheme := runtime.NewScheme()
 	err = admissionregistrationv1.AddToScheme(scheme)
 	require.NoError(t, err, "failed to add admission registration v1 scheme")
-	err = v1.AddToScheme(scheme)
+	err = admissionv1.AddToScheme(scheme)
 	require.NoError(t, err, "failed to add admission v1 scheme")
 	err = v1alpha1.AddToScheme(scheme)
 	require.NoError(t, err, "failed to add cowboy v1alpha1 to scheme")
-	cowbyClusterClient, err := client.NewForConfig(cfg)
+	cowbyClusterClient, err := wildwestclientset.NewForConfig(cfg)
 	require.NoError(t, err, "failed to add cowboy v1alpha1 to scheme")
 	codecs := serializer.NewCodecFactory(scheme)
 	deserializer := codecs.UniversalDeserializer()
 
 	t.Logf("Create test server and create mutating webhook for cowboys in both source and target cluster")
-	testWebhooks := map[logicalcluster.Name]*webhookserver.AdmissionWebhookServer{}
-	for _, cluster := range []logicalcluster.Name{sourceWorkspace, targetWorkspace} {
+	testWebhooks := map[logicalcluster.Path]*webhookserver.AdmissionWebhookServer{}
+	for _, cluster := range []logicalcluster.Path{sourcePath, targetPath} {
 		testWebhooks[cluster] = &webhookserver.AdmissionWebhookServer{
-			Response: v1.AdmissionResponse{
-				Allowed: true,
+			ResponseFn: func(review *admissionv1.AdmissionReview) (*admissionv1.AdmissionResponse, error) {
+				return &admissionv1.AdmissionResponse{Allowed: true}, nil
 			},
 			ObjectGVK: schema.GroupVersionKind{
 				Group:   "wildwest.dev",
@@ -171,7 +171,7 @@ func TestAPIBindingMutatingWebhook(t *testing.T) {
 				AdmissionReviewVersions: []string{"v1"},
 			}},
 		}
-		_, err = kubeClusterClient.AdmissionregistrationV1().MutatingWebhookConfigurations().Create(logicalcluster.WithCluster(ctx, cluster), webhook, metav1.CreateOptions{})
+		_, err = kubeClusterClient.Cluster(cluster).AdmissionregistrationV1().MutatingWebhookConfigurations().Create(ctx, webhook, metav1.CreateOptions{})
 		require.NoError(t, err, "failed to add validating webhook configurations")
 	}
 
@@ -185,47 +185,48 @@ func TestAPIBindingMutatingWebhook(t *testing.T) {
 	// Avoid race condition here by making sure that CRD is served after installing the types into logical clusters
 	t.Logf("Creating cowboy resource in target logical cluster")
 	require.Eventually(t, func() bool {
-		_, err = cowbyClusterClient.WildwestV1alpha1().Cowboys("default").Create(logicalcluster.WithCluster(ctx, targetWorkspace), &cowboy, metav1.CreateOptions{})
+		_, err = cowbyClusterClient.Cluster(targetPath).WildwestV1alpha1().Cowboys("default").Create(ctx, &cowboy, metav1.CreateOptions{})
+		t.Log(err)
 		if err != nil && !errors.IsAlreadyExists(err) {
 			return false
 		}
-		return testWebhooks[sourceWorkspace].Calls() >= 1
+		return testWebhooks[sourcePath].Calls() >= 1
 	}, wait.ForeverTestTimeout, 100*time.Millisecond)
 
 	t.Logf("Check that the in-workspace webhook was NOT called")
-	require.Zero(t, testWebhooks[targetWorkspace].Calls(), "in-workspace webhook should not have been called")
+	require.Zero(t, testWebhooks[targetPath].Calls(), "in-workspace webhook should not have been called")
 }
 
 func TestAPIBindingValidatingWebhook(t *testing.T) {
 	t.Parallel()
+	framework.Suite(t, "control-plane")
 
 	server := framework.SharedKcpServer(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	orgClusterName := framework.NewOrganizationFixture(t, server)
-	sourceWorkspace := framework.NewWorkspaceFixture(t, server, orgClusterName)
-	targetWorkspace := framework.NewWorkspaceFixture(t, server, orgClusterName)
+	orgPath, _ := framework.NewOrganizationFixture(t, server)
+	sourcePath, _ := framework.NewWorkspaceFixture(t, server, orgPath)
+	targetPath, _ := framework.NewWorkspaceFixture(t, server, orgPath)
 
 	cfg := server.BaseConfig(t)
 
-	kcpClients, err := clientset.NewForConfig(cfg)
+	kcpClients, err := kcpclientset.NewForConfig(cfg)
 	require.NoError(t, err, "failed to construct kcp cluster client for server")
 
-	dynamicClusterClient, err := kcpdynamic.NewClusterDynamicClientForConfig(cfg)
+	dynamicClusterClient, err := kcpdynamic.NewForConfig(cfg)
 	require.NoError(t, err, "failed to construct dynamic cluster client for server")
 
-	kubeClusterClient, err := kubernetes.NewForConfig(cfg)
+	kubeClusterClient, err := kcpkubernetesclientset.NewForConfig(cfg)
 	require.NoError(t, err, "failed to construct client for server")
 
-	sourceWorkspaceConfig := kcpclienthelper.SetCluster(rest.CopyConfig(cfg), sourceWorkspace)
-	sourceWorkspaceClient, err := clientset.NewForConfig(sourceWorkspaceConfig)
+	sourceWorkspaceClient, err := kcpclientset.NewForConfig(cfg)
 	require.NoError(t, err)
 
-	t.Logf("Install a cowboys APIResourceSchema into workspace %q", sourceWorkspace)
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(sourceWorkspaceClient.Discovery()))
-	err = helpers.CreateResourceFromFS(ctx, dynamicClusterClient.Cluster(sourceWorkspace), mapper, nil, "apiresourceschema_cowboys.yaml", testFiles)
+	t.Logf("Install a cowboys APIResourceSchema into workspace %q", sourcePath)
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(sourceWorkspaceClient.Cluster(sourcePath).Discovery()))
+	err = helpers.CreateResourceFromFS(ctx, dynamicClusterClient.Cluster(sourcePath), mapper, nil, "apiresourceschema_cowboys.yaml", testFiles)
 	require.NoError(t, err)
 
 	t.Logf("Create an APIExport for it")
@@ -237,46 +238,48 @@ func TestAPIBindingValidatingWebhook(t *testing.T) {
 			LatestResourceSchemas: []string{"today.cowboys.wildwest.dev"},
 		},
 	}
-	_, err = kcpClients.ApisV1alpha1().APIExports().Create(logicalcluster.WithCluster(ctx, sourceWorkspace), cowboysAPIExport, metav1.CreateOptions{})
+	_, err = kcpClients.Cluster(sourcePath).ApisV1alpha1().APIExports().Create(ctx, cowboysAPIExport, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	t.Logf("Create an APIBinding in workspace %q that points to the today-cowboys export", targetWorkspace)
+	t.Logf("Create an APIBinding in workspace %q that points to the today-cowboys export", targetPath)
 	require.NoError(t, err)
 	apiBinding := &apisv1alpha1.APIBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "cowboys",
 		},
 		Spec: apisv1alpha1.APIBindingSpec{
-			Reference: apisv1alpha1.ExportReference{
-				Workspace: &apisv1alpha1.WorkspaceExportReference{
-					Path:       sourceWorkspace.String(),
-					ExportName: cowboysAPIExport.Name,
+			Reference: apisv1alpha1.BindingReference{
+				Export: &apisv1alpha1.ExportBindingReference{
+					Path: sourcePath.String(),
+					Name: cowboysAPIExport.Name,
 				},
 			},
 		},
 	}
 
-	_, err = kcpClients.ApisV1alpha1().APIBindings().Create(logicalcluster.WithCluster(ctx, targetWorkspace), apiBinding, metav1.CreateOptions{})
-	require.NoError(t, err)
+	framework.Eventually(t, func() (bool, string) {
+		_, err := kcpClients.Cluster(targetPath).ApisV1alpha1().APIBindings().Create(ctx, apiBinding, metav1.CreateOptions{})
+		return err == nil, fmt.Sprintf("Error creating APIBinding: %v", err)
+	}, wait.ForeverTestTimeout, time.Millisecond*100)
 
 	scheme := runtime.NewScheme()
 	err = admissionregistrationv1.AddToScheme(scheme)
 	require.NoError(t, err, "failed to add admission registration v1 scheme")
-	err = v1.AddToScheme(scheme)
+	err = admissionv1.AddToScheme(scheme)
 	require.NoError(t, err, "failed to add admission v1 scheme")
 	err = v1alpha1.AddToScheme(scheme)
 	require.NoError(t, err, "failed to add cowboy v1alpha1 to scheme")
-	cowbyClusterClient, err := client.NewForConfig(cfg)
+	cowbyClusterClient, err := wildwestclientset.NewForConfig(cfg)
 	require.NoError(t, err, "failed to add cowboy v1alpha1 to scheme")
 	codecs := serializer.NewCodecFactory(scheme)
 	deserializer := codecs.UniversalDeserializer()
 
 	t.Logf("Create test server and create validating webhook for cowboys in both source and target cluster")
-	testWebhooks := map[logicalcluster.Name]*webhookserver.AdmissionWebhookServer{}
-	for _, cluster := range []logicalcluster.Name{sourceWorkspace, targetWorkspace} {
+	testWebhooks := map[logicalcluster.Path]*webhookserver.AdmissionWebhookServer{}
+	for _, cluster := range []logicalcluster.Path{sourcePath, targetPath} {
 		testWebhooks[cluster] = &webhookserver.AdmissionWebhookServer{
-			Response: v1.AdmissionResponse{
-				Allowed: true,
+			ResponseFn: func(review *admissionv1.AdmissionReview) (*admissionv1.AdmissionResponse, error) {
+				return &admissionv1.AdmissionResponse{Allowed: true}, nil
 			},
 			ObjectGVK: schema.GroupVersionKind{
 				Group:   "wildwest.dev",
@@ -292,8 +295,12 @@ func TestAPIBindingValidatingWebhook(t *testing.T) {
 
 		framework.Eventually(t, func() (bool, string) {
 			cl := gohttp.Client{Transport: &gohttp.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-			_, err := cl.Get(testWebhooks[cluster].GetURL())
-			return err == nil, fmt.Sprintf("%v", err)
+			resp, err := cl.Get(testWebhooks[cluster].GetURL()) //nolint:noctx
+			if err != nil {
+				return false, err.Error()
+			}
+			resp.Body.Close()
+			return true, ""
 		}, wait.ForeverTestTimeout, 100*time.Millisecond, "failed to connect to webhook")
 
 		sideEffect := admissionregistrationv1.SideEffectClassNone
@@ -321,7 +328,7 @@ func TestAPIBindingValidatingWebhook(t *testing.T) {
 				AdmissionReviewVersions: []string{"v1"},
 			}},
 		}
-		_, err = kubeClusterClient.AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(logicalcluster.WithCluster(ctx, cluster), webhook, metav1.CreateOptions{})
+		_, err = kubeClusterClient.Cluster(cluster).AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(ctx, webhook, metav1.CreateOptions{})
 		require.NoError(t, err, "failed to add validating webhook configurations")
 	}
 
@@ -334,17 +341,17 @@ func TestAPIBindingValidatingWebhook(t *testing.T) {
 
 	t.Logf("Ensure cowboys are served")
 	require.Eventually(t, func() bool {
-		_, err := cowbyClusterClient.WildwestV1alpha1().Cowboys("default").List(logicalcluster.WithCluster(ctx, targetWorkspace), metav1.ListOptions{})
+		_, err := cowbyClusterClient.Cluster(targetPath).WildwestV1alpha1().Cowboys("default").List(ctx, metav1.ListOptions{})
 		return err == nil
 	}, wait.ForeverTestTimeout, 100*time.Millisecond)
 
 	t.Logf("Creating cowboy resource in target logical cluster, eventually going through admission webhook")
 	require.Eventually(t, func() bool {
-		_, err = cowbyClusterClient.WildwestV1alpha1().Cowboys("default").Create(logicalcluster.WithCluster(ctx, targetWorkspace), &cowboy, metav1.CreateOptions{})
+		_, err = cowbyClusterClient.Cluster(targetPath).WildwestV1alpha1().Cowboys("default").Create(ctx, &cowboy, metav1.CreateOptions{})
 		require.NoError(t, err)
-		return testWebhooks[sourceWorkspace].Calls() >= 1
+		return testWebhooks[sourcePath].Calls() >= 1
 	}, wait.ForeverTestTimeout, 100*time.Millisecond)
 
 	t.Logf("Check that the in-workspace webhook was NOT called")
-	require.Zero(t, testWebhooks[targetWorkspace].Calls(), "in-workspace webhook should not have been called")
+	require.Zero(t, testWebhooks[targetPath].Calls(), "in-workspace webhook should not have been called")
 }

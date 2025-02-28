@@ -21,15 +21,14 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	"k8s.io/apiserver/pkg/authorization/authorizer"
-	"k8s.io/client-go/kubernetes"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	kcpauth "github.com/kcp-dev/kcp/pkg/authorization"
 	"github.com/kcp-dev/kcp/pkg/authorization/delegated"
 	dynamiccontext "github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/context"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 type apiExportsContentAuthorizer struct {
@@ -42,16 +41,13 @@ type apiExportsContentAuthorizer struct {
 // The given kube cluster client is used to execute a SAR request against the cluster of the current in-flight API export.
 // If the SAR decision allows access, the given delegate authorizer is executed to proceed the authorizer chain,
 // else access is denied.
-func NewAPIExportsContentAuthorizer(delegate authorizer.Authorizer, kubeClusterClient kubernetes.ClusterInterface) authorizer.Authorizer {
-	auth := &apiExportsContentAuthorizer{
+func NewAPIExportsContentAuthorizer(delegate authorizer.Authorizer, kubeClusterClient kcpkubernetesclientset.ClusterInterface) authorizer.Authorizer {
+	return &apiExportsContentAuthorizer{
 		newDelegatedAuthorizer: func(clusterName string) (authorizer.Authorizer, error) {
-			return delegated.NewDelegatedAuthorizer(logicalcluster.New(clusterName), kubeClusterClient)
+			return delegated.NewDelegatedAuthorizer(logicalcluster.Name(clusterName), kubeClusterClient, delegated.Options{})
 		},
 		delegate: delegate,
 	}
-
-	return kcpauth.NewAnonymizer("virtual apiexport content authorizer",
-		kcpauth.NewAuditLogger("virtual.apiexport.content.authorization.kcp.dev", auth))
 }
 
 func (a *apiExportsContentAuthorizer) Authorize(ctx context.Context, attr authorizer.Attributes) (authorizer.Decision, string, error) {

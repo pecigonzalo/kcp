@@ -32,7 +32,8 @@ import (
 
 	configcrds "github.com/kcp-dev/kcp/config/crds"
 	confighelpers "github.com/kcp-dev/kcp/config/helpers"
-	"github.com/kcp-dev/kcp/pkg/apis/apis"
+	"github.com/kcp-dev/kcp/sdk/apis/apis"
+	"github.com/kcp-dev/kcp/sdk/apis/core"
 )
 
 //go:embed *.yaml
@@ -41,7 +42,8 @@ var fs embed.FS
 // Bootstrap creates CRDs and the resources in this package by continuously retrying the list.
 // This is blocking, i.e. it only returns (with error) when the context is closed or with nil when
 // the bootstrapping is successfully completed.
-func Bootstrap(ctx context.Context, crdClient apiextensionsclient.Interface, discoveryClient discovery.DiscoveryInterface, dynamicClient dynamic.Interface, batteriesIncluded sets.String) error {
+func Bootstrap(ctx context.Context, crdClient apiextensionsclient.Interface, discoveryClient discovery.DiscoveryInterface, dynamicClient dynamic.Interface, batteriesIncluded sets.Set[string]) error {
+	logger := klog.FromContext(ctx)
 	// This is the full list of CRDs that kcp owns and manages in the system:system-crds logical cluster. Our custom CRD
 	// lister currently has a hard-coded list of which system CRDs are made available to which workspaces. See
 	// pkg/server/apiextensions.go newSystemCRDProvider for the list. These CRDs should never be installed in any other
@@ -51,11 +53,14 @@ func Bootstrap(ctx context.Context, crdClient apiextensionsclient.Interface, dis
 		{Group: apis.GroupName, Resource: "apiexports"},
 		{Group: apis.GroupName, Resource: "apibindings"},
 		{Group: apis.GroupName, Resource: "apiresourceschemas"},
+		{Group: apis.GroupName, Resource: "apiexportendpointslices"},
+		{Group: core.GroupName, Resource: "logicalclusters"},
+		{Group: apis.GroupName, Resource: "apiconversions"},
 	}
 
-	if err := wait.PollImmediateInfiniteWithContext(ctx, time.Second, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
 		if err := configcrds.Create(ctx, crdClient.ApiextensionsV1().CustomResourceDefinitions(), crds...); err != nil {
-			klog.Errorf("failed to bootstrap system CRDs: %v", err)
+			logger.Error(err, "failed to bootstrap system CRDs, retrying")
 			return false, nil // keep retrying
 		}
 		return true, nil

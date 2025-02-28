@@ -21,7 +21,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/emicklei/go-restful"
+	"github.com/emicklei/go-restful/v3"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,7 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
+	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
 	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/util/openapi"
+	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
 
 	virtualcontext "github.com/kcp-dev/kcp/pkg/virtual/framework/context"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/apidefinition"
@@ -39,7 +42,7 @@ var (
 	scheme = runtime.NewScheme()
 	codecs = serializer.NewCodecFactory(scheme)
 
-	// if you modify this, make sure you update the crEncoder
+	// if you modify this, make sure you update the crEncoder.
 	unversionedVersion = schema.GroupVersion{Group: "", Version: "v1"}
 	unversionedTypes   = []runtime.Object{
 		&metav1.Status{},
@@ -58,12 +61,12 @@ func init() {
 	scheme.AddUnversionedTypes(unversionedVersion, unversionedTypes...)
 }
 
-// DynamicAPIServerExtraConfig contains additional configuration for the DynamicAPIServer
+// DynamicAPIServerExtraConfig contains additional configuration for the DynamicAPIServer.
 type DynamicAPIServerExtraConfig struct {
 	APISetRetriever apidefinition.APIDefinitionSetGetter
 }
 
-// DynamicAPIServerConfig contains the configuration for the DynamicAPIServer
+// DynamicAPIServerConfig contains the configuration for the DynamicAPIServer.
 type DynamicAPIServerConfig struct {
 	GenericConfig *genericapiserver.RecommendedConfig
 	ExtraConfig   DynamicAPIServerExtraConfig
@@ -177,14 +180,21 @@ func (c completedConfig) New(virtualWorkspaceName string, delegationTarget gener
 
 	s.GenericAPIServer.Handler.GoRestfulContainer.Add(discovery.NewLegacyRootAPIHandler(c.GenericConfig.DiscoveryAddresses, s.GenericAPIServer.Serializer, "/api").WebService())
 
+	if !c.GenericConfig.SkipOpenAPIInstallation {
+		getOpenAPIDefinitions := openapi.GetOpenAPIDefinitionsWithoutDisabledFeatures(generatedopenapi.GetOpenAPIDefinitions)
+		namer := openapinamer.NewDefinitionNamer(scheme)
+		openapiv3Config := genericapiserver.DefaultOpenAPIV3Config(getOpenAPIDefinitions, namer)
+		openapiv3Config.Info.Title = "Kubernetes"
+
+		openAPIHandler := newOpenAPIHandler(s.APISetRetriever, s.GenericAPIServer.Handler.GoRestfulContainer, openapiv3Config, DefaultServiceCacheSize, delegateHandler)
+
+		s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/openapi", openAPIHandler)
+		s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/openapi/", openAPIHandler)
+	}
+
 	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/api/v1", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/api/v1/", crdHandler)
-
-	// TODO(david): plug OpenAPI if necessary. For now, according to the various virtual workspace use-cases,
-	// it doesn't seem necessary.
-	// Of course this requires using the --validate=false argument with some kubectl command like kubectl apply.
-
 	return s, nil
 }

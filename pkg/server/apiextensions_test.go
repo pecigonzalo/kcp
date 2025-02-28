@@ -27,11 +27,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/kcp-dev/kcp/pkg/admission/reservedcrdgroups"
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 func TestSystemCRDsLogicalClusterName(t *testing.T) {
-	require.Equal(t, SystemCRDLogicalCluster.String(), reservedcrdgroups.SystemCRDLogicalClusterName, "reservedcrdgroups admission check should match SystemCRDLogicalCluster")
+	require.Equal(t, SystemCRDClusterName.String(), reservedcrdgroups.SystemCRDLogicalClusterName, "reservedcrdgroups admission check should match SystemCRDLogicalCluster")
 }
 
 func TestDecorateCRDWithBinding(t *testing.T) {
@@ -112,11 +112,11 @@ func TestDecorateCRDWithBinding(t *testing.T) {
 					t.Fatalf("Missing status condition %v", expCondition.Type)
 				}
 
-				if cond.Status != expCondition.Status {
+				if cond != nil && cond.Status != expCondition.Status {
 					t.Errorf("expect condition status %q, got %q for type %s", expCondition.Status, cond.Status, cond.Type)
 				}
 
-				if cond.Reason != expCondition.Reason {
+				if cond != nil && cond.Reason != expCondition.Reason {
 					t.Errorf("expect condition reason %q, got %q for type %s", expCondition.Reason, cond.Reason, cond.Type)
 				}
 			}
@@ -129,5 +129,43 @@ func TestDecorateCRDWithBinding(t *testing.T) {
 				t.Errorf("expect deletetime %v, got %v", tt.deleteTime, newCrd.DeletionTimestamp)
 			}
 		})
+	}
+}
+
+func TestShallowCopyAndMakePartialMetadataCRD(t *testing.T) {
+	original := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{},
+		},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+				{
+					Schema: &apiextensionsv1.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+							Description: "desc",
+							Type:        "bob",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	shallow := shallowCopyCRDAndDeepCopyAnnotations(original)
+	addPartialMetadataCRDAnnotation(shallow)
+
+	// Validate that we've added the annotation in the shallow copy.
+	_, ok := shallow.Annotations[annotationKeyPartialMetadata]
+	require.True(t, ok)
+
+	// Validate that the original still has description and type intact.
+	_, ok = original.Annotations[annotationKeyPartialMetadata]
+	require.False(t, ok)
+
+	if original.Spec.Versions[0].Schema.OpenAPIV3Schema.Description != "desc" {
+		t.Errorf("expected shallow copy to not modify original schema description")
+	}
+	if original.Spec.Versions[0].Schema.OpenAPIV3Schema.Type != "bob" {
+		t.Error("expected shallow copy to not modify original schema type")
 	}
 }

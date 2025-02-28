@@ -20,28 +20,46 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/tools/clusters"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
-	"github.com/kcp-dev/kcp/pkg/apis/apis"
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1/permissionclaims"
-	apisinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/apis/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/indexers"
 	"github.com/kcp-dev/kcp/pkg/logging"
+	"github.com/kcp-dev/kcp/sdk/apis/apis"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1/permissionclaims"
+	apisv1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/apis/v1alpha1"
 )
+
+// NonPersistedResourcesClaimable is a list of resources that are not persisted
+// to etcd, and therefore should not be labeled with permission claims. The value
+// means whether they are claimable or not.
+var NonPersistedResourcesClaimable = map[schema.GroupResource]bool{
+	authorizationv1.SchemeGroupVersion.WithResource("localsubjectaccessreviews").GroupResource(): true,
+	authorizationv1.SchemeGroupVersion.WithResource("selfsubjectaccessreviews").GroupResource():  false,
+	authorizationv1.SchemeGroupVersion.WithResource("selfsubjectrulesreviews").GroupResource():   false,
+	authorizationv1.SchemeGroupVersion.WithResource("subjectaccessreviews").GroupResource():      true,
+	authenticationv1.SchemeGroupVersion.WithResource("selfsubjectreviews").GroupResource():       false,
+	authenticationv1.SchemeGroupVersion.WithResource("tokenreviews").GroupResource():             false,
+}
 
 // Labeler calculates labels to apply to all instances of a cluster-group-resource based on permission claims.
 type Labeler struct {
 	listAPIBindingsAcceptingClaimedGroupResource func(clusterName logicalcluster.Name, groupResource schema.GroupResource) ([]*apisv1alpha1.APIBinding, error)
 	getAPIBinding                                func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIBinding, error)
+	getAPIExport                                 func(path logicalcluster.Path, name string) (*apisv1alpha1.APIExport, error)
 }
 
 // NewLabeler returns a new Labeler.
-func NewLabeler(apiBindingInformer apisinformers.APIBindingInformer) *Labeler {
+func NewLabeler(
+	apiBindingInformer apisv1alpha1informers.APIBindingClusterInformer,
+	apiExportInformer, globalAPIExportInformer apisv1alpha1informers.APIExportClusterInformer,
+) *Labeler {
 	return &Labeler{
 		listAPIBindingsAcceptingClaimedGroupResource: func(clusterName logicalcluster.Name, groupResource schema.GroupResource) ([]*apisv1alpha1.APIBinding, error) {
 			indexKey := indexers.ClusterAndGroupResourceValue(clusterName, groupResource)
@@ -49,8 +67,10 @@ func NewLabeler(apiBindingInformer apisinformers.APIBindingInformer) *Labeler {
 		},
 
 		getAPIBinding: func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIBinding, error) {
-			key := clusters.ToClusterAwareKey(clusterName, name)
-			return apiBindingInformer.Lister().Get(key)
+			return apiBindingInformer.Lister().Cluster(clusterName).Get(name)
+		},
+		getAPIExport: func(path logicalcluster.Path, name string) (*apisv1alpha1.APIExport, error) {
+			return indexers.ByPathAndNameWithFallback[*apisv1alpha1.APIExport](apisv1alpha1.Resource("apiexports"), apiExportInformer.Informer().GetIndexer(), globalAPIExportInformer.Informer().GetIndexer(), path, name)
 		},
 	}
 }
@@ -60,6 +80,9 @@ func NewLabeler(apiBindingInformer apisinformers.APIBindingInformer) *Labeler {
 // associated APIExports that are claiming group-resource.
 func (l *Labeler) LabelsFor(ctx context.Context, cluster logicalcluster.Name, groupResource schema.GroupResource, resourceName string) (map[string]string, error) {
 	labels := map[string]string{}
+	if _, nonPersisted := NonPersistedResourcesClaimable[groupResource]; nonPersisted {
+		return labels, nil
+	}
 
 	bindings, err := l.listAPIBindingsAcceptingClaimedGroupResource(cluster, groupResource)
 	if err != nil {
@@ -71,19 +94,21 @@ func (l *Labeler) LabelsFor(ctx context.Context, cluster logicalcluster.Name, gr
 	for _, binding := range bindings {
 		logger := logging.WithObject(logger, binding)
 
-		if binding.Status.BoundAPIExport == nil {
-			logger.V(4).Info("skipping APIBinding because it has no bound APIExport")
+		path := logicalcluster.NewPath(binding.Spec.Reference.Export.Path)
+		if path.Empty() {
+			path = logicalcluster.From(binding).Path()
+		}
+		export, err := l.getAPIExport(path, binding.Spec.Reference.Export.Name)
+		if err != nil {
 			continue
 		}
 
-		boundAPIExportWorkspace := binding.Status.BoundAPIExport.Workspace
-
-		for _, claim := range binding.Status.ExportPermissionClaims {
-			if claim.Group != groupResource.Group || claim.Resource != groupResource.Resource {
+		for _, claim := range binding.Spec.PermissionClaims {
+			if claim.State != apisv1alpha1.ClaimAccepted || claim.Group != groupResource.Group || claim.Resource != groupResource.Resource {
 				continue
 			}
 
-			k, v, err := permissionclaims.ToLabelKeyAndValue(logicalcluster.New(boundAPIExportWorkspace.Path), boundAPIExportWorkspace.ExportName, claim)
+			k, v, err := permissionclaims.ToLabelKeyAndValue(logicalcluster.From(export), export.Name, claim.PermissionClaim)
 			if err != nil {
 				// extremely unlikely to get an error here - it means the json marshaling failed
 				logger.Error(err, "error calculating permission claim label key and value",
@@ -104,8 +129,13 @@ func (l *Labeler) LabelsFor(ctx context.Context, cluster logicalcluster.Name, gr
 			return labels, nil // can only be a NotFound
 		}
 
-		if exportRef := binding.Status.BoundAPIExport; exportRef != nil && exportRef.Workspace != nil {
-			k, v := permissionclaims.ToReflexiveAPIBindingLabelKeyAndValue(logicalcluster.New(exportRef.Workspace.Path), exportRef.Workspace.ExportName)
+		path := logicalcluster.NewPath(binding.Spec.Reference.Export.Path)
+		if path.Empty() {
+			path = logicalcluster.From(binding).Path()
+		}
+		export, err := l.getAPIExport(path, binding.Spec.Reference.Export.Name)
+		if err == nil {
+			k, v := permissionclaims.ToReflexiveAPIBindingLabelKeyAndValue(logicalcluster.From(export), binding.Spec.Reference.Export.Name)
 			if _, found := labels[k]; !found {
 				labels[k] = v
 			}
@@ -113,4 +143,11 @@ func (l *Labeler) LabelsFor(ctx context.Context, cluster logicalcluster.Name, gr
 	}
 
 	return labels, nil
+}
+
+// InstallIndexers adds the additional indexers that this controller requires to the informers.
+func InstallIndexers(apiExportInformer apisv1alpha1informers.APIExportClusterInformer) {
+	indexers.AddIfNotPresentOrDie(apiExportInformer.Informer().GetIndexer(), cache.Indexers{
+		indexers.ByLogicalClusterPathAndName: indexers.IndexByLogicalClusterPathAndName,
+	})
 }

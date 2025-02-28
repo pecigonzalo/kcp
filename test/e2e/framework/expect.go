@@ -25,15 +25,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
+	kcpclient "github.com/kcp-dev/kcp/sdk/client/clientset/versioned"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
 )
 
 // Expectation closes over a statement of intent, allowing the caller
@@ -41,7 +42,7 @@ import (
 // to be evaluated.
 type Expectation func(ctx context.Context) (done bool, err error)
 
-// Expecter allows callers to register expectations
+// Expecter allows callers to register expectations.
 type Expecter interface {
 	// ExpectBefore will result in the Expectation being evaluated whenever
 	// state changes, up until the desired timeout is reached.
@@ -56,7 +57,7 @@ func NewExpecter(informer cache.SharedIndexInformer) *ExpectationController {
 		lock:         sync.RWMutex{},
 	}
 
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(_ interface{}) {
 			controller.triggerExpectations()
 		},
@@ -81,7 +82,7 @@ type expectationRecord struct {
 	*sync.Mutex
 }
 
-// ExpectationController knows how to register expectations and trigger them
+// ExpectationController knows how to register expectations and trigger them.
 type ExpectationController struct {
 	// expectations are recorded by UUID so they may be removed after they complete
 	expectations map[uuid.UUID]expectationRecord
@@ -146,7 +147,8 @@ func (c *ExpectationController) ExpectBefore(ctx context.Context, expectation Ex
 		go func() {
 			defer wg.Done()
 			for range results {
-			} // we can throw away these results
+				// we can throw away these results
+			}
 		}()
 
 		// Finally, acquire the lock to close the results channel and deregister the expectation.
@@ -178,9 +180,9 @@ func (c *ExpectationController) ExpectBefore(ctx context.Context, expectation Ex
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("expected state not found: %w, %d errors encountered while processing %d events: %v", ctx.Err(), len(expectationErrors), processed, kerrors.NewAggregate(expectationErrors))
+			return fmt.Errorf("expected state not found: %w, %d errors encountered while processing %d events: %v", ctx.Err(), len(expectationErrors), processed, utilerrors.NewAggregate(expectationErrors))
 		case result := <-results:
-			processed += 1
+			processed++
 			if result.err != nil {
 				expectationErrors = append(expectationErrors, result.err)
 			}
@@ -188,7 +190,7 @@ func (c *ExpectationController) ExpectBefore(ctx context.Context, expectation Ex
 				if result.err == nil {
 					return nil
 				}
-				return kerrors.NewAggregate(expectationErrors)
+				return utilerrors.NewAggregate(expectationErrors)
 			}
 		}
 	}
@@ -196,64 +198,68 @@ func (c *ExpectationController) ExpectBefore(ctx context.Context, expectation Ex
 
 // The following are statically-typed helpers for common types to allow us to express expectations about objects.
 
-// RegisterClusterWorkspaceExpectation registers an expectation about the future state of the seed.
-type RegisterClusterWorkspaceExpectation func(seed *tenancyv1alpha1.ClusterWorkspace, expectation ClusterWorkspaceExpectation) error
+// RegisterWorkspaceExpectation registers an expectation about the future state of the seed.
+type RegisterWorkspaceExpectation func(seed *tenancyv1alpha1.Workspace, expectation WorkspaceExpectation) error
 
-// ClusterWorkspaceExpectation evaluates an expectation about the object.
-type ClusterWorkspaceExpectation func(*tenancyv1alpha1.ClusterWorkspace) error
+// WorkspaceExpectation evaluates an expectation about the object.
+type WorkspaceExpectation func(*tenancyv1alpha1.Workspace) error
 
-// ExpectClusterWorkspaces sets up an Expecter in order to allow registering expectations in tests with minimal setup.
-func ExpectClusterWorkspaces(ctx context.Context, t *testing.T, client kcpclient.Interface) (RegisterClusterWorkspaceExpectation, error) {
-	kcpSharedInformerFactory := kcpinformers.NewSharedInformerFactoryWithOptions(client, 0)
-	clusterWorkspaceInformer := kcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaces()
-	expecter := NewExpecter(clusterWorkspaceInformer.Informer())
+// ExpectWorkspaces sets up an Expecter in order to allow registering expectations in tests with minimal setup.
+func ExpectWorkspaces(
+	ctx context.Context,
+	t *testing.T,
+	client kcpclient.Interface,
+) (RegisterWorkspaceExpectation, error) {
+	t.Helper()
+
+	kcpSharedInformerFactory := kcpinformers.NewSharedScopedInformerFactoryWithOptions(client, 0)
+	workspaceInformer := kcpSharedInformerFactory.Tenancy().V1alpha1().Workspaces()
+	expecter := NewExpecter(workspaceInformer.Informer())
 	kcpSharedInformerFactory.Start(ctx.Done())
-	if !cache.WaitForNamedCacheSync(t.Name(), ctx.Done(), clusterWorkspaceInformer.Informer().HasSynced) {
+	waitCtx, cancel := context.WithTimeout(ctx, wait.ForeverTestTimeout)
+	t.Cleanup(cancel)
+	if !cache.WaitForNamedCacheSync(t.Name(), waitCtx.Done(), workspaceInformer.Informer().HasSynced) {
 		return nil, errors.New("failed to wait for caches to sync")
 	}
-	return func(seed *tenancyv1alpha1.ClusterWorkspace, expectation ClusterWorkspaceExpectation) error {
-		key, err := kcpcache.MetaClusterNamespaceKeyFunc(seed)
-		if err != nil {
-			return err
-		}
+	return func(seed *tenancyv1alpha1.Workspace, expectation WorkspaceExpectation) error {
 		return expecter.ExpectBefore(ctx, func(ctx context.Context) (done bool, err error) {
-			current, err := clusterWorkspaceInformer.Lister().Get(key)
+			current, err := workspaceInformer.Lister().Get(seed.Name)
 			if err != nil {
 				return !apierrors.IsNotFound(err), err
 			}
 			expectErr := expectation(current.DeepCopy())
 			return expectErr == nil, expectErr
-		}, 30*time.Second)
+		}, wait.ForeverTestTimeout)
 	}, nil
 }
 
 // RegisterWorkspaceShardExpectation registers an expectation about the future state of the seed.
-type RegisterWorkspaceShardExpectation func(seed *tenancyv1alpha1.ClusterWorkspaceShard, expectation WorkspaceShardExpectation) error
+type RegisterWorkspaceShardExpectation func(seed *corev1alpha1.Shard, expectation WorkspaceShardExpectation) error
 
 // WorkspaceShardExpectation evaluates an expectation about the object.
-type WorkspaceShardExpectation func(*tenancyv1alpha1.ClusterWorkspaceShard) error
+type WorkspaceShardExpectation func(*corev1alpha1.Shard) error
 
 // ExpectWorkspaceShards sets up an Expecter in order to allow registering expectations in tests with minimal setup.
 func ExpectWorkspaceShards(ctx context.Context, t *testing.T, client kcpclient.Interface) (RegisterWorkspaceShardExpectation, error) {
-	kcpSharedInformerFactory := kcpinformers.NewSharedInformerFactoryWithOptions(client, 0)
-	workspaceShardInformer := kcpSharedInformerFactory.Tenancy().V1alpha1().ClusterWorkspaceShards()
+	t.Helper()
+
+	kcpSharedInformerFactory := kcpinformers.NewSharedScopedInformerFactoryWithOptions(client, 0)
+	workspaceShardInformer := kcpSharedInformerFactory.Core().V1alpha1().Shards()
 	expecter := NewExpecter(workspaceShardInformer.Informer())
 	kcpSharedInformerFactory.Start(ctx.Done())
-	if !cache.WaitForNamedCacheSync(t.Name(), ctx.Done(), workspaceShardInformer.Informer().HasSynced) {
+	waitCtx, cancel := context.WithTimeout(ctx, wait.ForeverTestTimeout)
+	t.Cleanup(cancel)
+	if !cache.WaitForNamedCacheSync(t.Name(), waitCtx.Done(), workspaceShardInformer.Informer().HasSynced) {
 		return nil, errors.New("failed to wait for caches to sync")
 	}
-	return func(seed *tenancyv1alpha1.ClusterWorkspaceShard, expectation WorkspaceShardExpectation) error {
-		key, err := kcpcache.MetaClusterNamespaceKeyFunc(seed)
-		if err != nil {
-			return err
-		}
+	return func(seed *corev1alpha1.Shard, expectation WorkspaceShardExpectation) error {
 		return expecter.ExpectBefore(ctx, func(ctx context.Context) (done bool, err error) {
-			current, err := workspaceShardInformer.Lister().Get(key)
+			current, err := workspaceShardInformer.Lister().Get(seed.Name)
 			if err != nil {
 				return !apierrors.IsNotFound(err), err
 			}
 			expectErr := expectation(current.DeepCopy())
 			return expectErr == nil, expectErr
-		}, 30*time.Second)
+		}, wait.ForeverTestTimeout)
 	}, nil
 }

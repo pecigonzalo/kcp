@@ -21,8 +21,6 @@ package v1alpha1
 import (
 	"net/http"
 
-	v2 "github.com/kcp-dev/logicalcluster/v2"
-
 	rest "k8s.io/client-go/rest"
 
 	v1alpha1 "github.com/kcp-dev/kcp/test/e2e/fixtures/wildwest/apis/wildwest/v1alpha1"
@@ -32,16 +30,20 @@ import (
 type WildwestV1alpha1Interface interface {
 	RESTClient() rest.Interface
 	CowboysGetter
+	SherifvesGetter
 }
 
 // WildwestV1alpha1Client is used to interact with features provided by the wildwest.dev group.
 type WildwestV1alpha1Client struct {
 	restClient rest.Interface
-	cluster    v2.Name
 }
 
 func (c *WildwestV1alpha1Client) Cowboys(namespace string) CowboyInterface {
 	return newCowboys(c, namespace)
+}
+
+func (c *WildwestV1alpha1Client) Sherifves() SheriffInterface {
+	return newSherifves(c)
 }
 
 // NewForConfig creates a new WildwestV1alpha1Client for the given config.
@@ -70,7 +72,7 @@ func NewForConfigAndClient(c *rest.Config, h *http.Client) (*WildwestV1alpha1Cli
 	if err != nil {
 		return nil, err
 	}
-	return &WildwestV1alpha1Client{restClient: client}, nil
+	return &WildwestV1alpha1Client{client}, nil
 }
 
 // NewForConfigOrDie creates a new WildwestV1alpha1Client for the given config and
@@ -85,12 +87,7 @@ func NewForConfigOrDie(c *rest.Config) *WildwestV1alpha1Client {
 
 // New creates a new WildwestV1alpha1Client for the given RESTClient.
 func New(c rest.Interface) *WildwestV1alpha1Client {
-	return &WildwestV1alpha1Client{restClient: c}
-}
-
-// NewWithCluster creates a new WildwestV1alpha1Client for the given RESTClient and cluster.
-func NewWithCluster(c rest.Interface, cluster v2.Name) *WildwestV1alpha1Client {
-	return &WildwestV1alpha1Client{restClient: c, cluster: cluster}
+	return &WildwestV1alpha1Client{c}
 }
 
 func setConfigDefaults(config *rest.Config) error {

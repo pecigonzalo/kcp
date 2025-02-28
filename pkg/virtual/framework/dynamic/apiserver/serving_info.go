@@ -19,7 +19,7 @@ package apiserver
 import (
 	"fmt"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	apiextensionsinternal "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -36,9 +36,9 @@ import (
 	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/managedfields"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apiserver/pkg/endpoints/handlers"
-	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
 	"k8s.io/apiserver/pkg/endpoints/openapi"
 	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/registry/rest"
@@ -46,18 +46,16 @@ import (
 	utilopenapi "k8s.io/apiserver/pkg/util/openapi"
 	"k8s.io/klog/v2"
 	"k8s.io/kube-openapi/pkg/validation/spec"
-	"k8s.io/kube-openapi/pkg/validation/strfmt"
-	"k8s.io/kube-openapi/pkg/validation/validate"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
 	kcpfeatures "github.com/kcp-dev/kcp/pkg/features"
 	"github.com/kcp-dev/kcp/pkg/virtual/framework/dynamic/apidefinition"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 var _ apidefinition.APIDefinition = (*servingInfo)(nil)
 
 // RestProviderFunc is the type of a function that builds REST storage implementations for the main resource and sub-resources, based on information passed by the resource handler about a given API.
-type RestProviderFunc func(resource schema.GroupVersionResource, kind schema.GroupVersionKind, listKind schema.GroupVersionKind, typer runtime.ObjectTyper, tableConvertor rest.TableConvertor, namespaceScoped bool, schemaValidator *validate.SchemaValidator, subresourcesSchemaValidator map[string]*validate.SchemaValidator, structuralSchema *structuralschema.Structural) (mainStorage rest.Storage, subresourceStorages map[string]rest.Storage)
+type RestProviderFunc func(resource schema.GroupVersionResource, kind schema.GroupVersionKind, listKind schema.GroupVersionKind, typer runtime.ObjectTyper, tableConvertor rest.TableConvertor, namespaceScoped bool, schemaValidator apiservervalidation.SchemaValidator, subresourcesSchemaValidator map[string]apiservervalidation.SchemaValidator, structuralSchema *structuralschema.Structural) (mainStorage rest.Storage, subresourceStorages map[string]rest.Storage)
 
 // CreateServingInfoFor builds an APIDefinition for a apiResourceSchema.
 func CreateServingInfoFor(genericConfig genericapiserver.CompletedConfig, apiResourceSchema *apisv1alpha1.APIResourceSchema, version string, restProvider RestProviderFunc) (apidefinition.APIDefinition, error) {
@@ -101,11 +99,10 @@ func CreateServingInfoFor(genericConfig genericapiserver.CompletedConfig, apiRes
 		apiResourceSchema,
 		apiResourceVersion,
 		builder.Options{
-			V2: true,
-			SkipFilterSchemaForKubectlOpenAPIV2Validation: true,
-			StripValueValidation:                          true,
-			StripNullable:                                 true,
-			AllowNonStructural:                            false})
+			V2:                   true,
+			StripValueValidation: true,
+			StripNullable:        true,
+			AllowNonStructural:   false})
 	if err != nil {
 		return nil, err
 	}
@@ -123,9 +120,13 @@ func CreateServingInfoFor(genericConfig genericapiserver.CompletedConfig, apiRes
 			modelsByGKV = nil
 		}
 	}
-	var typeConverter fieldmanager.TypeConverter = fieldmanager.DeducedTypeConverter{}
+	typeConverter := managedfields.NewDeducedTypeConverter()
 	if openAPIModels != nil {
-		typeConverter, err = fieldmanager.NewTypeConverter(openAPIModels, false)
+		schemas := make(map[string]*spec.Schema, len(s.Definitions))
+		for k, v := range s.Definitions {
+			schemas[k] = &v
+		}
+		typeConverter, err = managedfields.NewTypeConverter(schemas, false)
 		if err != nil {
 			return nil, err
 		}
@@ -157,24 +158,23 @@ func CreateServingInfoFor(genericConfig genericapiserver.CompletedConfig, apiRes
 	internalValidationSchema := &apiextensionsinternal.CustomResourceValidation{
 		OpenAPIV3Schema: internalSchema,
 	}
-	validator, _, err := apiservervalidation.NewSchemaValidator(internalValidationSchema)
+	validator, _, err := apiservervalidation.NewSchemaValidator(internalSchema)
 	if err != nil {
 		return nil, err
 	}
 
-	subResourcesValidators := map[string]*validate.SchemaValidator{}
+	subResourcesValidators := map[string]apiservervalidation.SchemaValidator{}
 
 	if status := apiResourceVersion.Subresources.Status; status != nil {
-		var statusValidator *validate.SchemaValidator
+		var statusValidator apiservervalidation.SchemaValidator
 		equivalentResourceRegistry.RegisterKindFor(gvr, "status", gvk)
 		// for the status subresource, validate only against the status schema
 		if internalValidationSchema != nil && internalValidationSchema.OpenAPIV3Schema != nil && internalValidationSchema.OpenAPIV3Schema.Properties != nil {
 			if statusSchema, ok := internalValidationSchema.OpenAPIV3Schema.Properties["status"]; ok {
-				openapiSchema := &spec.Schema{}
-				if err := apiservervalidation.ConvertJSONSchemaPropsWithPostProcess(&statusSchema, openapiSchema, apiservervalidation.StripUnsupportedFormatsPostProcess); err != nil {
+				statusValidator, _, err = apiservervalidation.NewSchemaValidator(&statusSchema)
+				if err != nil {
 					return nil, err
 				}
-				statusValidator = validate.NewSchemaValidator(openapiSchema, nil, "", strfmt.Default)
 			}
 		}
 		subResourcesValidators["status"] = statusValidator
@@ -182,7 +182,7 @@ func CreateServingInfoFor(genericConfig genericapiserver.CompletedConfig, apiRes
 
 	table, err := tableconvertor.New(apiResourceVersion.AdditionalPrinterColumns)
 	if err != nil {
-		klog.V(2).Infof("The CRD for %s|%s has an invalid printer specification, falling back to default printing: %v", logicalcluster.From(apiResourceSchema), gvk.String(), err)
+		klog.Background().V(2).WithValues("cluster", logicalcluster.From(apiResourceSchema), "gvk", gvk, "err", err).Info("the CRD has an invalid printer specification, falling back to default printing")
 	}
 
 	storage, subresourceStorages := restProvider(
@@ -208,8 +208,9 @@ func CreateServingInfoFor(genericConfig genericapiserver.CompletedConfig, apiRes
 		gvk.GroupKind(),
 		false,
 	)
-	var standardSerializers []runtime.SerializerInfo
-	for _, s := range negotiatedSerializer.SupportedMediaTypes() {
+	supportedMediaTypes := negotiatedSerializer.SupportedMediaTypes()
+	standardSerializers := make([]runtime.SerializerInfo, 0, len(supportedMediaTypes))
+	for _, s := range supportedMediaTypes {
 		if s.MediaType == runtime.ContentTypeProtobuf {
 			continue
 		}
@@ -304,7 +305,7 @@ func CreateServingInfoFor(genericConfig genericapiserver.CompletedConfig, apiRes
 	return ret, nil
 }
 
-// servingInfo stores enough information to serve the storage for the apiResourceSchema
+// servingInfo stores enough information to serve the storage for the apiResourceSchema.
 type servingInfo struct {
 	logicalClusterName logicalcluster.Name
 	apiResourceSchema  *apisv1alpha1.APIResourceSchema
@@ -368,7 +369,7 @@ func (u nopConverter) ConvertFieldLabel(gvk schema.GroupVersionKind, label, valu
 	return label, value, nil
 }
 
-// buildOpenAPIV2 builds OpenAPI v2 for the given apiResourceSpec
+// buildOpenAPIV2 builds OpenAPI v2 for the given apiResourceSpec.
 func buildOpenAPIV2(apiResourceSchema *apisv1alpha1.APIResourceSchema, apiResourceVersion *apisv1alpha1.APIResourceVersion, opts builder.Options) (*spec.Swagger, error) {
 	openapiSchema, err := apiResourceVersion.GetSchema()
 	if err != nil {

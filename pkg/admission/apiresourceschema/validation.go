@@ -32,13 +32,14 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/cel/environment"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
 var (
 	namePrefixRE                 = regexp.MustCompile("^[a-z]([-a-z0-9]*[a-z0-9])?$")
-	singleSegmentGroupExceptions = sets.NewString("apps", "batch", "extensions", "policy", "autoscaling") // these are the sins of Kubernetes of single-word group names
+	singleSegmentGroupExceptions = sets.New[string]("apps", "batch", "extensions", "policy", "autoscaling") // these are the sins of Kubernetes of single-word group names
 )
 
 // ValidateAPIResourceSchema validates an APIResourceSchema.
@@ -114,7 +115,8 @@ func ValidateAPIResourceSchemaSpec(ctx context.Context, spec *apisv1alpha1.APIRe
 	storageFlagCount := 0
 	versionsMap := map[string]bool{}
 	uniqueNames := true
-	for i, version := range spec.Versions {
+	for i := range spec.Versions {
+		version := spec.Versions[i]
 		if version.Storage {
 			storageFlagCount++
 		}
@@ -157,7 +159,6 @@ func ValidateAPIResourceSchemaSpec(ctx context.Context, spec *apisv1alpha1.APIRe
 	}
 
 	// TODO(sttts): validate predecessors
-	// TODO(sttts): validate conversions
 
 	return allErrs
 }
@@ -170,12 +171,19 @@ var defaultValidationOpts = crdvalidation.ValidationOptions{
 	// Here this does not matter. The whole resource is always immutable.
 	RequireImmutableNames: false,
 
+	// in Kube, the validation on CRD update will set it to true for unchanged schemas
+	// (ratcheting validation). Here, as everything is immutable, this case never
+	// happens. Hence, we can statically set it to false.
+	SuppressPerExpressionCost: false,
+
 	RequireOpenAPISchema:               true,
 	RequireValidPropertyType:           true,
 	RequireStructuralSchema:            true,
 	RequirePrunedDefaults:              true,
 	RequireAtomicSetType:               true,
 	RequireMapListKeysMapSetValidation: true,
+
+	CELEnvironmentSet: environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion(), true),
 }
 
 func ValidateAPIResourceVersion(ctx context.Context, version *apisv1alpha1.APIResourceVersion, fldPath *field.Path) field.ErrorList {
@@ -186,7 +194,7 @@ func ValidateAPIResourceVersion(ctx context.Context, version *apisv1alpha1.APIRe
 	}
 
 	if len(version.Schema.Raw) == 0 || string(version.Schema.Raw) == "null" {
-		allErrs = append(allErrs, field.Required(fldPath.Child("schema"), "schemas are required"))
+		allErrs = append(allErrs, field.Required(fldPath.Child("schema"), ""))
 	} else {
 		statusEnabled := version.Subresources.Status != nil
 		var crdSchemaV1 apiextensionsv1.CustomResourceValidation

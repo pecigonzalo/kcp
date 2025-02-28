@@ -19,20 +19,17 @@ package apifixtures
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
-	"github.com/stretchr/testify/require"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"sigs.k8s.io/yaml"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/util/conditions"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/util/conditions"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
 	"github.com/kcp-dev/kcp/test/e2e/framework"
 )
 
@@ -41,20 +38,22 @@ import (
 func BindToExport(
 	ctx context.Context,
 	t *testing.T,
-	exportClusterName logicalcluster.Name,
+	exportPath logicalcluster.Path,
 	apiExportName string,
-	bindingClusterName logicalcluster.Name,
-	clusterClient kcpclient.Interface,
+	bindingClusterName logicalcluster.Path,
+	clusterClient kcpclientset.ClusterInterface,
 ) {
+	t.Helper()
+
 	binding := &apisv1alpha1.APIBinding{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: strings.ReplaceAll(exportClusterName.String(), ":", "-"),
+			Name: apiExportName,
 		},
 		Spec: apisv1alpha1.APIBindingSpec{
-			Reference: apisv1alpha1.ExportReference{
-				Workspace: &apisv1alpha1.WorkspaceExportReference{
-					Path:       exportClusterName.String(),
-					ExportName: apiExportName,
+			Reference: apisv1alpha1.BindingReference{
+				Export: &apisv1alpha1.ExportBindingReference{
+					Path: exportPath.String(),
+					Name: apiExportName,
 				},
 			},
 		},
@@ -62,23 +61,14 @@ func BindToExport(
 
 	framework.Eventually(t, func() (bool, string) {
 		t.Logf("Creating APIBinding %s|%s", bindingClusterName, binding.Name)
-		_, err := clusterClient.ApisV1alpha1().APIBindings().Create(logicalcluster.WithCluster(ctx, bindingClusterName), binding, metav1.CreateOptions{})
+		_, err := clusterClient.Cluster(bindingClusterName).ApisV1alpha1().APIBindings().Create(ctx, binding, metav1.CreateOptions{})
 		if err != nil {
 			return false, fmt.Sprintf("error creating APIBinding %s|%s: %v", bindingClusterName, binding.Name, err)
 		}
 		return true, ""
 	}, wait.ForeverTestTimeout, 100*time.Millisecond)
 
-	framework.Eventually(t, func() (bool, string) {
-		b, err := clusterClient.ApisV1alpha1().APIBindings().Get(logicalcluster.WithCluster(ctx, bindingClusterName), binding.Name, metav1.GetOptions{})
-		require.NoError(t, err, "error getting APIBinding %s|%s", bindingClusterName, binding.Name)
-
-		return conditions.IsTrue(b, apisv1alpha1.InitialBindingCompleted), toYAML(t, b.Status.Conditions)
-	}, wait.ForeverTestTimeout, 100*time.Millisecond)
-}
-
-func toYAML(t *testing.T, obj interface{}) string {
-	bs, err := yaml.Marshal(obj)
-	require.NoError(t, err, "error converting to YAML")
-	return string(bs)
+	framework.EventuallyCondition(t, func() (conditions.Getter, error) {
+		return clusterClient.Cluster(bindingClusterName).ApisV1alpha1().APIBindings().Get(ctx, binding.Name, metav1.GetOptions{})
+	}, framework.Is(apisv1alpha1.InitialBindingCompleted))
 }

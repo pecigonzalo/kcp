@@ -24,7 +24,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,53 +32,61 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/tenancy/initialization"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	conditionsv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/apis/conditions/v1alpha1"
-	"github.com/kcp-dev/kcp/pkg/apis/third_party/conditions/util/conditions"
 	"github.com/kcp-dev/kcp/pkg/logging"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/tenancy/initialization"
+	tenancyv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/tenancy/v1alpha1"
+	conditionsv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/apis/conditions/v1alpha1"
+	"github.com/kcp-dev/kcp/sdk/apis/third_party/conditions/util/conditions"
 )
 
-func (b *APIBinder) reconcile(ctx context.Context, clusterWorkspace *tenancyv1alpha1.ClusterWorkspace) error {
+func (b *APIBinder) reconcile(ctx context.Context, logicalCluster *corev1alpha1.LogicalCluster) error {
+	annotationValue, found := logicalCluster.Annotations[tenancyv1alpha1.LogicalClusterTypeAnnotationKey]
+	if !found {
+		return nil
+	}
+	wtCluster, wtName := logicalcluster.NewPath(annotationValue).Split()
+	if wtCluster.Empty() {
+		return nil
+	}
 	logger := klog.FromContext(ctx).WithValues(
-		"clusterWorkspaceType.path", clusterWorkspace.Spec.Type.Path,
-		"clusterWorkspaceType.name", clusterWorkspace.Spec.Type.Name,
+		"workspacetype.path", wtCluster.String(),
+		"workspacetype.name", wtName,
 	)
 
 	var errors []error
-	clusterName := logicalcluster.From(clusterWorkspace).Join(clusterWorkspace.Name)
-	logger.V(2).Info("initializing APIBindings for workspace")
+	clusterName := logicalcluster.From(logicalCluster)
+	logger.V(3).Info("initializing APIBindings for workspace")
 
-	// Start with the ClusterWorkspaceType specified by the ClusterWorkspace
-	leafCWT, err := b.getClusterWorkspaceType(logicalcluster.New(clusterWorkspace.Spec.Type.Path), string(clusterWorkspace.Spec.Type.Name))
+	// Start with the WorkspaceType specified by the Workspace
+	leafWT, err := b.getWorkspaceType(wtCluster, wtName)
 	if err != nil {
-		logger.Error(err, "error getting ClusterWorkspaceType")
+		logger.Error(err, "error getting WorkspaceType")
 
 		conditions.MarkFalse(
-			clusterWorkspace,
+			logicalCluster,
 			tenancyv1alpha1.WorkspaceAPIBindingsInitialized,
-			tenancyv1alpha1.WorkspaceInitializedClusterWorkspaceTypeInvalid,
+			tenancyv1alpha1.WorkspaceInitializedWorkspaceTypeInvalid,
 			conditionsv1alpha1.ConditionSeverityError,
-			"error getting ClusterWorkspaceType %s|%s: %v",
-			clusterWorkspace.Spec.Type.Path, clusterWorkspace.Spec.Type.Name,
-			err,
+			"error getting WorkspaceType %s|%s: %v",
+			wtCluster.String(), wtName, err,
 		)
 
 		return nil
 	}
 
-	// Get all the transitive ClusterWorkspaceTypes
-	cwts, err := b.transitiveTypeResolver.Resolve(leafCWT)
+	// Get all the transitive WorkspaceTypes
+	wts, err := b.transitiveTypeResolver.Resolve(leafWT)
 	if err != nil {
 		logger.Error(err, "error resolving transitive types")
 
 		conditions.MarkFalse(
-			clusterWorkspace,
+			logicalCluster,
 			tenancyv1alpha1.WorkspaceAPIBindingsInitialized,
-			tenancyv1alpha1.WorkspaceInitializedClusterWorkspaceTypeInvalid,
+			tenancyv1alpha1.WorkspaceInitializedWorkspaceTypeInvalid,
 			conditionsv1alpha1.ConditionSeverityError,
-			"error resolving transitive set of cluster workspace types: %v",
+			"error resolving transitive set of workspace types: %v",
 			err,
 		)
 
@@ -92,36 +100,47 @@ func (b *APIBinder) reconcile(ctx context.Context, clusterWorkspace *tenancyv1al
 	}
 
 	// This keeps track of which APIBindings have been created for which APIExports
-	exportToBinding := map[apisv1alpha1.WorkspaceExportReference]*apisv1alpha1.APIBinding{}
+	exportToBinding := map[apisv1alpha1.ExportBindingReference]*apisv1alpha1.APIBinding{}
 
 	for i := range bindings {
 		binding := bindings[i]
 
-		if binding.Spec.Reference.Workspace == nil {
+		if binding.Spec.Reference.Export == nil {
 			continue
 		}
 
 		// Track what we have ("actual")
-		exportToBinding[*binding.Spec.Reference.Workspace] = binding
+		exportToBinding[*binding.Spec.Reference.Export] = binding
 	}
 
 	requiredExportRefs := map[tenancyv1alpha1.APIExportReference]struct{}{}
 	someExportsMissing := false
 
-	for _, cwt := range cwts {
-		logger := logging.WithObject(logger, cwt)
-		logger.V(2).Info("attempting to initialize APIBindings")
+	for _, wt := range wts {
+		logger := logging.WithObject(logger, wt)
+		logger.V(3).Info("attempting to initialize APIBindings")
 
-		for i := range cwt.Spec.DefaultAPIBindings {
-			exportRef := cwt.Spec.DefaultAPIBindings[i]
+		for i := range wt.Spec.DefaultAPIBindings {
+			exportRef := wt.Spec.DefaultAPIBindings[i]
+			if exportRef.Path == "" {
+				exportRef.Path = logicalcluster.From(wt).String()
+			}
+			apiExport, err := b.getAPIExport(logicalcluster.NewPath(exportRef.Path), exportRef.Export)
+			if err != nil {
+				if !someExportsMissing {
+					errors = append(errors, fmt.Errorf("unable to complete initialization: unable to find at least 1 APIExport"))
+				}
+				someExportsMissing = true
+				continue
+			}
 
-			// Keep track of unique set of expected exports across all CWTs
+			// Keep track of unique set of expected exports across all WTs
 			requiredExportRefs[exportRef] = struct{}{}
 
-			logger := logger.WithValues("apiExport.path", exportRef.Path, "apiExport.name", exportRef.ExportName)
+			logger := logger.WithValues("apiExport.path", exportRef.Path, "apiExport.name", exportRef.Export)
 			ctx := klog.NewContext(ctx, logger)
 
-			apiBindingName := generateAPIBindingName(clusterName, exportRef.Path, exportRef.ExportName)
+			apiBindingName := generateAPIBindingName(clusterName, exportRef.Path, exportRef.Export)
 			logger = logger.WithValues("apiBindingName", apiBindingName)
 
 			if _, err = b.getAPIBinding(clusterName, apiBindingName); err == nil {
@@ -134,22 +153,13 @@ func (b *APIBinder) reconcile(ctx context.Context, clusterWorkspace *tenancyv1al
 					Name: apiBindingName,
 				},
 				Spec: apisv1alpha1.APIBindingSpec{
-					Reference: apisv1alpha1.ExportReference{
-						Workspace: &apisv1alpha1.WorkspaceExportReference{
-							Path:       exportRef.Path,
-							ExportName: exportRef.ExportName,
+					Reference: apisv1alpha1.BindingReference{
+						Export: &apisv1alpha1.ExportBindingReference{
+							Path: exportRef.Path,
+							Name: apiExport.Name,
 						},
 					},
 				},
-			}
-
-			apiExport, err := b.getAPIExport(logicalcluster.New(exportRef.Path), exportRef.ExportName)
-			if err != nil {
-				if !someExportsMissing {
-					errors = append(errors, fmt.Errorf("unable to complete initialization: unable to find at least 1 APIExport"))
-				}
-				someExportsMissing = true
-				continue
 			}
 
 			for i := range apiExport.Spec.PermissionClaims {
@@ -166,7 +176,7 @@ func (b *APIBinder) reconcile(ctx context.Context, clusterWorkspace *tenancyv1al
 			logger = logging.WithObject(logger, apiBinding)
 
 			logger.V(2).Info("trying to create APIBinding")
-			if _, err := b.createAPIBinding(ctx, clusterName, apiBinding); err != nil {
+			if _, err := b.createAPIBinding(ctx, clusterName.Path(), apiBinding); err != nil {
 				if apierrors.IsAlreadyExists(err) {
 					logger.V(2).Info("APIBinding already exists")
 					continue
@@ -184,7 +194,7 @@ func (b *APIBinder) reconcile(ctx context.Context, clusterWorkspace *tenancyv1al
 		logger.Error(utilerrors.NewAggregate(errors), "error initializing APIBindings")
 
 		conditions.MarkFalse(
-			clusterWorkspace,
+			logicalCluster,
 			tenancyv1alpha1.WorkspaceAPIBindingsInitialized,
 			tenancyv1alpha1.WorkspaceInitializedAPIBindingErrors,
 			conditionsv1alpha1.ConditionSeverityError,
@@ -205,14 +215,12 @@ func (b *APIBinder) reconcile(ctx context.Context, clusterWorkspace *tenancyv1al
 	var incomplete []string
 
 	for exportRef := range requiredExportRefs {
-		workspaceExportRef := apisv1alpha1.WorkspaceExportReference{
-			Path:       exportRef.Path,
-			ExportName: exportRef.ExportName,
-		}
-
-		binding, exists := exportToBinding[workspaceExportRef]
+		binding, exists := exportToBinding[apisv1alpha1.ExportBindingReference{
+			Path: exportRef.Path,
+			Name: exportRef.Export,
+		}]
 		if !exists {
-			incomplete = append(incomplete, fmt.Sprintf("for APIExport %s|%s", exportRef.Path, exportRef.ExportName))
+			incomplete = append(incomplete, fmt.Sprintf("for APIExport %s|%s", exportRef.Path, exportRef.Export))
 			continue
 		}
 
@@ -225,17 +233,18 @@ func (b *APIBinder) reconcile(ctx context.Context, clusterWorkspace *tenancyv1al
 		sort.Strings(incomplete)
 
 		conditions.MarkFalse(
-			clusterWorkspace,
+			logicalCluster,
 			tenancyv1alpha1.WorkspaceAPIBindingsInitialized,
 			tenancyv1alpha1.WorkspaceInitializedWaitingOnAPIBindings,
 			conditionsv1alpha1.ConditionSeverityInfo,
-			"APIBinding(s) not yet fully bound: %s", strings.Join(incomplete, ", "),
+			"APIBinding(s) not yet fully bound: %s",
+			strings.Join(incomplete, ", "),
 		)
 
 		return nil
 	}
 
-	clusterWorkspace.Status.Initializers = initialization.EnsureInitializerAbsent(tenancyv1alpha1.ClusterWorkspaceAPIBindingsInitializer, clusterWorkspace.Status.Initializers)
+	logicalCluster.Status.Initializers = initialization.EnsureInitializerAbsent(tenancyv1alpha1.WorkspaceAPIBindingsInitializer, logicalCluster.Status.Initializers)
 
 	return nil
 }

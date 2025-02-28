@@ -22,17 +22,19 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)
 LOG_FILE="${REPO_ROOT}/hack/logcheck.out"
 work_file="$(mktemp)"
 LOGCHECK=${LOGCHECK:-logcheck}
+LOGCHECK_ARGS="-check-contextual -check-key=false"
 
 cd "$REPO_ROOT"
 
 set +o errexit
-${LOGCHECK} -check-contextual ./... > "${work_file}" 2>&1
+${LOGCHECK} ${LOGCHECK_ARGS} ./... > "${work_file}" 2>&1
 set -o errexit
 
-# pkg/apis is a separate module, so check that in addition to our root packages
-cd "${REPO_ROOT}"/pkg/apis
+# sdk is a separate module, so check that in addition to our root packages
+echo "Checking "${REPO_ROOT}"/sdk"
+cd "${REPO_ROOT}"/sdk
 set +o errexit
-${LOGCHECK} -check-contextual ./... >> "${work_file}" 2>&1
+${LOGCHECK} ${LOGCHECK_ARGS} ./... >> "${work_file}" 2>&1
 set -o errexit
 
 is_gnu_sed() { sed --version >/dev/null 2>&1; }
@@ -46,6 +48,12 @@ fi
 ${SED} -e "s,${REPO_ROOT},,g" "${work_file}"
 LC_COLLATE=C sort "${work_file}" -o "${work_file}"
 
+# Remove errors that are not useful for us
+mv "${work_file}" "${work_file}.full"
+if ! grep -vE 'Additional arguments to|Key positional arguments|InitFlags' "${work_file}.full" > "${work_file}"; then
+  echo "[INFO] Congratulations! No errors found."
+fi
+
 # Copy the current set to the known set, but keep temp file in place for diffing
 if [[ "${UPDATE:-}" == "true" ]]; then
     cp "${work_file}" "${LOG_FILE}"
@@ -56,7 +64,7 @@ fi
 work_cleaned="$( sed -e 's/[0-9]*//g' "${work_file}" )"
 log_cleaned="$( sed -e 's/[0-9]*//g' "${LOG_FILE}" )"
 
-if ! changes="$(diff <(echo "${work_cleaned}")  <(echo "${log_cleaned}") )"; then
+if ! changes="$(diff <(echo "${log_cleaned}") <(echo "${work_cleaned}"))"; then
     echo "[ERROR] Current logging errors and saved logging errors do not match."
     echo "${changes}"
     echo

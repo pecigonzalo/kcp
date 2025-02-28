@@ -17,85 +17,15 @@ limitations under the License.
 package replication
 
 import (
-	"context"
 	"fmt"
 	"reflect"
 
-	"github.com/kcp-dev/logicalcluster/v2"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	genericrequest "k8s.io/apiserver/pkg/endpoints/request"
 )
 
-// reconcileUnstructuredObjects makes sure that the given cachedObject of the given GVR under the given key from the local shard is replicated to the cache server.
-//
-// this method handles the following cases:
-//  1. creation of the object in the cache server
-//     happens when the cacheObject is nil
-//  2. deletion of the object from the cache server
-//     happens when either of the following is true:
-//     - the localObject object is nil
-//     - the localObject was deleted
-//  3. modification of the object to match the original/local object
-//     happens when either of the following is true:
-//      - the localObject's metadata doesn't match the cacheObject
-//      - the localObject's spec doesn't match the cacheObject
-//      - the localObject's status doesn't match the cacheObject
-func (c *controller) reconcileUnstructuredObjects(ctx context.Context, cluster logicalcluster.Name, gvr *schema.GroupVersionResource, cacheObject *unstructured.Unstructured, localObject *unstructured.Unstructured) error {
-	if localObject == nil {
-		return c.handleObjectDeletion(ctx, cluster, gvr, cacheObject)
-	}
-	if localObject.GetDeletionTimestamp() != nil {
-		return c.handleObjectDeletion(ctx, cluster, gvr, cacheObject)
-	}
-
-	if cacheObject == nil {
-		// TODO: in the future the original RV will have to be stored in an annotation (?)
-		// so that the clients that need to modify the original/local object can do it
-		localObject.SetResourceVersion("")
-		annotations := localObject.GetAnnotations()
-		if annotations == nil {
-			annotations = map[string]string{}
-		}
-		annotations[genericrequest.AnnotationKey] = c.shardName
-		localObject.SetAnnotations(annotations)
-		_, err := c.dynamicCacheClient.Cluster(cluster).Resource(*gvr).Namespace(localObject.GetNamespace()).Create(ctx, localObject, metav1.CreateOptions{})
-		return err
-	}
-
-	metaChanged, err := ensureMeta(cacheObject, localObject)
-	if err != nil {
-		return err
-	}
-	remainingChanged, err := ensureRemaining(cacheObject, localObject)
-	if err != nil {
-		return err
-	}
-	if !metaChanged && !remainingChanged {
-		return nil
-	}
-
-	if metaChanged || remainingChanged {
-		_, err := c.dynamicCacheClient.Cluster(cluster).Resource(*gvr).Namespace(cacheObject.GetNamespace()).Update(ctx, cacheObject, metav1.UpdateOptions{})
-		return err
-	}
-	return nil
-}
-
-func (c *controller) handleObjectDeletion(ctx context.Context, cluster logicalcluster.Name, gvr *schema.GroupVersionResource, cacheObject *unstructured.Unstructured) error {
-	if cacheObject == nil {
-		return nil // the cached object already removed
-	}
-	if cacheObject.GetDeletionTimestamp() == nil {
-		return c.dynamicCacheClient.Cluster(cluster).Resource(*gvr).Delete(ctx, cacheObject.GetName(), metav1.DeleteOptions{})
-	}
-	return nil
-}
-
-// ensureMeta changes unstructuredCacheObject's metadata to match unstructuredLocalObject's metadata except the ResourceVersion and the shard annotation fields
+// ensureMeta changes unstructuredCacheObject's metadata to match unstructuredLocalObject's metadata except the ResourceVersion and the shard annotation fields.
 func ensureMeta(cacheObject *unstructured.Unstructured, localObject *unstructured.Unstructured) (changed bool, err error) {
 	cacheObjMetaRaw, hasCacheObjMetaRaw, err := unstructured.NestedFieldNoCopy(cacheObject.Object, "metadata")
 	if err != nil {
@@ -136,11 +66,11 @@ func ensureMeta(cacheObject *unstructured.Unstructured, localObject *unstructure
 		if !ok {
 			return false, fmt.Errorf("metadata.annotations field of unstructuredCacheObject is of the type %T, expected map[string]interface{}", cacheObjAnnotationsRaw)
 		}
-		if shard, hasShard := cacheObjAnnotations[genericrequest.AnnotationKey]; hasShard {
-			unstructured.RemoveNestedField(cacheObjAnnotations, genericrequest.AnnotationKey)
+		if shard, hasShard := cacheObjAnnotations[genericrequest.ShardAnnotationKey]; hasShard {
+			unstructured.RemoveNestedField(cacheObjAnnotations, genericrequest.ShardAnnotationKey)
 			defer func() {
 				if err == nil {
-					err = unstructured.SetNestedField(cacheObject.Object, shard, "metadata", "annotations", genericrequest.AnnotationKey)
+					err = unstructured.SetNestedField(cacheObject.Object, shard, "metadata", "annotations", genericrequest.ShardAnnotationKey)
 				}
 			}()
 		}
@@ -209,11 +139,11 @@ func ensureRemaining(cacheObject *unstructured.Unstructured, localObject *unstru
 }
 
 func toUnstructured(obj interface{}) (*unstructured.Unstructured, error) {
-	unstructured := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	u := &unstructured.Unstructured{Object: map[string]interface{}{}}
 	raw, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
 		return nil, err
 	}
-	unstructured.Object = raw
-	return unstructured, nil
+	u.Object = raw
+	return u, nil
 }

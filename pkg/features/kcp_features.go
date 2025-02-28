@@ -23,11 +23,11 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"k8s.io/apimachinery/pkg/util/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	genericfeatures "k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/featuregate"
-	"k8s.io/component-base/logs"
+	logsapi "k8s.io/component-base/logs/api/v1"
 )
 
 const (
@@ -35,33 +35,23 @@ const (
 	//
 	// // owner: @username
 	// // alpha: v1.4
-	// MyFeature() bool
+	// MyFeature() bool.
 
-	// owner: @sttts
-	// alpha: v0.4
-	//
-	// Enable the scheduling.kcp.dev/v1alpha1 API group, and related controllers.
-	LocationAPI featuregate.Feature = "KCPLocationAPI"
-
-	// owner: @aojea
-	// alpha: v0.8
-	//
-	// Enable reverse tunnels to the downstream clusters through the syncers.
-	SyncerTunnel featuregate.Feature = "KCPSyncerTunnel"
+	// owner: @mjudeikis
+	// alpha: v0.1
+	// Enables workspace mounts via frontProxy.
+	WorkspaceMounts featuregate.Feature = "WorkspaceMounts"
 )
 
 // DefaultFeatureGate exposes the upstream feature gate, but with our gate setting applied.
 var DefaultFeatureGate = utilfeature.DefaultFeatureGate
 
 func init() {
-	runtime.Must(utilfeature.DefaultMutableFeatureGate.Add(defaultGenericControlPlaneFeatureGates))
-
-	// here we differ from upstream:
-	runtime.Must(utilfeature.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=true", genericfeatures.CustomResourceValidationExpressions)))
+	utilruntime.Must(utilfeature.DefaultMutableFeatureGate.Add(defaultGenericControlPlaneFeatureGates))
 }
 
 func KnownFeatures() []string {
-	var features []string
+	features := make([]string, 0, len(defaultGenericControlPlaneFeatureGates))
 	for k := range defaultGenericControlPlaneFeatureGates {
 		features = append(features, string(k))
 	}
@@ -96,18 +86,13 @@ func (f *kcpFeatureGate) Type() string {
 // in the generic control plane code. To add a new feature, define a key for it above and add it
 // here. The features will be available throughout Kubernetes binaries.
 var defaultGenericControlPlaneFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
-	LocationAPI:  {Default: true, PreRelease: featuregate.Alpha},
-	SyncerTunnel: {Default: false, PreRelease: featuregate.Alpha},
-
+	WorkspaceMounts: {Default: false, PreRelease: featuregate.Alpha},
 	// inherited features from generic apiserver, relisted here to get a conflict if it is changed
 	// unintentionally on either side:
-	genericfeatures.AdvancedAuditing:                    {Default: true, PreRelease: featuregate.GA},
-	genericfeatures.APIResponseCompression:              {Default: true, PreRelease: featuregate.Beta},
-	genericfeatures.APIListChunking:                     {Default: true, PreRelease: featuregate.Beta},
-	genericfeatures.DryRun:                              {Default: true, PreRelease: featuregate.GA},
-	genericfeatures.ServerSideApply:                     {Default: true, PreRelease: featuregate.GA},
-	genericfeatures.APIPriorityAndFairness:              {Default: true, PreRelease: featuregate.Beta},
-	genericfeatures.CustomResourceValidationExpressions: {Default: false, PreRelease: featuregate.Alpha},
+	genericfeatures.APIResponseCompression:    {Default: true, PreRelease: featuregate.Beta},
+	genericfeatures.OpenAPIEnums:              {Default: true, PreRelease: featuregate.Beta},
+	genericfeatures.ServerSideFieldValidation: {Default: true, PreRelease: featuregate.GA, LockToDefault: true},
 
-	logs.ContextualLogging: {Default: true, PreRelease: featuregate.Alpha},
+	logsapi.LoggingBetaOptions: {Default: true, PreRelease: featuregate.Beta},
+	logsapi.ContextualLogging:  {Default: true, PreRelease: featuregate.Alpha},
 }

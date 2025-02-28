@@ -20,16 +20,15 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/tools/cache"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
 )
 
-// byUID implements sort.Interface based on the UID field of CustomResourceDefinition
+// byUID implements sort.Interface based on the UID field of CustomResourceDefinition.
 type byUID []*apiextensionsv1.CustomResourceDefinition
 
 func (u byUID) Len() int           { return len(u) }
@@ -38,105 +37,97 @@ func (u byUID) Swap(i, j int)      { u[i], u[j] = u[j], u[i] }
 
 type conflictChecker struct {
 	listAPIBindings      func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIBinding, error)
-	getAPIExport         func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIExport, error)
 	getAPIResourceSchema func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIResourceSchema, error)
 	getCRD               func(clusterName logicalcluster.Name, name string) (*apiextensionsv1.CustomResourceDefinition, error)
+	listCRDs             func(clusterName logicalcluster.Name) ([]*apiextensionsv1.CustomResourceDefinition, error)
 
-	boundCRDs    []*apiextensionsv1.CustomResourceDefinition
+	clusterName  logicalcluster.Name
+	crds         []*apiextensionsv1.CustomResourceDefinition
 	crdToBinding map[string]*apisv1alpha1.APIBinding
-	crdIndexer   cache.Indexer
 }
 
-func (ncc *conflictChecker) getBoundCRDs(apiBindingToExclude *apisv1alpha1.APIBinding) error {
-	clusterName := logicalcluster.From(apiBindingToExclude)
-
-	apiBindings, err := ncc.listAPIBindings(clusterName)
-	if err != nil {
-		return err
+// newConflictChecker creates a CRD conflict checker for the given cluster.
+func newConflictChecker(clusterName logicalcluster.Name,
+	listAPIBindings func(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIBinding, error),
+	getAPIResourceSchema func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIResourceSchema, error),
+	getCRD func(clusterName logicalcluster.Name, name string) (*apiextensionsv1.CustomResourceDefinition, error),
+	listCRDs func(clusterName logicalcluster.Name) ([]*apiextensionsv1.CustomResourceDefinition, error),
+) (*conflictChecker, error) {
+	ncc := &conflictChecker{
+		listAPIBindings:      listAPIBindings,
+		getAPIResourceSchema: getAPIResourceSchema,
+		getCRD:               getCRD,
+		listCRDs:             listCRDs,
+		clusterName:          clusterName,
+		crdToBinding:         map[string]*apisv1alpha1.APIBinding{},
 	}
 
-	ncc.crdToBinding = make(map[string]*apisv1alpha1.APIBinding)
+	// get bound CRDs
+	bindings, err := ncc.listAPIBindings(ncc.clusterName)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range bindings {
+		for _, br := range b.Status.BoundResources {
+			crd, err := ncc.getCRD(SystemBoundCRDsClusterName, br.Schema.UID)
+			if err != nil {
+				return nil, err
+			}
 
-	for _, apiBinding := range apiBindings {
-		if apiBinding.Name == apiBindingToExclude.Name {
+			ncc.crds = append(ncc.crds, crd)
+			ncc.crdToBinding[crd.Name] = b
+		}
+	}
+
+	// get normal CRDs
+	crds, err := ncc.listCRDs(clusterName)
+	if err != nil {
+		return nil, err
+	}
+	ncc.crds = append(ncc.crds, crds...)
+
+	sort.Sort(byUID(ncc.crds))
+
+	return ncc, nil
+}
+
+// Check checks if the given schema from the given APIBinding conflicts with any
+// CRD or any other APIBinding.
+func (ncc *conflictChecker) Check(binding *apisv1alpha1.APIBinding, s *apisv1alpha1.APIResourceSchema) error {
+	for _, crd := range ncc.crds {
+		if other, found := ncc.crdToBinding[crd.Name]; found && other.Name == binding.Name {
+			// don't check binding against itself
 			continue
 		}
 
-		apiExportClusterName, err := getAPIExportClusterName(apiBinding)
-		if err != nil {
-			return err
+		found, details := namesConflict(crd, s)
+		if !found {
+			// no conflict
+			continue
 		}
 
-		apiExport, err := ncc.getAPIExport(apiExportClusterName, apiBinding.Spec.Reference.Workspace.ExportName)
-		if err != nil {
-			return err
-		}
-
-		boundSchemaUIDs := sets.NewString()
-		for _, boundResource := range apiBinding.Status.BoundResources {
-			boundSchemaUIDs.Insert(boundResource.Schema.UID)
-		}
-
-		for _, schemaName := range apiExport.Spec.LatestResourceSchemas {
-			schema, err := ncc.getAPIResourceSchema(apiExportClusterName, schemaName)
-			if err != nil {
-				return err
+		if otherBinding, found := ncc.crdToBinding[crd.Name]; found {
+			path := logicalcluster.NewPath(otherBinding.Spec.Reference.Export.Path)
+			var boundTo string
+			if path.Empty() {
+				boundTo = fmt.Sprintf("local APIExport %q", otherBinding.Spec.Reference.Export.Name)
+			} else {
+				boundTo = fmt.Sprintf("APIExport %s", path.Join(otherBinding.Spec.Reference.Export.Name))
 			}
-
-			if !boundSchemaUIDs.Has(string(schema.UID)) {
-				continue
-			}
-
-			crd, err := ncc.getCRD(ShadowWorkspaceName, string(schema.UID))
-			if err != nil {
-				return err
-			}
-
-			ncc.boundCRDs = append(ncc.boundCRDs, crd)
-			ncc.crdToBinding[crd.Name] = apiBinding
+			return fmt.Errorf("naming conflict with APIBinding %q bound to %s: %s", otherBinding.Name, boundTo, details)
+		} else {
+			return fmt.Errorf("naming conflict with CustomResourceDefinition %q: %s", crd.Name, details)
 		}
 	}
 
-	sort.Sort(byUID(ncc.boundCRDs))
 	return nil
 }
 
-func (ncc *conflictChecker) checkForConflicts(crd *apiextensionsv1.CustomResourceDefinition, apiBinding *apisv1alpha1.APIBinding) error {
-	if err := ncc.getBoundCRDs(apiBinding); err != nil {
-		return fmt.Errorf("error checking for naming conflicts for APIBinding %s|%s: error getting CRDs: %w", logicalcluster.From(apiBinding), apiBinding.Name, err)
-	}
-
-	for _, boundCRD := range ncc.boundCRDs {
-		if foundConflict, details := namesConflict(boundCRD, crd); foundConflict {
-			conflict := ncc.crdToBinding[boundCRD.Name]
-			return fmt.Errorf("naming conflict with a bound API %s, %s", conflict.Name, details)
-		}
-	}
-
-	return ncc.gvrConflict(crd, apiBinding)
-}
-
-func (ncc *conflictChecker) gvrConflict(crd *apiextensionsv1.CustomResourceDefinition, apiBinding *apisv1alpha1.APIBinding) error {
-	bindingClusterName := logicalcluster.From(apiBinding)
-	rawBindingClusterCRDs, err := ncc.crdIndexer.ByIndex(indexByWorkspace, bindingClusterName.String())
-	if err != nil {
-		return err
-	}
-	for _, rawBindClusterCRD := range rawBindingClusterCRDs {
-		bindingClusterCRD := rawBindClusterCRD.(*apiextensionsv1.CustomResourceDefinition)
-		if bindingClusterCRD.Spec.Group == crd.Spec.Group && bindingClusterCRD.Spec.Names.Plural == crd.Spec.Names.Plural {
-			return fmt.Errorf("cannot create %q CustomResourceDefinition with %q group and %q resource because it overlaps with %q CustomResourceDefinition in %q logical cluster",
-				crd.Name, crd.Spec.Group, crd.Spec.Names.Plural, bindingClusterCRD.Name, bindingClusterName)
-		}
-	}
-	return nil
-}
-
-func namesConflict(existing, incoming *apiextensionsv1.CustomResourceDefinition) (bool, string) {
+func namesConflict(existing *apiextensionsv1.CustomResourceDefinition, incoming *apisv1alpha1.APIResourceSchema) (bool, string) {
 	if existing.Spec.Group != incoming.Spec.Group {
 		return false, ""
 	}
-	existingNames := sets.NewString()
+	existingNames := sets.New[string]()
 	existingNames.Insert(existing.Status.AcceptedNames.Plural)
 	existingNames.Insert(existing.Status.AcceptedNames.Singular)
 	existingNames.Insert(existing.Status.AcceptedNames.ShortNames...)
@@ -155,7 +146,7 @@ func namesConflict(existing, incoming *apiextensionsv1.CustomResourceDefinition)
 		}
 	}
 
-	existingKinds := sets.NewString()
+	existingKinds := sets.New[string]()
 	existingKinds.Insert(existing.Status.AcceptedNames.Kind)
 	existingKinds.Insert(existing.Status.AcceptedNames.ListKind)
 

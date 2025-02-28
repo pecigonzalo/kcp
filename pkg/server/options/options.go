@@ -17,10 +17,8 @@ limitations under the License.
 package options
 
 import (
-	"errors"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -30,9 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	genericapiserveroptions "k8s.io/apiserver/pkg/server/options"
 	cliflag "k8s.io/component-base/cli/flag"
-	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/genericcontrolplane/options"
-	kubeoptions "k8s.io/kubernetes/pkg/kubeapiserver/options"
+	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver/options"
 
 	kcpadmission "github.com/kcp-dev/kcp/pkg/admission"
 	etcdoptions "github.com/kcp-dev/kcp/pkg/embeddedetcd/options"
@@ -41,7 +37,7 @@ import (
 )
 
 type Options struct {
-	GenericControlPlane ServerRunOptions
+	GenericControlPlane controlplaneapiserver.Options
 	EmbeddedEtcd        etcdoptions.Options
 	Controllers         Controllers
 	Authorization       Authorization
@@ -54,22 +50,31 @@ type Options struct {
 }
 
 type ExtraOptions struct {
-	RootDirectory            string
-	ProfilerAddress          string
-	ShardKubeconfigFile      string
-	RootShardKubeconfigFile  string
-	ShardBaseURL             string
-	ShardExternalURL         string
-	ShardName                string
-	ShardVirtualWorkspaceURL string
-	DiscoveryPollInterval    time.Duration
-	ExperimentalBindFreePort bool
-
-	BatteriesIncluded []string
+	ProfilerAddress                       string
+	ShardKubeconfigFile                   string
+	RootShardKubeconfigFile               string
+	ShardBaseURL                          string
+	ShardExternalURL                      string
+	ShardName                             string
+	ShardVirtualWorkspaceURL              string
+	ShardClientCertFile                   string
+	ShardClientKeyFile                    string
+	ShardVirtualWorkspaceCAFile           string
+	DiscoveryPollInterval                 time.Duration
+	ExperimentalBindFreePort              bool
+	LogicalClusterAdminKubeconfig         string
+	ExternalLogicalClusterAdminKubeconfig string
+	ConversionCELTransformationTimeout    time.Duration
+	BatteriesIncluded                     []string
+	// DEVELOPMENT ONLY. AdditionalMappingsFile is the path to a file that contains additional mappings
+	// for the mini-front-proxy to use. The file should be in the format of the
+	// --miniproxy-mapping-file flag of the front-proxy. Do NOT expose this flag to users via main server options.
+	// It is overridden by the kcp start command.
+	AdditionalMappingsFile string
 }
 
 type completedOptions struct {
-	GenericControlPlane options.CompletedServerRunOptions
+	GenericControlPlane controlplaneapiserver.CompletedOptions
 	EmbeddedEtcd        etcdoptions.CompletedOptions
 	Controllers         Controllers
 	Authorization       Authorization
@@ -88,9 +93,7 @@ type CompletedOptions struct {
 // NewOptions creates a new Options with default parameters.
 func NewOptions(rootDir string) *Options {
 	o := &Options{
-		GenericControlPlane: ServerRunOptions{
-			*options.NewServerRunOptions(),
-		},
+		GenericControlPlane: *controlplaneapiserver.NewOptions(),
 		EmbeddedEtcd:        *etcdoptions.NewOptions(rootDir),
 		Controllers:         *NewControllers(),
 		Authorization:       *NewAuthorization(),
@@ -100,59 +103,47 @@ func NewOptions(rootDir string) *Options {
 		Cache:               *NewCache(rootDir),
 
 		Extra: ExtraOptions{
-			RootDirectory:            rootDir,
-			ProfilerAddress:          "",
-			ShardKubeconfigFile:      "",
-			ShardBaseURL:             "",
-			ShardExternalURL:         "",
-			ShardName:                "root",
-			DiscoveryPollInterval:    60 * time.Second,
-			ExperimentalBindFreePort: false,
-			BatteriesIncluded:        batteries.Defaults.List(),
+			ProfilerAddress:                    "",
+			ShardKubeconfigFile:                "",
+			ShardBaseURL:                       "",
+			ShardExternalURL:                   "",
+			ShardName:                          "root",
+			DiscoveryPollInterval:              60 * time.Second,
+			ExperimentalBindFreePort:           false,
+			ConversionCELTransformationTimeout: time.Second,
+
+			BatteriesIncluded: sets.List[string](batteries.Defaults),
 		},
 	}
 
 	// override all the stuff
 	o.GenericControlPlane.SecureServing.ServerCert.CertDirectory = rootDir
-	o.GenericControlPlane.Authentication = kubeoptions.NewBuiltInAuthenticationOptions().
-		WithAnonymous().
-		WithBootstrapToken().
-		WithClientCert().
-		WithOIDC().
-		WithRequestHeader().
-		WithServiceAccounts().
-		WithTokenFile()
-	// WithWebHook()
 	o.GenericControlPlane.Authentication.ServiceAccounts.Issuers = []string{"https://kcp.default.svc"}
 	o.GenericControlPlane.Etcd.StorageConfig.Transport.ServerList = []string{"embedded"}
+	o.GenericControlPlane.Authorization = nil // we have our own
 
 	// override set of admission plugins
-	kcpadmission.RegisterAllKcpAdmissionPlugins(o.GenericControlPlane.Admission.Plugins)
-	o.GenericControlPlane.Admission.DisablePlugins = kcpadmission.DefaultOffAdmissionPlugins().List()
-	o.GenericControlPlane.Admission.RecommendedPluginOrder = kcpadmission.AllOrderedPlugins
+	kcpadmission.RegisterAllKcpAdmissionPlugins(o.GenericControlPlane.Admission.GenericAdmission.Plugins)
+	o.GenericControlPlane.Admission.GenericAdmission.DisablePlugins = sets.List[string](kcpadmission.DefaultOffAdmissionPlugins())
+	o.GenericControlPlane.Admission.GenericAdmission.RecommendedPluginOrder = kcpadmission.AllOrderedPlugins
 
 	// turn on the watch cache
 	o.GenericControlPlane.Etcd.EnableWatchCache = true
 
+	// Turn on admissionregistration for validating admission policy
+	if err := o.GenericControlPlane.APIEnablement.RuntimeConfig.Set("admissionregistration.k8s.io/v1alpha1=true"); err != nil {
+		panic(fmt.Errorf("error setting APIEnablement: %w", err))
+	}
+
 	return o
 }
 
-func (o *Options) Flags() cliflag.NamedFlagSets {
-	fss := filter(o.rawFlags(), allowedFlags)
-
-	// add flags that are filtered out from upstream, but overridden here with our own version
-	fs := fss.FlagSet("KCP")
-	fs.Var(kcpfeatures.NewFlagValue(), "feature-gates", ""+
-		"A set of key=value pairs that describe feature gates for alpha/experimental features. "+
-		"Options are:\n"+strings.Join(kcpfeatures.KnownFeatures(), "\n")) // hide kube-only gates
-
-	fss.Order = namedFlagSetOrder
-
-	return fss
-}
-
-func (o *Options) rawFlags() cliflag.NamedFlagSets {
-	fss := o.GenericControlPlane.Flags()
+func (o *Options) AddFlags(fss *cliflag.NamedFlagSets) {
+	raw := &cliflag.NamedFlagSets{}
+	o.GenericControlPlane.AddFlags(raw)
+	for name, fs := range raw.FlagSets {
+		fss.FlagSet(name).AddFlagSet(filter(name, fs, allowedFlags))
+	}
 
 	etcdServers := fss.FlagSet("etcd").Lookup("etcd-servers")
 	etcdServers.Usage += " By default an embedded etcd server is started."
@@ -172,24 +163,34 @@ func (o *Options) rawFlags() cliflag.NamedFlagSets {
 	fs.StringVar(&o.Extra.ShardBaseURL, "shard-base-url", o.Extra.ShardBaseURL, "Base URL to this kcp shard. Defaults to external address.")
 	fs.StringVar(&o.Extra.ShardExternalURL, "shard-external-url", o.Extra.ShardExternalURL, "URL used by outside clients to talk to this kcp shard. Defaults to external address.")
 	fs.StringVar(&o.Extra.ShardName, "shard-name", o.Extra.ShardName, "A name of this kcp shard. Defaults to the \"root\" name.")
+	fs.StringVar(&o.Extra.ShardVirtualWorkspaceCAFile, "shard-virtual-workspace-ca-file", o.Extra.ShardVirtualWorkspaceCAFile, "Path to a CA certificate file that is valid for the virtual workspace server.")
 	fs.StringVar(&o.Extra.ShardVirtualWorkspaceURL, "shard-virtual-workspace-url", o.Extra.ShardVirtualWorkspaceURL, "An external URL address of a virtual workspace server associated with this shard. Defaults to shard's base address.")
-	fs.StringVar(&o.Extra.RootDirectory, "root-directory", o.Extra.RootDirectory, "Root directory.")
+	fs.StringVar(&o.Extra.ShardClientCertFile, "shard-client-cert-file", o.Extra.ShardClientCertFile, "Path to a client certificate file the shard uses to communicate with other system components.")
+	fs.StringVar(&o.Extra.ShardClientKeyFile, "shard-client-key-file", o.Extra.ShardClientKeyFile, "Path to a client certificate key file the shard uses to communicate with other system components.")
+	fs.StringVar(&o.Extra.LogicalClusterAdminKubeconfig, "logical-cluster-admin-kubeconfig", o.Extra.LogicalClusterAdminKubeconfig, "Kubeconfig holding system:kcp:logical-cluster-admin credentials for connecting to other shards. Defaults to the loopback client")
+	fs.StringVar(&o.Extra.ExternalLogicalClusterAdminKubeconfig, "external-logical-cluster-admin-kubeconfig", o.Extra.ExternalLogicalClusterAdminKubeconfig, "Kubeconfig holding system:kcp:external-logical-cluster-admin credentials for connecting to the external address (e.g. the front-proxy). Defaults to the loopback client")
 
 	fs.BoolVar(&o.Extra.ExperimentalBindFreePort, "experimental-bind-free-port", o.Extra.ExperimentalBindFreePort, "Bind to a free port. --secure-port must be 0. Use the admin.kubeconfig to extract the chosen port.")
 	fs.MarkHidden("experimental-bind-free-port") //nolint:errcheck
 
+	fs.DurationVar(&o.Extra.ConversionCELTransformationTimeout, "conversion-cel-transformation-timeout", o.Extra.ConversionCELTransformationTimeout, "Maximum amount of time that CEL transformations may take per object conversion.")
+
 	fs.StringSliceVar(&o.Extra.BatteriesIncluded, "batteries-included", o.Extra.BatteriesIncluded, fmt.Sprintf(
 		`A list of batteries included (= default objects that might be unwanted in production, but are very helpful in trying out kcp or for development). These are the possible values: %s.
 
-- cluster-workspace-types: creates "organization" and "team" ClusterWorkspaceTypes in the root workspace.
-- root-compute-workspace:  create a root:compute workspace, and kubernetes APIExport in it for deployments/services/ingresses
-- user:                    creates an additional non-admin user and context named "user" in the admin.kubeconfig
+- workspace-types:         creates "organization" and "team" WorkspaceTypes in the root workspace.
+- admin:                   creates an admin.kubeconfig in the path passed to --kubeconfig-path.
+- user:                    creates an additional non-admin user and context named "user" in the admin.kubeconfig. Requires "admin" battery to be enabled.
+- metrics-viewer:          creates a service account named "metrics" and a corresponding ClusterRoleBinding (also binds a "metrics-viewer" user) in the root namespace that can view metrics.
 
 Prefixing with - or + means to remove from the default set or add to the default set.`,
-		strings.Join(batteries.All.List(), ","),
+		strings.Join(sets.List[string](batteries.All), ","),
 	))
 
-	return fss
+	// add flags that are filtered out from upstream, but overridden here with our own version
+	fs.Var(kcpfeatures.NewFlagValue(), "feature-gates", ""+
+		"A set of key=value pairs that describe feature gates for alpha/experimental features. "+
+		"Options are:\n"+strings.Join(kcpfeatures.KnownFeatures(), "\n")) // hide kube-only gates
 }
 
 func (o *CompletedOptions) Validate() []error {
@@ -228,24 +229,24 @@ func (o *CompletedOptions) Validate() []error {
 		}
 	}
 
+	batterySet := sets.New[string](o.Extra.BatteriesIncluded...)
+	if batterySet.Has(batteries.User) && !batterySet.Has(batteries.Admin) {
+		errs = append(errs, fmt.Errorf("battery %s enabled which requires %s as well", batteries.User, batteries.Admin))
+	}
+
+	if o.Extra.LogicalClusterAdminKubeconfig != "" && o.Extra.ShardExternalURL == "" {
+		errs = append(errs, fmt.Errorf("--shard-external-url is required if --logical-cluster-admin-kubeconfig is set"))
+	}
+
 	return errs
 }
 
-func (o *Options) Complete() (*CompletedOptions, error) {
+func (o *Options) Complete(rootDir string) (*CompletedOptions, error) {
 	if servers := o.GenericControlPlane.Etcd.StorageConfig.Transport.ServerList; len(servers) == 1 && servers[0] == "embedded" {
 		o.EmbeddedEtcd.Enabled = true
 	}
 
-	if !filepath.IsAbs(o.Extra.RootDirectory) {
-		pwd, err := os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-		o.Extra.RootDirectory = filepath.Join(pwd, o.Extra.RootDirectory)
-	}
-
-	// Create the configuration root correctly before other components get a chance.
-	if err := mkdirRoot(o.Extra.RootDirectory); err != nil {
+	if err := o.Authorization.Complete(); err != nil {
 		return nil, err
 	}
 
@@ -274,6 +275,18 @@ func (o *Options) Complete() (*CompletedOptions, error) {
 			return nil, err
 		}
 	}
+	if len(o.Extra.LogicalClusterAdminKubeconfig) > 0 && !filepath.IsAbs(o.Extra.LogicalClusterAdminKubeconfig) {
+		o.Extra.LogicalClusterAdminKubeconfig, err = filepath.Abs(o.Extra.LogicalClusterAdminKubeconfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(o.Extra.ExternalLogicalClusterAdminKubeconfig) > 0 && !filepath.IsAbs(o.Extra.ExternalLogicalClusterAdminKubeconfig) {
+		o.Extra.ExternalLogicalClusterAdminKubeconfig, err = filepath.Abs(o.Extra.ExternalLogicalClusterAdminKubeconfig)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	if o.Extra.ExperimentalBindFreePort {
 		listener, _, err := genericapiserveroptions.CreateListener("tcp", fmt.Sprintf("%s:0", o.GenericControlPlane.SecureServing.BindAddress), net.ListenConfig{})
@@ -283,7 +296,7 @@ func (o *Options) Complete() (*CompletedOptions, error) {
 		o.GenericControlPlane.SecureServing.Listener = listener
 	}
 
-	if err := o.Controllers.Complete(o.Extra.RootDirectory); err != nil {
+	if err := o.Controllers.Complete(rootDir); err != nil {
 		return nil, err
 	}
 	if o.Controllers.SAController.ServiceAccountKeyFile != "" && !filepath.IsAbs(o.Controllers.SAController.ServiceAccountKeyFile) {
@@ -295,11 +308,11 @@ func (o *Options) Complete() (*CompletedOptions, error) {
 	if len(o.GenericControlPlane.Authentication.ServiceAccounts.KeyFiles) == 0 {
 		o.GenericControlPlane.Authentication.ServiceAccounts.KeyFiles = []string{o.Controllers.SAController.ServiceAccountKeyFile}
 	}
-	if o.GenericControlPlane.ServerRunOptions.ServiceAccountSigningKeyFile == "" {
-		o.GenericControlPlane.ServerRunOptions.ServiceAccountSigningKeyFile = o.Controllers.SAController.ServiceAccountKeyFile
+	if o.GenericControlPlane.ServiceAccountSigningKeyFile == "" {
+		o.GenericControlPlane.ServiceAccountSigningKeyFile = o.Controllers.SAController.ServiceAccountKeyFile
 	}
 
-	completedGenericControlPlane, err := o.GenericControlPlane.ServerRunOptions.Complete()
+	completedGenericOptions, err := o.GenericControlPlane.Complete(nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +332,7 @@ func (o *Options) Complete() (*CompletedOptions, error) {
 		}
 	}
 	if differential {
-		bats := sets.NewString(batteries.Defaults.List()...)
+		bats := sets.New[string](sets.List[string](batteries.Defaults)...)
 		for _, b := range o.Extra.BatteriesIncluded {
 			if strings.HasPrefix(b, "+") {
 				bats.Insert(b[1:])
@@ -327,27 +340,27 @@ func (o *Options) Complete() (*CompletedOptions, error) {
 				bats.Delete(b[1:])
 			}
 		}
-		o.Extra.BatteriesIncluded = bats.List()
+		o.Extra.BatteriesIncluded = sets.List[string](bats)
 	}
 
-	cacheServerEtcdOptions := *completedGenericControlPlane.Etcd
+	completedEmbeddedEtcd := o.EmbeddedEtcd.Complete(o.GenericControlPlane.Etcd)
+	cacheServerEtcdOptions := *o.GenericControlPlane.Etcd
 	o.Cache.Server.Etcd = &cacheServerEtcdOptions
 	// TODO: enable the watch cache, it was disabled because
 	//  - we need to pass a shard name so that the watch cache can calculate the key
 	//    we already do that for cluster names (stored in the obj)
 	//  - we need to modify wildcardClusterNameRegex and crdWildcardPartialMetadataClusterNameRegex
 	o.Cache.Server.Etcd.EnableWatchCache = false
-	o.Cache.Server.SecureServing = completedGenericControlPlane.SecureServing
-	cacheCompletedOptions, err := o.Cache.Complete(completedGenericControlPlane.SecureServing)
+	o.Cache.Server.SecureServing = completedGenericOptions.SecureServing
+	cacheCompletedOptions, err := o.Cache.Complete()
 	if err != nil {
 		return nil, err
 	}
 
 	return &CompletedOptions{
 		completedOptions: &completedOptions{
-			// TODO: GenericControlPlane here should be completed. But the k/k repo does not expose the CompleteOptions type, but should.
-			GenericControlPlane: completedGenericControlPlane,
-			EmbeddedEtcd:        o.EmbeddedEtcd.Complete(o.GenericControlPlane.Etcd),
+			GenericControlPlane: completedGenericOptions,
+			EmbeddedEtcd:        completedEmbeddedEtcd,
 			Controllers:         o.Controllers,
 			Authorization:       o.Authorization,
 			AdminAuthentication: o.AdminAuthentication,
@@ -359,51 +372,12 @@ func (o *Options) Complete() (*CompletedOptions, error) {
 	}, nil
 }
 
-func filter(ffs cliflag.NamedFlagSets, allowed sets.String) cliflag.NamedFlagSets {
-	filtered := cliflag.NamedFlagSets{}
-	for title, fs := range ffs.FlagSets {
-		section := filtered.FlagSet(title)
-		fs.VisitAll(func(f *pflag.Flag) {
-			if allowed.Has(f.Name) {
-				section.AddFlag(f)
-			}
-		})
-	}
+func filter(name string, fs *pflag.FlagSet, allowed sets.Set[string]) *pflag.FlagSet {
+	filtered := pflag.NewFlagSet(name, pflag.ContinueOnError)
+	fs.VisitAll(func(f *pflag.Flag) {
+		if allowed.Has(f.Name) {
+			filtered.AddFlag(f)
+		}
+	})
 	return filtered
-}
-
-// mkdirRoot creates the root configuration directory for the KCP
-// server. This has to be done early before we start bringing up server
-// components to ensure that we set the initial permissions correctly,
-// since otherwise components will create it as a side-effect.
-func mkdirRoot(dir string) error {
-	if dir == "" {
-		return errors.New("missing root directory configuration")
-	}
-	logger := klog.Background().WithValues("dir", dir)
-
-	fi, err := os.Stat(dir)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-
-		logger.Info("creating root directory")
-
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
-
-		// Ensure the leaf directory is moderately private
-		// because this may contain private keys and other
-		// sensitive data
-		return os.Chmod(dir, 0700)
-	}
-
-	if !fi.IsDir() {
-		return fmt.Errorf("%q is a file, please delete or select another location", dir)
-	}
-
-	logger.Info("using root directory")
-	return nil
 }

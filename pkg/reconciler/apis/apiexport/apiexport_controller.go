@@ -21,124 +21,146 @@ import (
 	"fmt"
 	"time"
 
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
+	kcpcorev1informers "github.com/kcp-dev/client-go/informers/core/v1"
+	kcpkubernetesclientset "github.com/kcp-dev/client-go/kubernetes"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	coreinformers "k8s.io/client-go/informers/core/v1"
-	kubernetesclient "k8s.io/client-go/kubernetes"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clusters"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	tenancyv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/tenancy/v1alpha1"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	apisinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/apis/v1alpha1"
-	tenancyinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/tenancy/v1alpha1"
-	apislisters "github.com/kcp-dev/kcp/pkg/client/listers/apis/v1alpha1"
 	"github.com/kcp-dev/kcp/pkg/indexers"
 	"github.com/kcp-dev/kcp/pkg/logging"
 	"github.com/kcp-dev/kcp/pkg/reconciler/committer"
+	"github.com/kcp-dev/kcp/pkg/reconciler/events"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	apisv1alpha1client "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/typed/apis/v1alpha1"
+	apisv1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/apis/v1alpha1"
+	corev1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/core/v1alpha1"
 )
 
 const (
-	controllerName = "kcp-apiexport"
+	ControllerName = "kcp-apiexport"
 
 	DefaultIdentitySecretNamespace = "kcp-system"
 )
 
 // NewController returns a new controller for APIExports.
 func NewController(
-	kcpClusterClient kcpclient.Interface,
-	apiExportInformer apisinformers.APIExportInformer,
-	clusterWorkspaceShardInformer tenancyinformers.ClusterWorkspaceShardInformer,
-	kubeClusterClient kubernetesclient.Interface,
-	namespaceInformer coreinformers.NamespaceInformer,
-	secretInformer coreinformers.SecretInformer,
+	kcpClusterClient kcpclientset.ClusterInterface,
+	apiExportInformer apisv1alpha1informers.APIExportClusterInformer,
+	globalShardInformer corev1alpha1informers.ShardClusterInformer,
+	kubeClusterClient kcpkubernetesclientset.ClusterInterface,
+	namespaceInformer kcpcorev1informers.NamespaceClusterInformer,
+	secretInformer kcpcorev1informers.SecretClusterInformer,
 ) (*controller, error) {
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), controllerName)
-
 	c := &controller{
-		queue:             queue,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name: ControllerName,
+			},
+		),
+
 		kcpClusterClient:  kcpClusterClient,
-		apiExportLister:   apiExportInformer.Lister(),
-		apiExportIndexer:  apiExportInformer.Informer().GetIndexer(),
 		kubeClusterClient: kubeClusterClient,
+
+		listAPIExports: func() ([]*apisv1alpha1.APIExport, error) {
+			return apiExportInformer.Lister().List(labels.Everything())
+		},
+		listAPIExportsForSecret: func(secret *corev1.Secret) ([]*apisv1alpha1.APIExport, error) {
+			secretKey, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(secret)
+			if err != nil {
+				return nil, err
+			}
+
+			return indexers.ByIndex[*apisv1alpha1.APIExport](apiExportInformer.Informer().GetIndexer(), indexers.APIExportBySecret, secretKey)
+		},
+		getAPIExport: func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIExport, error) {
+			return apiExportInformer.Lister().Cluster(clusterName).Get(name)
+		},
+
 		getNamespace: func(clusterName logicalcluster.Name, name string) (*corev1.Namespace, error) {
-			return namespaceInformer.Lister().Get(clusters.ToClusterAwareKey(clusterName, name))
+			return namespaceInformer.Lister().Cluster(clusterName).Get(name)
 		},
-		createNamespace: func(ctx context.Context, clusterName logicalcluster.Name, ns *corev1.Namespace) error {
-			_, err := kubeClusterClient.CoreV1().Namespaces().Create(logicalcluster.WithCluster(ctx, clusterName), ns, metav1.CreateOptions{})
+		createNamespace: func(ctx context.Context, clusterName logicalcluster.Path, ns *corev1.Namespace) error {
+			_, err := kubeClusterClient.Cluster(clusterName).CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
 			return err
 		},
-		secretLister:    secretInformer.Lister(),
 		secretNamespace: DefaultIdentitySecretNamespace,
-		createSecret: func(ctx context.Context, clusterName logicalcluster.Name, secret *corev1.Secret) error {
-			_, err := kubeClusterClient.CoreV1().Secrets(secret.Namespace).Create(logicalcluster.WithCluster(ctx, clusterName), secret, metav1.CreateOptions{})
+
+		getSecret: func(ctx context.Context, clusterName logicalcluster.Name, ns, name string) (*corev1.Secret, error) {
+			secret, err := secretInformer.Lister().Cluster(clusterName).Secrets(ns).Get(name)
+			if err == nil {
+				return secret, nil
+			}
+
+			// In case the lister is slow to catch up, try a live read
+			secret, err = kubeClusterClient.Cluster(clusterName.Path()).CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+
+			return secret, nil
+		},
+		createSecret: func(ctx context.Context, clusterName logicalcluster.Path, secret *corev1.Secret) error {
+			_, err := kubeClusterClient.Cluster(clusterName).CoreV1().Secrets(secret.Namespace).Create(ctx, secret, metav1.CreateOptions{})
 			return err
 		},
-		listClusterWorkspaceShards: func() ([]*tenancyv1alpha1.ClusterWorkspaceShard, error) {
-			return clusterWorkspaceShardInformer.Lister().List(labels.Everything())
+
+		listShards: func() ([]*corev1alpha1.Shard, error) {
+			return globalShardInformer.Lister().List(labels.Everything())
 		},
-		commit: committer.NewCommitter[*APIExport, *APIExportSpec, *APIExportStatus](kcpClusterClient.ApisV1alpha1().APIExports()),
+
+		commit: committer.NewCommitter[*APIExport, Patcher, *APIExportSpec, *APIExportStatus](kcpClusterClient.ApisV1alpha1().APIExports()),
 	}
 
-	c.getSecret = c.readThroughGetSecret
-
-	indexers.AddIfNotPresentOrDie(
-		apiExportInformer.Informer().GetIndexer(),
-		cache.Indexers{
-			indexers.APIExportByIdentity: indexers.IndexAPIExportByIdentity,
-			indexers.APIExportBySecret:   indexers.IndexAPIExportBySecret,
-		},
-	)
-
-	apiExportInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = apiExportInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			c.enqueueAPIExport(obj)
+			c.enqueueAPIExport(obj.(*apisv1alpha1.APIExport))
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			c.enqueueAPIExport(newObj)
+			c.enqueueAPIExport(newObj.(*apisv1alpha1.APIExport))
 		},
 		DeleteFunc: func(obj interface{}) {
-			c.enqueueAPIExport(obj)
+			c.enqueueAPIExport(obj.(*apisv1alpha1.APIExport))
 		},
 	})
 
-	secretInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = secretInformer.Informer().AddEventHandler(events.WithoutSyncs(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			c.enqueueSecret(obj)
+			c.enqueueSecret(obj.(*corev1.Secret))
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			c.enqueueSecret(newObj)
+			c.enqueueSecret(newObj.(*corev1.Secret))
 		},
 		DeleteFunc: func(obj interface{}) {
-			c.enqueueSecret(obj)
+			c.enqueueSecret(obj.(*corev1.Secret))
 		},
-	})
+	}))
 
-	clusterWorkspaceShardInformer.Informer().AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				c.enqueueAllAPIExports(obj)
-			},
-			UpdateFunc: func(_, newObj interface{}) {
-				c.enqueueAllAPIExports(newObj)
-			},
-			DeleteFunc: func(obj interface{}) {
-				c.enqueueAllAPIExports(obj)
-			},
+	_, _ = globalShardInformer.Informer().AddEventHandler(events.WithoutSyncs(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			c.enqueueAllAPIExports(obj.(*corev1alpha1.Shard))
 		},
-	)
+		UpdateFunc: func(_, newObj interface{}) {
+			c.enqueueAllAPIExports(newObj.(*corev1alpha1.Shard))
+		},
+		DeleteFunc: func(obj interface{}) {
+			c.enqueueAllAPIExports(obj.(*corev1alpha1.Shard))
+		},
+	},
+	))
 
 	return c, nil
 }
@@ -146,96 +168,92 @@ func NewController(
 type APIExport = apisv1alpha1.APIExport
 type APIExportSpec = apisv1alpha1.APIExportSpec
 type APIExportStatus = apisv1alpha1.APIExportStatus
+type Patcher = apisv1alpha1client.APIExportInterface
 type Resource = committer.Resource[*APIExportSpec, *APIExportStatus]
 type CommitFunc = func(context.Context, *Resource, *Resource) error
 
 // controller reconciles APIExports. It ensures an export's identity secret exists and is valid.
 type controller struct {
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
-	kcpClusterClient kcpclient.Interface
-	apiExportLister  apislisters.APIExportLister
-	apiExportIndexer cache.Indexer
+	kcpClusterClient  kcpclientset.ClusterInterface
+	kubeClusterClient kcpkubernetesclientset.ClusterInterface
 
-	kubeClusterClient kubernetesclient.Interface
+	listAPIExports          func() ([]*apisv1alpha1.APIExport, error)
+	listAPIExportsForSecret func(secret *corev1.Secret) ([]*apisv1alpha1.APIExport, error)
+	getAPIExport            func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIExport, error)
 
 	getNamespace    func(clusterName logicalcluster.Name, name string) (*corev1.Namespace, error)
-	createNamespace func(ctx context.Context, clusterName logicalcluster.Name, ns *corev1.Namespace) error
+	createNamespace func(ctx context.Context, clusterName logicalcluster.Path, ns *corev1.Namespace) error
 
-	secretLister    corelisters.SecretLister
 	secretNamespace string
 
 	getSecret    func(ctx context.Context, clusterName logicalcluster.Name, ns, name string) (*corev1.Secret, error)
-	createSecret func(ctx context.Context, clusterName logicalcluster.Name, secret *corev1.Secret) error
+	createSecret func(ctx context.Context, clusterName logicalcluster.Path, secret *corev1.Secret) error
 
-	listClusterWorkspaceShards func() ([]*tenancyv1alpha1.ClusterWorkspaceShard, error)
-	commit                     CommitFunc
+	listShards func() ([]*corev1alpha1.Shard, error)
+
+	commit CommitFunc
 }
 
-// enqueueAPIBinding enqueues an APIExport .
-func (c *controller) enqueueAPIExport(obj interface{}) {
-	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
+// enqueueAPIExport enqueues an APIExport.
+func (c *controller) enqueueAPIExport(apiExport *apisv1alpha1.APIExport) {
+	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(apiExport)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
 
-	logger := logging.WithQueueKey(logging.WithReconciler(klog.Background(), controllerName), key)
+	logger := logging.WithQueueKey(logging.WithReconciler(klog.Background(), ControllerName), key)
 	logger.V(4).Info("queueing APIExport")
 	c.queue.Add(key)
 }
 
-func (c *controller) enqueueAllAPIExports(clusterWorkspaceShard interface{}) {
-	list, err := c.apiExportLister.List(labels.Everything())
+func (c *controller) enqueueAllAPIExports(shard *corev1alpha1.Shard) {
+	list, err := c.listAPIExports()
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
 
-	logger := logging.WithObject(logging.WithReconciler(klog.Background(), controllerName), clusterWorkspaceShard.(*tenancyv1alpha1.ClusterWorkspaceShard))
+	logger := logging.WithObject(logging.WithReconciler(klog.Background(), ControllerName), shard)
 	for i := range list {
 		key, err := kcpcache.MetaClusterNamespaceKeyFunc(list[i])
 		if err != nil {
-			runtime.HandleError(err)
+			utilruntime.HandleError(err)
 			continue
 		}
 
-		logging.WithQueueKey(logger, key).V(2).Info("queuing APIExport because ClusterWorkspaceShard changed")
+		logging.WithQueueKey(logger, key).V(3).Info("queuing APIExport because Shard changed")
 		c.queue.Add(key)
 	}
 }
 
-func (c *controller) enqueueSecret(obj interface{}) {
-	secretKey, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
+func (c *controller) enqueueSecret(secret *corev1.Secret) {
+	apiExports, err := c.listAPIExportsForSecret(secret)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
 
-	apiExports, err := c.apiExportIndexer.ByIndex(indexers.APIExportBySecret, secretKey)
-	if err != nil {
-		runtime.HandleError(err)
-		return
-	}
-
-	logger := logging.WithObject(logging.WithReconciler(klog.Background(), controllerName), obj.(*corev1.Secret))
+	logger := logging.WithObject(logging.WithReconciler(klog.Background(), ControllerName), secret)
 	for _, apiExport := range apiExports {
 		key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(apiExport)
 		if err != nil {
-			runtime.HandleError(err)
+			utilruntime.HandleError(err)
 			return
 		}
-		logging.WithQueueKey(logger, key).V(2).Info("queueing APIExport via identity Secret")
+		logging.WithQueueKey(logger, key).V(3).Info("queueing APIExport via identity Secret")
 		c.queue.Add(key)
 	}
 }
 
 // Start starts the controller, which stops when ctx.Done() is closed.
 func (c *controller) Start(ctx context.Context, numThreads int) {
-	defer runtime.HandleCrash()
+	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	logger := logging.WithReconciler(klog.FromContext(ctx), controllerName)
+	logger := logging.WithReconciler(klog.FromContext(ctx), ControllerName)
 	ctx = klog.NewContext(ctx, logger)
 	logger.Info("Starting controller")
 	defer logger.Info("Shutting down controller")
@@ -258,7 +276,7 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 	if quit {
 		return false
 	}
-	key := k.(string)
+	key := k
 
 	logger := logging.WithQueueKey(klog.FromContext(ctx), key)
 	ctx = klog.NewContext(ctx, logger)
@@ -269,7 +287,7 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 	defer c.queue.Done(key)
 
 	if err := c.process(ctx, key); err != nil {
-		runtime.HandleError(fmt.Errorf("%q controller failed to sync %q, err: %w", controllerName, key, err))
+		utilruntime.HandleError(fmt.Errorf("%q controller failed to sync %q, err: %w", ControllerName, key, err))
 		c.queue.AddRateLimited(key)
 		return true
 	}
@@ -278,7 +296,13 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 }
 
 func (c *controller) process(ctx context.Context, key string) error {
-	obj, err := c.apiExportLister.Get(key)
+	cluster, _, name, err := kcpcache.SplitMetaClusterNamespaceKey(key)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return nil
+	}
+
+	obj, err := c.getAPIExport(cluster, name)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil // object deleted before we handled it
@@ -310,17 +334,13 @@ func (c *controller) process(ctx context.Context, key string) error {
 	return utilerrors.NewAggregate(errs)
 }
 
-func (c *controller) readThroughGetSecret(ctx context.Context, clusterName logicalcluster.Name, ns, name string) (*corev1.Secret, error) {
-	secret, err := c.secretLister.Secrets(ns).Get(clusters.ToClusterAwareKey(clusterName, name))
-	if err == nil {
-		return secret, nil
-	}
-
-	// In case the lister is slow to catch up, try a live read
-	secret, err = c.kubeClusterClient.CoreV1().Secrets(ns).Get(logicalcluster.WithCluster(ctx, clusterName), name, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	return secret, nil
+// InstallIndexers adds the additional indexers that this controller requires to the informers.
+func InstallIndexers(apiExportInformer apisv1alpha1informers.APIExportClusterInformer) {
+	indexers.AddIfNotPresentOrDie(
+		apiExportInformer.Informer().GetIndexer(),
+		cache.Indexers{
+			indexers.APIExportByIdentity: indexers.IndexAPIExportByIdentity,
+			indexers.APIExportBySecret:   indexers.IndexAPIExportBySecret,
+		},
+	)
 }

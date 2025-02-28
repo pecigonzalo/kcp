@@ -23,24 +23,27 @@ import (
 )
 
 const (
-	// ClusterWorkspaceTypes leads to creation of a number of default types beyond the universal type.
-	ClusterWorkspaceTypes = "cluster-workspace-types"
+	// WorkspaceTypes leads to creation of a number of default types beyond the universal type.
+	WorkspaceTypes = "workspace-types"
 
-	// User leads to an additional user named "user" in the admin.kubeconfig that is not admin.
+	// Admin leads to creating a local admin.kubeconfig and a token hash file to access kcp as shard admin.
+	Admin = "admin"
+
+	// User leads to an additional user named "user" in the admin.kubeconfig that is not admin. Requires the "admin" battery to be enabled.
 	User = "user"
 
-	// RootComputeWorkspace leads to creation of a compute workspace with kubernetes APIExport and
-	// related APIResourceSchemas in the workspace.
-	RootComputeWorkspace = "root-compute-workspace"
+	// MetricsViewer leads to an additional service account named "metrics" in the root namespace that can view metrics.
+	MetricsViewer = "metrics-viewer"
 )
 
-var All = sets.NewString(
-	ClusterWorkspaceTypes,
+var All = sets.New[string](
+	WorkspaceTypes,
+	Admin,
 	User,
-	RootComputeWorkspace,
+	MetricsViewer,
 )
 
-var Defaults = sets.NewString(
-	ClusterWorkspaceTypes,
-	RootComputeWorkspace,
+var Defaults = sets.New[string](
+	WorkspaceTypes,
+	Admin,
 )

@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"net/http"
 
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -63,6 +65,8 @@ type Strategy interface {
 	rest.ResetFieldsStrategy
 }
 
+type DynamicClusterClientFunc func(ctx context.Context) (kcpdynamic.ClusterInterface, error)
+
 func DefaultDynamicDelegatedStoreFuncs(
 	factory FactoryFunc,
 	listFactory ListFactoryFunc,
@@ -72,12 +76,13 @@ func DefaultDynamicDelegatedStoreFuncs(
 	resource schema.GroupVersionResource,
 	apiExportIdentityHash string,
 	categories []string,
-	dynamicClusterClient dynamic.ClusterInterface,
+	dynamicClusterClientFunc DynamicClusterClientFunc,
 	subResources []string,
 	patchConflictRetryBackoff wait.Backoff,
 	stopWatchesCh <-chan struct{},
 ) *StoreFuncs {
-	client := clientGetter(dynamicClusterClient, strategy.NamespaceScoped(), resource, apiExportIdentityHash)
+	client := clientGetter(dynamicClusterClientFunc, strategy.NamespaceScoped(), resource, apiExportIdentityHash)
+	listerWatcher := listerWatcherGetter(dynamicClusterClientFunc, strategy.NamespaceScoped(), resource, apiExportIdentityHash)
 	s := &StoreFuncs{}
 	s.FactoryFunc = factory
 	s.ListFactoryFunc = listFactory
@@ -109,7 +114,7 @@ func DefaultDynamicDelegatedStoreFuncs(
 			return nil, false, err
 		}
 
-		deleter, err := withDeleter(delegate)
+		deleter, err := dynamicextension.NewDeleterWithResults(delegate)
 		if err != nil {
 			return nil, false, err
 		}
@@ -143,7 +148,7 @@ func DefaultDynamicDelegatedStoreFuncs(
 			return nil, err
 		}
 
-		deleter, err := withDeleter(delegate)
+		deleter, err := dynamicextension.NewDeleterWithResults(delegate)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +167,7 @@ func DefaultDynamicDelegatedStoreFuncs(
 			return nil, err
 		}
 
-		delegate, err := client(ctx)
+		delegate, err := listerWatcher(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -178,6 +183,7 @@ func DefaultDynamicDelegatedStoreFuncs(
 		requestInfo, _ := genericapirequest.RequestInfoFrom(ctx)
 
 		doUpdate := func() (*unstructured.Unstructured, error) {
+			needToCreate := false
 			oldObj, err := s.Get(ctx, name, &metav1.GetOptions{})
 			if err != nil {
 				// Continue on 404 when forceAllowCreate is enabled,
@@ -188,7 +194,12 @@ func DefaultDynamicDelegatedStoreFuncs(
 						!(requestInfo != nil && requestInfo.Verb == "patch") {
 					return nil, err
 				}
-				oldObj = nil
+
+				// This needs to be the zero value of the object and not nil. This matches the normal rest/storage
+				// flows. Additionally, if oldObj were nil, the call the objInfo.UpdatedObject below would return an
+				// error because one of the transformers wouldn't be able to extract metadata for oldObj.
+				oldObj = &unstructured.Unstructured{}
+				needToCreate = true
 			}
 
 			// The following call returns a 404 error for non server-side apply
@@ -207,7 +218,7 @@ func DefaultDynamicDelegatedStoreFuncs(
 				return nil, fmt.Errorf("not an Unstructured: %T", obj)
 			}
 
-			if oldObj == nil {
+			if needToCreate {
 				// The object does not currently exist.
 				// We switch to calling a create operation on the forwarding registry.
 				// This enables support for server-side apply requests, to create non-existent objects.
@@ -235,7 +246,7 @@ func DefaultDynamicDelegatedStoreFuncs(
 		if err := metainternalversion.Convert_internalversion_ListOptions_To_v1_ListOptions(options, &v1ListOptions, nil); err != nil {
 			return nil, err
 		}
-		delegate, err := client(ctx)
+		delegate, err := listerWatcher(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -260,33 +271,72 @@ func DefaultDynamicDelegatedStoreFuncs(
 	return s
 }
 
-func withDeleter(dynamicResourceInterface dynamic.ResourceInterface) (dynamicextension.ResourceInterface, error) {
-	if c, ok := dynamicResourceInterface.(dynamicextension.ResourceInterface); ok {
-		return c, nil
-	}
-	return nil, fmt.Errorf("dynamic client does not implement ResourceDeleterInterface")
-}
-
-func clientGetter(dynamicClusterClient dynamic.ClusterInterface, namespaceScoped bool, resource schema.GroupVersionResource, apiExportIdentityHash string) func(ctx context.Context) (dynamic.ResourceInterface, error) {
+func clientGetter(dynamicClusterClientFunc DynamicClusterClientFunc, namespaceScoped bool, resource schema.GroupVersionResource, apiExportIdentityHash string) func(ctx context.Context) (dynamic.ResourceInterface, error) {
 	return func(ctx context.Context) (dynamic.ResourceInterface, error) {
 		cluster, err := genericapirequest.ValidClusterFrom(ctx)
 		if err != nil {
-			return nil, err
+			return nil, apiErrorBadRequest(err)
 		}
+
 		gvr := resource
 		clusterName := cluster.Name
 		if apiExportIdentityHash != "" {
 			gvr.Resource += ":" + apiExportIdentityHash
 		}
 
+		dynamicClusterClient, err := dynamicClusterClientFunc(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("error generating dynamic client: %w", err)
+		}
+
 		if namespaceScoped {
 			if namespace, ok := genericapirequest.NamespaceFrom(ctx); ok {
-				return dynamicClusterClient.Cluster(clusterName).Resource(gvr).Namespace(namespace), nil
+				return dynamicClusterClient.Cluster(clusterName.Path()).Resource(gvr).Namespace(namespace), nil
 			} else {
-				return nil, fmt.Errorf("there should be a Namespace context in a request for a namespaced resource: %s", gvr.String())
+				return nil, apiErrorBadRequest(fmt.Errorf("there should be a Namespace context in a request for a namespaced resource: %s", gvr.String()))
 			}
 		} else {
-			return dynamicClusterClient.Cluster(clusterName).Resource(gvr), nil
+			return dynamicClusterClient.Cluster(clusterName.Path()).Resource(gvr), nil
+		}
+	}
+}
+
+type listerWatcher interface {
+	List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error)
+	Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)
+}
+
+func listerWatcherGetter(dynamicClusterClientFunc DynamicClusterClientFunc, namespaceScoped bool, resource schema.GroupVersionResource, apiExportIdentityHash string) func(ctx context.Context) (listerWatcher, error) {
+	return func(ctx context.Context) (listerWatcher, error) {
+		cluster, err := genericapirequest.ValidClusterFrom(ctx)
+		if err != nil {
+			return nil, apiErrorBadRequest(err)
+		}
+		gvr := resource
+		if apiExportIdentityHash != "" {
+			gvr.Resource += ":" + apiExportIdentityHash
+		}
+		namespace, namespaceSet := genericapirequest.NamespaceFrom(ctx)
+
+		dynamicClusterClient, err := dynamicClusterClientFunc(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("error generating dynamic client: %w", err)
+		}
+
+		switch {
+		case cluster.Wildcard:
+			if namespaceScoped && namespaceSet && namespace != metav1.NamespaceAll {
+				return nil, apiErrorBadRequest(fmt.Errorf("cross-cluster LIST and WATCH are required to be cross-namespace, not scoped to namespace %s", namespace))
+			}
+			return dynamicClusterClient.Resource(gvr), nil
+		default:
+			if namespaceScoped {
+				if !namespaceSet {
+					return nil, apiErrorBadRequest(fmt.Errorf("there should be a Namespace context in a request for a namespaced resource: %s", gvr.String()))
+				}
+				return dynamicClusterClient.Cluster(cluster.Name.Path()).Resource(gvr).Namespace(namespace), nil
+			}
+			return dynamicClusterClient.Cluster(cluster.Name.Path()).Resource(gvr), nil
 		}
 	}
 }
@@ -300,4 +350,13 @@ func updateToCreateOptions(uo *metav1.UpdateOptions) metav1.CreateOptions {
 	}
 	co.TypeMeta.SetGroupVersionKind(metav1.SchemeGroupVersion.WithKind("CreateOptions"))
 	return co
+}
+
+// apiErrorBadRequest returns a apierrors.StatusError with a BadRequest reason.
+func apiErrorBadRequest(err error) *apierrors.StatusError {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    http.StatusBadRequest,
+		Message: err.Error(),
+	}}
 }

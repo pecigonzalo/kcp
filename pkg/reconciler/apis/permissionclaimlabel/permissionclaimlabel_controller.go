@@ -18,55 +18,55 @@ package permissionclaimlabel
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/go-logr/logr"
-	kcpcache "github.com/kcp-dev/apimachinery/pkg/cache"
-	"github.com/kcp-dev/logicalcluster/v2"
+	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
+	kcpdynamic "github.com/kcp-dev/client-go/dynamic"
+	"github.com/kcp-dev/logicalcluster/v3"
 
-	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clusters"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	kcpclient "github.com/kcp-dev/kcp/pkg/client/clientset/versioned"
-	apisinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions/apis/v1alpha1"
-	apislisters "github.com/kcp-dev/kcp/pkg/client/listers/apis/v1alpha1"
+	"github.com/kcp-dev/kcp/pkg/indexers"
 	"github.com/kcp-dev/kcp/pkg/informer"
 	"github.com/kcp-dev/kcp/pkg/logging"
+	"github.com/kcp-dev/kcp/pkg/reconciler/committer"
+	apisv1alpha1 "github.com/kcp-dev/kcp/sdk/apis/apis/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	apisv1alpha1client "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/typed/apis/v1alpha1"
+	apisv1alpha1informers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions/apis/v1alpha1"
+	apisv1alpha1listers "github.com/kcp-dev/kcp/sdk/client/listers/apis/v1alpha1"
 )
 
 const (
-	controllerName = "kcp-permissionclaimlabel"
+	ControllerName = "kcp-permissionclaimlabel"
 )
 
 // NewController returns a new controller for handling permission claims for an APIBinding.
 // it will own the AppliedPermissionClaims and will own the accepted permission claim condition.
 func NewController(
-	kcpClusterClient kcpclient.Interface,
-	dynamicClusterClient dynamic.Interface,
-	dynamicDiscoverySharedInformerFactory *informer.DynamicDiscoverySharedInformerFactory,
-	apiBindingInformer apisinformers.APIBindingInformer,
-	apiExportInformer apisinformers.APIExportInformer,
+	kcpClusterClient kcpclientset.ClusterInterface,
+	dynamicClusterClient kcpdynamic.ClusterInterface,
+	dynamicDiscoverySharedInformerFactory *informer.DiscoveringDynamicSharedInformerFactory,
+	apiBindingInformer apisv1alpha1informers.APIBindingClusterInformer,
+	apiExportInformer, globalAPIExportInformer apisv1alpha1informers.APIExportClusterInformer,
 ) (*controller, error) {
-	logger := logging.WithReconciler(klog.Background(), controllerName)
-
-	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), controllerName)
+	logger := logging.WithReconciler(klog.Background(), ControllerName)
 
 	c := &controller{
-		queue:                queue,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Name: ControllerName,
+			},
+		),
 		kcpClusterClient:     kcpClusterClient,
 		dynamicClusterClient: dynamicClusterClient,
 		ddsif:                dynamicDiscoverySharedInformerFactory,
@@ -74,13 +74,14 @@ func NewController(
 		apiBindingsLister:  apiBindingInformer.Lister(),
 		apiBindingsIndexer: apiBindingInformer.Informer().GetIndexer(),
 
-		getAPIExport: func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIExport, error) {
-			key := clusters.ToClusterAwareKey(clusterName, name)
-			return apiExportInformer.Lister().Get(key)
+		getAPIExport: func(path logicalcluster.Path, name string) (*apisv1alpha1.APIExport, error) {
+			return indexers.ByPathAndNameWithFallback[*apisv1alpha1.APIExport](apisv1alpha1.Resource("apiexports"), apiExportInformer.Informer().GetIndexer(), globalAPIExportInformer.Informer().GetIndexer(), path, name)
 		},
+
+		commit: committer.NewCommitter[*APIBinding, Patcher, *APIBindingSpec, *APIBindingStatus](kcpClusterClient.ApisV1alpha1().APIBindings()),
 	}
 
-	apiBindingInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, _ = apiBindingInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) { c.enqueueAPIBinding(obj, logger) },
 		UpdateFunc: func(_, newObj interface{}) {
 			c.enqueueAPIBinding(newObj, logger)
@@ -89,42 +90,50 @@ func NewController(
 	})
 
 	return c, nil
-
 }
+
+type APIBinding = apisv1alpha1.APIBinding
+type APIBindingSpec = apisv1alpha1.APIBindingSpec
+type APIBindingStatus = apisv1alpha1.APIBindingStatus
+type Patcher = apisv1alpha1client.APIBindingInterface
+type Resource = committer.Resource[*APIBindingSpec, *APIBindingStatus]
+type CommitFunc = func(context.Context, *Resource, *Resource) error
 
 // controller reconciles resource labels that make claimed resources visible to an APIExport
 // owner. It labels resources in the intersection of `APIBinding.status.permissionClaims` and
 // `APIBinding.spec.acceptedPermissionClaims`.
 type controller struct {
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
-	kcpClusterClient     kcpclient.Interface
+	kcpClusterClient     kcpclientset.ClusterInterface
 	apiBindingsIndexer   cache.Indexer
-	dynamicClusterClient dynamic.Interface
-	ddsif                *informer.DynamicDiscoverySharedInformerFactory
+	dynamicClusterClient kcpdynamic.ClusterInterface
+	ddsif                *informer.DiscoveringDynamicSharedInformerFactory
 
-	apiBindingsLister apislisters.APIBindingLister
-	getAPIExport      func(clusterName logicalcluster.Name, name string) (*apisv1alpha1.APIExport, error)
+	apiBindingsLister apisv1alpha1listers.APIBindingClusterLister
+	getAPIExport      func(path logicalcluster.Path, name string) (*apisv1alpha1.APIExport, error)
+
+	commit CommitFunc
 }
 
 // enqueueAPIBinding enqueues an APIBinding.
 func (c *controller) enqueueAPIBinding(obj interface{}, logger logr.Logger) {
 	key, err := kcpcache.DeletionHandlingMetaClusterNamespaceKeyFunc(obj)
 	if err != nil {
-		runtime.HandleError(err)
+		utilruntime.HandleError(err)
 		return
 	}
 
-	logging.WithQueueKey(logger, key).V(2).Info("queueing APIBinding")
+	logging.WithQueueKey(logger, key).V(4).Info("queueing APIBinding")
 	c.queue.Add(key)
 }
 
 // Start starts the controller, which stops when ctx.Done() is closed.
 func (c *controller) Start(ctx context.Context, numThreads int) {
-	defer runtime.HandleCrash()
+	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	logger := logging.WithReconciler(klog.FromContext(ctx), controllerName)
+	logger := logging.WithReconciler(klog.FromContext(ctx), ControllerName)
 	ctx = klog.NewContext(ctx, logger)
 	logger.Info("starting controller")
 	defer logger.Info("shutting down controller")
@@ -147,18 +156,18 @@ func (c *controller) processNextWorkItem(ctx context.Context) bool {
 	if quit {
 		return false
 	}
-	key := k.(string)
+	key := k
 
 	logger := logging.WithQueueKey(klog.FromContext(ctx), key)
 	ctx = klog.NewContext(ctx, logger)
-	logger.V(1).Info("processing key")
+	logger.V(4).Info("processing key")
 
 	// No matter what, tell the queue we're done with this key, to unblock
 	// other workers.
 	defer c.queue.Done(key)
 
 	if err := c.process(ctx, key); err != nil {
-		runtime.HandleError(fmt.Errorf("%q controller failed to sync %q, err: %w", controllerName, key, err))
+		utilruntime.HandleError(fmt.Errorf("%q controller failed to sync %q, err: %w", ControllerName, key, err))
 		c.queue.AddRateLimited(key)
 		return true
 	}
@@ -174,56 +183,49 @@ func (c *controller) process(ctx context.Context, key string) error {
 		return nil
 	}
 
-	obj, err := c.apiBindingsLister.Get(key)
+	obj, err := c.apiBindingsLister.Cluster(clusterName).Get(name)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return nil // object deleted before we handled it
 		}
 		return err
 	}
 
-	logger = logging.WithObject(logger, obj)
-	ctx = klog.NewContext(ctx, logger)
-
 	old := obj
 	obj = obj.DeepCopy()
+
+	logger = logging.WithObject(logger, obj)
+	ctx = klog.NewContext(ctx, logger)
 
 	var errs []error
 	if err := c.reconcile(ctx, obj); err != nil {
 		errs = append(errs, err)
 	}
 
+	// Regardless of whether reconcile returned an error or not, always try to patch status if needed. Return the
+	// reconciliation error at the end.
+
 	// If the object being reconciled changed as a result, update it.
-	if !equality.Semantic.DeepEqual(old.Status, obj.Status) {
-		oldData, err := json.Marshal(apisv1alpha1.APIBinding{
-			Status: old.Status,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to Marshal old data for apibinding %s|%s: %w", clusterName, name, err)
-		}
-
-		newData, err := json.Marshal(apisv1alpha1.APIBinding{
-			ObjectMeta: metav1.ObjectMeta{
-				UID:             old.UID,
-				ResourceVersion: old.ResourceVersion,
-			}, // to ensure they appear in the patch as preconditions
-			Status: obj.Status,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to Marshal new data for apibinding %s|%s: %w", clusterName, name, err)
-		}
-
-		patchBytes, err := jsonpatch.CreateMergePatch(oldData, newData)
-		if err != nil {
-			return fmt.Errorf("failed to create patch for apibinding %s|%s: %w", clusterName, name, err)
-		}
-
-		logger.V(2).Info("patching APIBinding", "patch", string(patchBytes))
-		if _, err := c.kcpClusterClient.ApisV1alpha1().APIBindings().Patch(logicalcluster.WithCluster(ctx, clusterName), obj.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{}, "status"); err != nil {
-			errs = append(errs, err)
-
-		}
+	oldResource := &Resource{ObjectMeta: old.ObjectMeta, Spec: &old.Spec, Status: &old.Status}
+	newResource := &Resource{ObjectMeta: obj.ObjectMeta, Spec: &obj.Spec, Status: &obj.Status}
+	if err := c.commit(ctx, oldResource, newResource); err != nil {
+		errs = append(errs, err)
 	}
 
 	return utilerrors.NewAggregate(errs)
+}
+
+// InstallIndexers adds the additional indexers that this controller requires to the informers.
+func InstallIndexers(apiExportInformer apisv1alpha1informers.APIExportClusterInformer, apiBindingInformer apisv1alpha1informers.APIBindingClusterInformer) {
+	indexers.AddIfNotPresentOrDie(apiExportInformer.Informer().GetIndexer(), cache.Indexers{
+		indexers.ByLogicalClusterPathAndName: indexers.IndexByLogicalClusterPathAndName,
+	})
+
+	if err := apiBindingInformer.Informer().GetIndexer().AddIndexers(
+		cache.Indexers{
+			indexers.APIBindingByClusterAndAcceptedClaimedGroupResources: indexers.IndexAPIBindingByClusterAndAcceptedClaimedGroupResources,
+		},
+	); err != nil {
+		panic(err)
+	}
 }

@@ -17,15 +17,20 @@
 set -e
 set -o pipefail
 
-VERSION=$(grep "go 1." go.mod | sed 's/go //')
+VERSION=$(grep "go 1." go.mod | sed 's/go //' | sed 's/.0$//')
 
-grep "tag: \"" .ci-operator.yaml | { ! grep -v "${VERSION}"; } || { echo "Wrong go version in .ci-operator.yaml, expected ${VERSION}"; exit 1; }
-grep "FROM golang:" Dockerfile | { ! grep -v "${VERSION}"; } || { echo "Wrong go version in Dockerfile, expected ${VERSION}"; exit 1; }
-grep "go-version:" .github/workflows/*.yaml | { ! grep -v "go-version: v${VERSION}"; } || { echo "Wrong go version in .github/workflows/*.yaml, expected ${VERSION}"; exit 1; }
+grep "FROM .* docker.io/golang:" Dockerfile | { ! grep -v "${VERSION}"; } || { echo "Wrong go version in Dockerfile, expected ${VERSION}"; exit 1; }
+grep -w "go-version:" .github/workflows/*.yaml | { ! grep -v "go-version: v${VERSION}"; } || { echo "Wrong go version in .github/workflows/*.yaml, expected ${VERSION}"; exit 1; }
+
+shopt -s dotglob
 # Note CONTRIBUTING.md isn't copied in the Dockerfile
-if [ -e CONTRIBUTING.md ]; then
-  grep "golang.org/doc/install" CONTRIBUTING.md | { ! grep -v "${VERSION}"; } || { echo "Wrong go version in CONTRIBUTING.md expected ${VERSION}"; exit 1; }
-fi
+for f in docs/content/contributing/index.md; do
+  grep "golang.org/doc/install" "$f" | { ! grep -v "${VERSION}"; } || { echo "Wrong go version in $f; expected ${VERSION}"; exit 1; }
+done
+
+# Check prow config
+grep "ghcr.io/kcp-dev/infra/build" ".prow.yaml" | { ! grep -v "${VERSION}"; } || { echo "Wrong go version in .prow.yaml; expected ${VERSION}"; exit 1; }
+
 if [ -z "${IGNORE_GO_VERSION}" ]; then
   go version | { ! grep -v go${VERSION}; } || { echo "Unexpected go version installed, expected ${VERSION}. Use IGNORE_GO_VERSION=1 to skip this check."; exit 1; }
 fi

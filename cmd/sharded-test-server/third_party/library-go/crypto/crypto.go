@@ -30,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/big"
 	mathrand "math/rand"
 	"net"
@@ -402,7 +401,7 @@ func GetTLSCertificateConfig(certFile, keyFile string) (*TLSCertificateConfig, e
 		return nil, errors.New("keyFile missing")
 	}
 
-	certPEMBlock, err := ioutil.ReadFile(certFile)
+	certPEMBlock, err := os.ReadFile(certFile)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +410,7 @@ func GetTLSCertificateConfig(certFile, keyFile string) (*TLSCertificateConfig, e
 		return nil, fmt.Errorf("error reading %s: %s", certFile, err)
 	}
 
-	keyPEMBlock, err := ioutil.ReadFile(keyFile)
+	keyPEMBlock, err := os.ReadFile(keyFile)
 	if err != nil {
 		return nil, err
 	}
@@ -524,14 +523,14 @@ func (s *SerialFileGenerator) Next(template *x509.Certificate) (int64, error) {
 	// always add a newline at the end to have a valid file
 	serialText += "\n"
 
-	if err := ioutil.WriteFile(s.SerialFile, []byte(serialText), os.FileMode(0640)); err != nil {
+	if err := os.WriteFile(s.SerialFile, []byte(serialText), os.FileMode(0640)); err != nil {
 		return 0, err
 	}
 	return next, nil
 }
 
 func fileToSerial(serialFile string) (int64, error) {
-	serialData, err := ioutil.ReadFile(serialFile)
+	serialData, err := os.ReadFile(serialFile)
 	if err != nil {
 		return 0, err
 	}
@@ -613,7 +612,7 @@ func GetCAFromBytes(certBytes, keyBytes []byte) (*CA, error) {
 
 // if serialFile is empty, a RandomSerialGenerator will be used
 func MakeSelfSignedCA(certFile, keyFile, serialFile, name string, expireDays int) (*CA, error) {
-	klog.V(2).Infof("Generating new CA for %s cert, and key in %s, %s", name, certFile, keyFile)
+	klog.Background().V(2).WithValues("certName", name, "certFile", certFile, "keyFile", keyFile).Info("generating new CA for cert")
 
 	caConfig, err := MakeSelfSignedCAConfig(name, expireDays)
 	if err != nil {
@@ -626,7 +625,7 @@ func MakeSelfSignedCA(certFile, keyFile, serialFile, name string, expireDays int
 	var serialGenerator SerialGenerator
 	if len(serialFile) > 0 {
 		// create / overwrite the serial file with a zero padded hex value (ending in a newline to have a valid file)
-		if err := ioutil.WriteFile(serialFile, []byte("00\n"), 0644); err != nil {
+		if err := os.WriteFile(serialFile, []byte("00\n"), 0644); err != nil {
 			return nil, err
 		}
 		serialGenerator, err = NewSerialFileGenerator(serialFile)
@@ -708,7 +707,7 @@ func MakeCAConfigForDuration(name string, caLifetime time.Duration, issuer *CA) 
 	return signerConfig, nil
 }
 
-func (ca *CA) EnsureServerCert(certFile, keyFile string, hostnames sets.String, expireDays int) (*TLSCertificateConfig, bool, error) {
+func (ca *CA) EnsureServerCert(certFile, keyFile string, hostnames sets.Set[string], expireDays int) (*TLSCertificateConfig, bool, error) {
 	certConfig, err := GetServerCert(certFile, keyFile, hostnames)
 	if err != nil {
 		certConfig, err = ca.MakeAndWriteServerCert(certFile, keyFile, hostnames, expireDays)
@@ -718,26 +717,26 @@ func (ca *CA) EnsureServerCert(certFile, keyFile string, hostnames sets.String, 
 	return certConfig, false, nil
 }
 
-func GetServerCert(certFile, keyFile string, hostnames sets.String) (*TLSCertificateConfig, error) {
+func GetServerCert(certFile, keyFile string, hostnames sets.Set[string]) (*TLSCertificateConfig, error) {
 	server, err := GetTLSCertificateConfig(certFile, keyFile)
 	if err != nil {
 		return nil, err
 	}
 
-	cert := server.Certs[0]
-	ips, dns := IPAddressesDNSNames(hostnames.List())
-	missingIps := ipsNotInSlice(ips, cert.IPAddresses)
-	missingDns := stringsNotInSlice(dns, cert.DNSNames)
+	certificate := server.Certs[0]
+	ips, dns := IPAddressesDNSNames(sets.List[string](hostnames))
+	missingIps := ipsNotInSlice(ips, certificate.IPAddresses)
+	missingDns := stringsNotInSlice(dns, certificate.DNSNames)
 	if len(missingIps) == 0 && len(missingDns) == 0 {
-		klog.V(4).Infof("Found existing server certificate in %s", certFile)
+		klog.Background().V(4).WithValues("certFile", certFile).Info("found existing server certificate")
 		return server, nil
 	}
 
 	return nil, fmt.Errorf("existing server certificate in %s was missing some hostnames (%v) or IP addresses (%v)", certFile, missingDns, missingIps)
 }
 
-func (ca *CA) MakeAndWriteServerCert(certFile, keyFile string, hostnames sets.String, expireDays int) (*TLSCertificateConfig, error) {
-	klog.V(4).Infof("Generating server certificate in %s, key in %s", certFile, keyFile)
+func (ca *CA) MakeAndWriteServerCert(certFile, keyFile string, hostnames sets.Set[string], expireDays int) (*TLSCertificateConfig, error) {
+	klog.Background().V(4).WithValues("certFile", certFile, "keyFile", keyFile).Info("generating server certificate")
 
 	server, err := ca.MakeServerCert(hostnames, expireDays)
 	if err != nil {
@@ -753,11 +752,11 @@ func (ca *CA) MakeAndWriteServerCert(certFile, keyFile string, hostnames sets.St
 // if the extension attempt failed.
 type CertificateExtensionFunc func(*x509.Certificate) error
 
-func (ca *CA) MakeServerCert(hostnames sets.String, expireDays int, fns ...CertificateExtensionFunc) (*TLSCertificateConfig, error) {
+func (ca *CA) MakeServerCert(hostnames sets.Set[string], expireDays int, fns ...CertificateExtensionFunc) (*TLSCertificateConfig, error) {
 	serverPublicKey, serverPrivateKey, publicKeyHash, _ := newKeyPairWithHash()
 	authorityKeyId := ca.Config.Certs[0].SubjectKeyId
 	subjectKeyId := publicKeyHash
-	serverTemplate := newServerCertificateTemplate(pkix.Name{CommonName: hostnames.List()[0]}, hostnames.List(), expireDays, time.Now, authorityKeyId, subjectKeyId)
+	serverTemplate := newServerCertificateTemplate(pkix.Name{CommonName: sets.List[string](hostnames)[0]}, sets.List[string](hostnames), expireDays, time.Now, authorityKeyId, subjectKeyId)
 	for _, fn := range fns {
 		if err := fn(serverTemplate); err != nil {
 			return nil, err
@@ -774,11 +773,11 @@ func (ca *CA) MakeServerCert(hostnames sets.String, expireDays int, fns ...Certi
 	return server, nil
 }
 
-func (ca *CA) MakeServerCertForDuration(hostnames sets.String, lifetime time.Duration, fns ...CertificateExtensionFunc) (*TLSCertificateConfig, error) {
+func (ca *CA) MakeServerCertForDuration(hostnames sets.Set[string], lifetime time.Duration, fns ...CertificateExtensionFunc) (*TLSCertificateConfig, error) {
 	serverPublicKey, serverPrivateKey, publicKeyHash, _ := newKeyPairWithHash()
 	authorityKeyId := ca.Config.Certs[0].SubjectKeyId
 	subjectKeyId := publicKeyHash
-	serverTemplate := newServerCertificateTemplateForDuration(pkix.Name{CommonName: hostnames.List()[0]}, hostnames.List(), lifetime, time.Now, authorityKeyId, subjectKeyId)
+	serverTemplate := newServerCertificateTemplateForDuration(pkix.Name{CommonName: sets.List[string](hostnames)[0]}, sets.List[string](hostnames), lifetime, time.Now, authorityKeyId, subjectKeyId)
 	for _, fn := range fns {
 		if err := fn(serverTemplate); err != nil {
 			return nil, err
@@ -806,7 +805,7 @@ func (ca *CA) EnsureClientCertificate(certFile, keyFile string, u user.Info, exp
 }
 
 func (ca *CA) MakeClientCertificate(certFile, keyFile string, u user.Info, expireDays int) (*TLSCertificateConfig, error) {
-	klog.V(4).Infof("Generating client cert in %s and key in %s", certFile, keyFile)
+	klog.Background().V(4).WithValues("certFile", certFile, "keyFile", keyFile).Info("generating client cert")
 	// ensure parent dirs
 	if err := os.MkdirAll(filepath.Dir(certFile), os.FileMode(0755)); err != nil {
 		return nil, err
@@ -831,10 +830,10 @@ func (ca *CA) MakeClientCertificate(certFile, keyFile string, u user.Info, expir
 		return nil, err
 	}
 
-	if err = ioutil.WriteFile(certFile, certData, os.FileMode(0644)); err != nil {
+	if err = os.WriteFile(certFile, certData, os.FileMode(0644)); err != nil {
 		return nil, err
 	}
-	if err = ioutil.WriteFile(keyFile, keyData, os.FileMode(0600)); err != nil {
+	if err = os.WriteFile(keyFile, keyData, os.FileMode(0600)); err != nil {
 		return nil, err
 	}
 
@@ -1035,12 +1034,12 @@ func CertsFromPEM(pemCerts []byte) ([]*x509.Certificate, error) {
 			continue
 		}
 
-		cert, err := x509.ParseCertificate(block.Bytes)
+		certiicate, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			return certs, err
 		}
 
-		certs = append(certs, cert)
+		certs = append(certs, certiicate)
 		ok = true
 	}
 
@@ -1106,8 +1105,8 @@ func signCertificate(template *x509.Certificate, requestKey crypto.PublicKey, is
 
 func EncodeCertificates(certs ...*x509.Certificate) ([]byte, error) {
 	b := bytes.Buffer{}
-	for _, cert := range certs {
-		if err := pem.Encode(&b, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil {
+	for _, certificate := range certs {
+		if err := pem.Encode(&b, &pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw}); err != nil {
 			return []byte{}, err
 		}
 	}
@@ -1136,22 +1135,22 @@ func encodeKey(key crypto.PrivateKey) ([]byte, error) {
 }
 
 func writeCertificates(f io.Writer, certs ...*x509.Certificate) error {
-	bytes, err := EncodeCertificates(certs...)
+	encoded, err := EncodeCertificates(certs...)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(bytes); err != nil {
+	if _, err := f.Write(encoded); err != nil {
 		return err
 	}
 
 	return nil
 }
 func writeKeyFile(f io.Writer, key crypto.PrivateKey) error {
-	bytes, err := encodeKey(key)
+	b, err := encodeKey(key)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(bytes); err != nil {
+	if _, err := f.Write(b); err != nil {
 		return err
 	}
 

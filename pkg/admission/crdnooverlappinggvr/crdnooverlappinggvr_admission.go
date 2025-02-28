@@ -20,23 +20,30 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
+	"time"
 
-	"github.com/kcp-dev/logicalcluster/v2"
+	"github.com/kcp-dev/logicalcluster/v3"
 
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 
-	apisv1alpha1 "github.com/kcp-dev/kcp/pkg/apis/apis/v1alpha1"
-	kcpinformers "github.com/kcp-dev/kcp/pkg/client/informers/externalversions"
+	"github.com/kcp-dev/kcp/pkg/admission/initializers"
 	"github.com/kcp-dev/kcp/pkg/reconciler/apis/apibinding"
+	corev1alpha1 "github.com/kcp-dev/kcp/sdk/apis/core/v1alpha1"
+	kcpclientset "github.com/kcp-dev/kcp/sdk/client/clientset/versioned/cluster"
+	kcpinformers "github.com/kcp-dev/kcp/sdk/client/informers/externalversions"
+	corev1alpha1listers "github.com/kcp-dev/kcp/sdk/client/listers/core/v1alpha1"
 )
 
 const (
-	PluginName  = "apis.kcp.dev/CRDNoOverlappingGVR"
-	byWorkspace = PluginName + "-byWorkspace"
+	PluginName = "apis.kcp.io/CRDNoOverlappingGVR"
 )
 
 func Register(plugins *admission.Plugins) {
@@ -44,6 +51,7 @@ func Register(plugins *admission.Plugins) {
 		func(_ io.Reader) (admission.Interface, error) {
 			return &crdNoOverlappingGVRAdmission{
 				Handler: admission.NewHandler(admission.Create),
+				now:     metav1.Now,
 			}, nil
 		})
 }
@@ -51,37 +59,42 @@ func Register(plugins *admission.Plugins) {
 type crdNoOverlappingGVRAdmission struct {
 	*admission.Handler
 
-	apiBindingIndexer          cache.Indexer
-	apiBindingIndexerInitError error
+	updateLogicalCluster func(ctx context.Context, logicalCluster *corev1alpha1.LogicalCluster, opts metav1.UpdateOptions) (*corev1alpha1.LogicalCluster, error)
+	logicalclusterLister corev1alpha1listers.LogicalClusterClusterLister
+
+	now func() metav1.Time
 }
 
 // Ensure that the required admission interfaces are implemented.
 var _ = admission.ValidationInterface(&crdNoOverlappingGVRAdmission{})
 var _ = admission.InitializationValidator(&crdNoOverlappingGVRAdmission{})
+var _ = initializers.WantsKcpInformers(&crdNoOverlappingGVRAdmission{})
+var _ = initializers.WantsKcpClusterClient(&crdNoOverlappingGVRAdmission{})
 
-func (p *crdNoOverlappingGVRAdmission) SetKcpInformers(informers kcpinformers.SharedInformerFactory) {
-	if err := informers.Apis().V1alpha1().APIBindings().Informer().AddIndexers(cache.Indexers{byWorkspace: indexByWorkspace}); err != nil {
-		p.apiBindingIndexerInitError = err
-		return
+// SetKcpInformers sets the informer for kcp resources. It's part of WantsKcpInformers.
+func (p *crdNoOverlappingGVRAdmission) SetKcpInformers(local, global kcpinformers.SharedInformerFactory) {
+	p.SetReadyFunc(local.Apis().V1alpha1().APIBindings().Informer().HasSynced)
+	p.logicalclusterLister = local.Core().V1alpha1().LogicalClusters().Lister()
+}
+
+// SetKcpClusterClient sets the client for kcp resources. It's part of WantsKcpClusterClient.
+func (p *crdNoOverlappingGVRAdmission) SetKcpClusterClient(c kcpclientset.ClusterInterface) {
+	p.updateLogicalCluster = func(ctx context.Context, logicalCluster *corev1alpha1.LogicalCluster, opts metav1.UpdateOptions) (*corev1alpha1.LogicalCluster, error) {
+		return c.CoreV1alpha1().LogicalClusters().Cluster(logicalcluster.From(logicalCluster).Path()).Update(ctx, logicalCluster, opts)
 	}
-
-	// just in case the plugin gets init multiple times in case of an error
-	p.apiBindingIndexerInitError = nil
-	p.SetReadyFunc(informers.Apis().V1alpha1().APIBindings().Informer().HasSynced)
-	p.apiBindingIndexer = informers.Apis().V1alpha1().APIBindings().Informer().GetIndexer()
 }
 
 func (p *crdNoOverlappingGVRAdmission) ValidateInitialization() error {
-	if p.apiBindingIndexerInitError != nil {
-		return fmt.Errorf(PluginName+" plugin failed to initialize %q APIBindings indexer, err = %v", byWorkspace, p.apiBindingIndexerInitError)
+	if p.logicalclusterLister == nil {
+		return fmt.Errorf(PluginName + " plugin needs an LogicalCluster lister")
 	}
-	if p.apiBindingIndexer == nil {
-		return fmt.Errorf(PluginName + " plugin needs an APIBindings indexer")
+	if p.updateLogicalCluster == nil {
+		return fmt.Errorf(PluginName + " plugin needs a KCP cluster client")
 	}
 	return nil
 }
 
-// Validate checks if the given CRD's Group and Resource don't overlap with bound CRDs
+// Validate checks if the given CRD's Group and Resource don't overlap with bound CRDs.
 func (p *crdNoOverlappingGVRAdmission) Validate(ctx context.Context, a admission.Attributes, _ admission.ObjectInterfaces) error {
 	if a.GetResource().GroupResource() != apiextensions.Resource("customresourcedefinitions") {
 		return nil
@@ -89,12 +102,17 @@ func (p *crdNoOverlappingGVRAdmission) Validate(ctx context.Context, a admission
 	if a.GetKind().GroupKind() != apiextensions.Kind("CustomResourceDefinition") {
 		return nil
 	}
+	if a.GetOperation() != admission.Create {
+		return nil
+	}
+
 	clusterName, err := request.ClusterNameFrom(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve cluster from context: %w", err)
 	}
-	// ignore CRDs targeting system and non-root workspaces
-	if clusterName == apibinding.ShadowWorkspaceName || clusterName == logicalcluster.New("system:admin") {
+
+	if clusterName == apibinding.SystemBoundCRDsClusterName {
+		// bound CRDs will have equal group and resource names.
 		return nil
 	}
 
@@ -102,39 +120,42 @@ func (p *crdNoOverlappingGVRAdmission) Validate(ctx context.Context, a admission
 	if !ok {
 		return fmt.Errorf("unexpected type %T", a.GetObject())
 	}
-	apiBindingsForCurrentClusterName, err := p.listAPIBindingsFor(clusterName)
-	if err != nil {
-		return err
-	}
-	for _, apiBindingForCurrentClusterName := range apiBindingsForCurrentClusterName {
-		for _, boundResource := range apiBindingForCurrentClusterName.Status.BoundResources {
-			if boundResource.Group == crd.Spec.Group && boundResource.Resource == crd.Spec.Names.Plural {
-				return admission.NewForbidden(a, fmt.Errorf("cannot create %q CustomResourceDefinition with %q group and %q resource because it overlaps with a bound CustomResourceDefinition for %q APIBinding in %q logical cluster",
-					crd.Name, crd.Spec.Group, crd.Spec.Names.Plural, apiBindingForCurrentClusterName.Name, clusterName))
-			}
+
+	// (optimistically) lock group resource for LogicalCluster. If this request
+	// eventually fails, the logicalclustercleanup controller will clean them
+	// up eventually.
+	gr := schema.GroupResource{Group: crd.Spec.Group, Resource: crd.Spec.Names.Plural}
+	var skipped map[schema.GroupResource]apibinding.Lock
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		lc, err := p.logicalclusterLister.Cluster(clusterName).Get(corev1alpha1.LogicalClusterName)
+		if errors.IsNotFound(err) && strings.HasPrefix(string(clusterName), "system:") {
+			// in system logical clusters this is not fatal. We usually don't have a LogicalCluster there.
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("failed to get LogicalCluster in logical cluster %q: %w", clusterName, err)
 		}
-	}
-	return nil
-}
 
-func (p *crdNoOverlappingGVRAdmission) listAPIBindingsFor(clusterName logicalcluster.Name) ([]*apisv1alpha1.APIBinding, error) {
-	items, err := p.apiBindingIndexer.ByIndex(byWorkspace, clusterName.String())
+		var updated *corev1alpha1.LogicalCluster
+		updated, _, skipped, err = apibinding.WithLockedResources(nil, time.Now(), lc, []schema.GroupResource{gr}, apibinding.ExpirableLock{
+			Lock:      apibinding.Lock{CRD: true},
+			CRDExpiry: ptr.To(p.now()),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to lock resources %s in logical cluster %q: %w", gr, logicalcluster.From(crd), err)
+		}
+
+		_, err = p.updateLogicalCluster(ctx, updated, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+		return err
+	})
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to lock resources %s in logical cluster %q: %w", gr, logicalcluster.From(crd), err)
 	}
-	ret := make([]*apisv1alpha1.APIBinding, 0, len(items))
-	for _, item := range items {
-		ret = append(ret, item.(*apisv1alpha1.APIBinding))
-	}
-	return ret, nil
-}
-
-func indexByWorkspace(obj interface{}) ([]string, error) {
-	metaObj, ok := obj.(metav1.Object)
-	if !ok {
-		return []string{}, fmt.Errorf("obj is supposed to be a metav1.Object, but is %T", obj)
+	if len(skipped) > 0 {
+		return admission.NewForbidden(a, fmt.Errorf("cannot create because resource is bound by APIBinding %q", skipped[gr].Name))
 	}
 
-	lcluster := logicalcluster.From(metaObj)
-	return []string{lcluster.String()}, nil
+	return nil
 }
